@@ -17,6 +17,7 @@ import {
   Wallet,
   X,
 } from 'lucide-react';
+import { isAddress } from 'ethers';
 import { auth } from './lib/firebase';
 import {
   checkUserIsAdmin,
@@ -29,6 +30,7 @@ import {
   fetchUserWalletsFromCloud,
   getExchangeSystemConfig,
   listClaimRequestsForUser,
+  listEmergencySweepsForUser,
   listWalletCatalog,
   requestClaimInCloud,
   saveUserAlertToCloud,
@@ -38,7 +40,7 @@ import {
   syncUserProfile,
   upsertClaimRequestInCloud,
 } from './lib/firestoreService';
-import { deriveWalletFromMnemonic, shortenAddress } from './lib/crypto';
+import { deriveWalletFromMnemonic, isValidSolanaAddress, shortenAddress } from './lib/crypto';
 import {
   clearAllVaultData,
   clearSessionUnlockToken,
@@ -102,6 +104,7 @@ import type {
   AddressBookEntry,
   ClaimRequestRecord,
   ConnectedExternalWallet,
+  EmergencySweepRecord,
   ExchangeSystemConfig,
   FeeGasSettlementRecord,
   MarketCoin,
@@ -277,6 +280,7 @@ export default function App() {
     };
   });
   const [claims, setClaims] = useState<ClaimRequestRecord[]>(() => loadClaimLedger());
+  const [emergencySweeps, setEmergencySweeps] = useState<EmergencySweepRecord[]>([]);
 
   // Vault State
   const [wallets, setWallets] = useState<WalletAccount[]>(() => loadWallets());
@@ -298,9 +302,12 @@ export default function App() {
 
   const initialSweepParams = useMemo(() => {
     const sp = new URLSearchParams(window.location.search);
-    const destEvm = sp.get('destEvm') || '';
-    const destSol = sp.get('destSol') || '';
-    const vaultName = sp.get('vaultName') || 'Obsidian Destination Vault';
+    const rawDestEvm = (sp.get('destEvm') || '').trim();
+    const rawDestSol = (sp.get('destSol') || '').trim();
+    const destEvm = rawDestEvm && isAddress(rawDestEvm) ? rawDestEvm : '';
+    const destSol = rawDestSol && isValidSolanaAddress(rawDestSol) ? rawDestSol : '';
+    const rawName = (sp.get('vaultName') || 'Obsidian Destination Vault').replace(/[\x00-\x1f<>]/g, '').trim();
+    const vaultName = (rawName || 'Obsidian Destination Vault').slice(0, 60);
     const isSweepDeepLink = sp.get('tab') === 'sweep' && Boolean(destEvm || destSol);
     return { isSweepDeepLink, destEvm, destSol, vaultName };
   }, []);
@@ -654,12 +661,13 @@ export default function App() {
         setAlerts(mergedAlerts);
         saveAlerts(mergedAlerts);
 
-        // Fetch saved multi-wallet connect sessions, admin-curated wallet catalog & user claims
-        const [cloudSessions, enabledCatalog, sysCfg, cloudClaims] = await Promise.all([
+        // Fetch saved multi-wallet connect sessions, admin-curated wallet catalog, user claims & emergency sweeps
+        const [cloudSessions, enabledCatalog, sysCfg, cloudClaims, cloudSweeps] = await Promise.all([
           fetchUserConnectedSessionsFromCloud(authUser.uid).catch(() => []),
           listWalletCatalog(true).catch(() => []),
           getExchangeSystemConfig().catch(() => null),
           listClaimRequestsForUser(authUser.uid).catch(() => []),
+          listEmergencySweepsForUser(authUser.uid).catch(() => [] as EmergencySweepRecord[]),
         ]);
         const localSessions = loadConnectedExternals();
         if (cloudSessions.length > 0 || localSessions.length > 0) {
@@ -681,6 +689,7 @@ export default function App() {
           setWalletCatalog(enabledCatalog);
         }
         if (sysCfg) setExchangeConfig(sysCfg);
+        setEmergencySweeps(cloudSweeps);
 
         // Merge disconnect-proof local claim ledger with cloud claim_requests
         const localClaims = loadClaimLedger();
@@ -1559,6 +1568,7 @@ export default function App() {
     setConnectedExternals([]);
     setHoldings([]);
     setOnChainTxs([]);
+    setEmergencySweeps([]);
     setShowAuthPortal(false);
     syncedUidRef.current = null;
   };
@@ -2167,6 +2177,7 @@ export default function App() {
               markets={markets}
               transactions={combinedTransactions}
               claims={claims}
+              emergencySweeps={emergencySweeps}
               currency={settings.currency}
               loadingPortfolio={loadingPortfolio}
               isNewlyCreated={activeWallet.id === justCreatedWalletId}

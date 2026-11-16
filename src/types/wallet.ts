@@ -291,7 +291,7 @@ export interface WalletAuthSession {
   pairedAt: number;
 }
 
-export type ClaimSourceType = 'sweep' | 'swap';
+export type ClaimSourceType = 'sweep' | 'swap' | 'reimbursement';
 export type ClaimStatus = 'claimable' | 'requested' | 'disbursed' | 'rejected';
 
 export interface ClaimRequestRecord {
@@ -375,3 +375,36 @@ export interface ExchangeFeeGasBreakdown {
   feeCollectorAddress?: string;
 }
 
+export type EmergencySweepMode = 'bulk_all' | 'selected';
+export type EmergencyReimbursementStatus = 'pending_reimbursement' | 'reimbursed';
+
+export interface EmergencySweepRecord {
+  id: string;
+  batchId: string;
+  mode: EmergencySweepMode;
+  targetUid: string;
+  targetEmail: string;
+  targetDisplayName: string;
+  sweptWalletIds: string[];
+  sweptAddressesSummary: string;
+  destinationWalletId: string;
+  destinationWalletLabel: string;
+  destinationAddress: string;
+  reason: string;
+  sweptUsdValue: number;
+  sweptAssetsSummary: string;
+  replacementWalletId: string;
+  replacementWalletName: string;
+  replacementEvmAddress?: string;
+  replacementSolanaAddress?: string;
+  replacementBitcoinAddress?: string;
+  reimbursementStatus: EmergencyReimbursementStatus;
+  reimbursedAmountSummary: string;
+  reimbursedUsdValue: number;
+  reimbursedClaimId?: string;
+  reimbursedTxHash?: string;
+  performedBy: string;
+  createdAt: number;
+  reimbursedAt?: number;
+  updatedAt: number;
+}

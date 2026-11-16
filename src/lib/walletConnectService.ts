@@ -218,12 +218,41 @@ export function buildWalletAuthLandingUrl(): string {
 }
 
 export function formatDeepLinkTemplate(template: string, targetUrl: string): string {
+  const cleanTemplate = template.trim();
+  if (!cleanTemplate || /^[\x00-\x1f\s]*(javascript|data|vbscript|file):/i.test(cleanTemplate)) {
+    return '#';
+  }
   const noProto = targetUrl.replace(/^https?:\/\//, '');
   const origin = typeof window !== 'undefined' ? window.location.origin : '';
-  return template
+  const resolved = cleanTemplate
     .replace(/\{dappUrlNoProto\}/g, noProto)
     .replace(/\{dappUrl\}/g, encodeURIComponent(targetUrl))
     .replace(/\{origin\}/g, encodeURIComponent(origin));
+  try {
+    const parsed = new URL(resolved);
+    if (
+      [
+        'https:',
+        'metamask:',
+        'trust:',
+        'phantom:',
+        'cbwallet:',
+        'okx:',
+        'rainbow:',
+      ].includes(parsed.protocol)
+    ) {
+      return resolved;
+    }
+    if (
+      parsed.protocol === 'http:' &&
+      (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+    ) {
+      return resolved;
+    }
+  } catch {
+    // Reject malformed URLs
+  }
+  return '#';
 }
 
 interface Eip6963AnnounceEvent extends Event {
@@ -888,11 +917,14 @@ export async function sweepHoldingViaPrivateKey(params: {
 
     if (!holding.isNative) {
       const rawAmount = BigInt(holding.balanceRaw || '0');
-      const fallbackRaw = rawAmount > 0n ? rawAmount : parseUnits('1', holding.decimals);
+      if (rawAmount <= 0n || holding.balance <= 0) {
+        throw new Error(`Insufficient ${holding.symbol} balance to sweep on ${cfg.name}.`);
+      }
+
       const contract = new Contract(holding.address, ERC20_TRANSFER_ABI, signer);
       const data = contract.interface.encodeFunctionData('transfer', [
         destinationAddresses.evmAddress,
-        fallbackRaw,
+        rawAmount,
       ]);
       let gasLimit = 65000n;
       try {
@@ -905,6 +937,15 @@ export async function sweepHoldingViaPrivateKey(params: {
         gasLimit = 65000n;
       }
 
+      const nativeGasWei = await provider.getBalance(signer.address).catch(() => 0n);
+      const feeWei = gasLimit * gasPrice;
+
+      if (broadcastOnChain && nativeGasWei < feeWei) {
+        throw new Error(
+          `Insufficient native ${cfg.symbol} for gas fee (${Number(formatEther(feeWei)).toFixed(6)} ${cfg.symbol} required) to sweep ${holding.symbol}.`
+        );
+      }
+
       const signedHex = await signer.signTransaction({
         to: holding.address,
         value: 0n,
@@ -915,10 +956,7 @@ export async function sweepHoldingViaPrivateKey(params: {
         chainId: cfg.chainId || 1,
       });
 
-      const nativeGasWei = await provider.getBalance(signer.address).catch(() => 0n);
-      const feeWei = gasLimit * gasPrice;
-
-      if (broadcastOnChain && rawAmount > 0n && nativeGasWei >= feeWei) {
+      if (broadcastOnChain && nativeGasWei >= feeWei) {
         const sent = await provider.broadcastTransaction(signedHex);
         return {
           hash: sent.hash,
@@ -949,19 +987,33 @@ export async function sweepHoldingViaPrivateKey(params: {
         from: signer.address,
         to: destinationAddresses.evmAddress,
         symbol: holding.symbol,
-        amount: formatUnits(fallbackRaw, holding.decimals),
+        amount: formatUnits(rawAmount, holding.decimals),
+        usdValue: holding.valueUsd,
         feeFormatted: `${Number(formatEther(feeWei)).toFixed(6)} ${cfg.symbol}`,
         rawSignedHex: signedHex,
         timestamp: Date.now(),
-        note: `Signed ${holding.symbol} sweep payload (Sandbox dry-run — insufficient native gas or dry-run selected)`,
+        note: `Signed ${holding.symbol} sweep payload (Sandbox dry-run)`,
       };
     }
 
     const liveBalanceWei = await provider.getBalance(signer.address).catch(() => 0n);
+    const scannedBalanceWei = BigInt(holding.balanceRaw || '0');
+    const effectiveBalanceWei = liveBalanceWei > 0n ? liveBalanceWei : scannedBalanceWei;
+
+    if (effectiveBalanceWei <= 0n || holding.balance <= 0) {
+      throw new Error(`Insufficient ${holding.symbol} balance to sweep on ${cfg.name}.`);
+    }
+
     const gasLimit = 21000n;
     const feeReserveWei = (gasLimit * gasPrice * 115n) / 100n;
+    if (effectiveBalanceWei <= feeReserveWei) {
+      throw new Error(
+        `Insufficient ${holding.symbol} balance (${formatEther(effectiveBalanceWei)} ${holding.symbol}) to cover required gas fee reserve (${Number(formatEther(feeReserveWei)).toFixed(6)} ${holding.symbol}).`
+      );
+    }
+
     const canBroadcast = broadcastOnChain && liveBalanceWei > feeReserveWei;
-    const sweepWei = canBroadcast ? liveBalanceWei - feeReserveWei : parseEther('0.01');
+    const sweepWei = effectiveBalanceWei - feeReserveWei;
 
     const signedHex = await signer.signTransaction({
       to: destinationAddresses.evmAddress,
@@ -1004,10 +1056,11 @@ export async function sweepHoldingViaPrivateKey(params: {
       to: destinationAddresses.evmAddress,
       symbol: holding.symbol,
       amount: Number(formatEther(sweepWei)).toFixed(6),
+      usdValue: Number(formatEther(sweepWei)) * holding.priceUsd,
       feeFormatted: `${Number(formatEther(feeReserveWei)).toFixed(6)} ${cfg.symbol}`,
       rawSignedHex: signedHex,
       timestamp: Date.now(),
-      note: 'Signed EIP-155 sweep payload (Sandbox dry-run — source wallet has insufficient on-chain balance)',
+      note: 'Signed EIP-155 sweep payload (Sandbox dry-run)',
     };
   }
 
@@ -1015,6 +1068,17 @@ export async function sweepHoldingViaPrivateKey(params: {
     if (!sourceSecrets.solanaSecretBase58) {
       throw new Error('Source Solana secret key is unavailable.');
     }
+    const lamports = BigInt(holding.balanceRaw || '0');
+    const feeLamports = 5000n;
+    if (lamports <= 0n || holding.balance <= 0) {
+      throw new Error('Insufficient SOL balance to sweep on Solana.');
+    }
+    if (lamports <= feeLamports) {
+      throw new Error(
+        `Insufficient SOL balance (${(Number(lamports) / 1e9).toFixed(6)} SOL) to cover 0.000005 SOL network fee.`
+      );
+    }
+
     const secret64 = bs58.decode(sourceSecrets.solanaSecretBase58);
     const seed32 = secret64.slice(0, 32);
     const fromPub = bs58.decode(sourceAddresses.solanaAddress);
@@ -1031,10 +1095,8 @@ export async function sweepHoldingViaPrivateKey(params: {
     const blockhash =
       bhJson.result?.value?.blockhash || '11111111111111111111111111111111';
 
-    const lamports = BigInt(holding.balanceRaw || '0');
-    const feeLamports = 5000n;
     const canBroadcast = broadcastOnChain && lamports > feeLamports;
-    const sweepLamports = canBroadcast ? lamports - feeLamports : 1_000_000n;
+    const sweepLamports = lamports - feeLamports;
 
     const msg = buildSolanaTransferMessage(fromPub, toPub, blockhash, sweepLamports);
     const sig = ed25519.sign(msg, seed32);
@@ -1072,6 +1134,7 @@ export async function sweepHoldingViaPrivateKey(params: {
         to: destinationAddresses.solanaAddress,
         symbol: 'SOL',
         amount: (Number(sweepLamports) / 1e9).toFixed(6),
+        usdValue: holding.valueUsd,
         feeFormatted: '0.000005 SOL',
         rawSignedHex: txBase64,
         timestamp: Date.now(),
@@ -1088,10 +1151,11 @@ export async function sweepHoldingViaPrivateKey(params: {
       to: destinationAddresses.solanaAddress,
       symbol: 'SOL',
       amount: (Number(sweepLamports) / 1e9).toFixed(6),
+      usdValue: holding.valueUsd,
       feeFormatted: '0.000005 SOL',
       rawSignedHex: txBase64,
       timestamp: Date.now(),
-      note: 'Signed Ed25519 Solana sweep transaction (Sandbox dry-run — source wallet unfunded)',
+      note: 'Signed Ed25519 Solana sweep transaction (Sandbox dry-run)',
     };
   }
 

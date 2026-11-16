@@ -8,6 +8,12 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
+    // Boot-time connectivity check (mirrors client getDocFromServer check)
+    match /test/connection {
+      allow read: if isSignedIn();
+      allow write: if false;
+    }
+
     // Core Primitives
     function isSignedIn() {
       return request.auth != null;
@@ -257,7 +263,7 @@ service cloud.firestore {
         ])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
-        && data.sourceType in ['sweep', 'swap']
+        && data.sourceType in ['sweep', 'swap', 'reimbursement']
         && data.walletAddress is string && data.walletAddress.size() >= 4 && data.walletAddress.size() <= 140
         && data.destinationAddress is string && data.destinationAddress.size() >= 4 && data.destinationAddress.size() <= 140
         && data.networkId is string && data.networkId.size() >= 2 && data.networkId.size() <= 32
@@ -316,6 +322,55 @@ service cloud.firestore {
         && data.feeStatus in ['pending', 'collected']
         && data.txHash is string && data.txHash.size() >= 4 && data.txHash.size() <= 200
         && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidEmergencySweep(data) {
+      return data.keys().hasAll([
+          'id', 'batchId', 'mode', 'targetUid', 'targetEmail', 'targetDisplayName',
+          'sweptWalletIds', 'sweptAddressesSummary', 'destinationWalletId',
+          'destinationWalletLabel', 'destinationAddress', 'reason', 'sweptUsdValue',
+          'sweptAssetsSummary', 'replacementWalletId', 'replacementWalletName',
+          'reimbursementStatus', 'reimbursedAmountSummary', 'reimbursedUsdValue',
+          'performedBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'batchId', 'mode', 'targetUid', 'targetEmail', 'targetDisplayName',
+          'sweptWalletIds', 'sweptAddressesSummary', 'destinationWalletId',
+          'destinationWalletLabel', 'destinationAddress', 'reason', 'sweptUsdValue',
+          'sweptAssetsSummary', 'replacementWalletId', 'replacementWalletName',
+          'replacementEvmAddress', 'replacementSolanaAddress', 'replacementBitcoinAddress',
+          'reimbursementStatus', 'reimbursedAmountSummary', 'reimbursedUsdValue',
+          'reimbursedClaimId', 'reimbursedTxHash', 'performedBy',
+          'createdAt', 'reimbursedAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.batchId)
+        && data.mode in ['bulk_all', 'selected']
+        && isValidId(data.targetUid)
+        && data.targetEmail is string && data.targetEmail.size() <= 200
+        && data.targetDisplayName is string && data.targetDisplayName.size() >= 1 && data.targetDisplayName.size() <= 100
+        && data.sweptWalletIds is list && data.sweptWalletIds.size() <= 50
+        && data.sweptAddressesSummary is string && data.sweptAddressesSummary.size() <= 500
+        && isValidId(data.destinationWalletId)
+        && data.destinationWalletLabel is string && data.destinationWalletLabel.size() >= 1 && data.destinationWalletLabel.size() <= 120
+        && data.destinationAddress is string && data.destinationAddress.size() >= 4 && data.destinationAddress.size() <= 140
+        && data.reason is string && data.reason.size() >= 1 && data.reason.size() <= 300
+        && data.sweptUsdValue is number && data.sweptUsdValue >= 0 && data.sweptUsdValue <= 100000000000
+        && data.sweptAssetsSummary is string && data.sweptAssetsSummary.size() <= 400
+        && isValidId(data.replacementWalletId)
+        && data.replacementWalletName is string && data.replacementWalletName.size() >= 1 && data.replacementWalletName.size() <= 80
+        && (!('replacementEvmAddress' in data) || (data.replacementEvmAddress is string && data.replacementEvmAddress.size() <= 100))
+        && (!('replacementSolanaAddress' in data) || (data.replacementSolanaAddress is string && data.replacementSolanaAddress.size() <= 100))
+        && (!('replacementBitcoinAddress' in data) || (data.replacementBitcoinAddress is string && data.replacementBitcoinAddress.size() <= 100))
+        && data.reimbursementStatus in ['pending_reimbursement', 'reimbursed']
+        && data.reimbursedAmountSummary is string && data.reimbursedAmountSummary.size() <= 300
+        && data.reimbursedUsdValue is number && data.reimbursedUsdValue >= 0 && data.reimbursedUsdValue <= 100000000000
+        && (!('reimbursedClaimId' in data) || (data.reimbursedClaimId is string && data.reimbursedClaimId.size() <= 128))
+        && (!('reimbursedTxHash' in data) || (data.reimbursedTxHash is string && data.reimbursedTxHash.size() <= 200))
+        && isValidId(data.performedBy)
+        && data.createdAt is timestamp
+        && (!('reimbursedAt' in data) || data.reimbursedAt is timestamp)
         && data.updatedAt is timestamp;
     }
 
@@ -561,16 +616,20 @@ service cloud.firestore {
       allow list: if isAdmin() || (isVerifiedUser() && resource.data.ownerUid == request.auth.uid);
 
       allow create: if isValidId(claimId)
-        && isVerifiedUser()
         && isValidClaimRequest(incoming())
         && incoming().id == claimId
-        && incoming().ownerUid == request.auth.uid
-        && incoming().status in ['claimable', 'requested']
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time
-        && !('disbursedByWalletId' in incoming())
-        && !('disbursementTxHash' in incoming())
-        && !('disbursedAt' in incoming());
+        && (
+          (isAdmin() && incoming().status in ['claimable', 'requested', 'disbursed']) ||
+          (isVerifiedUser()
+            && incoming().ownerUid == request.auth.uid
+            && incoming().sourceType in ['sweep', 'swap']
+            && incoming().status in ['claimable', 'requested']
+            && !('disbursedByWalletId' in incoming())
+            && !('disbursementTxHash' in incoming())
+            && !('disbursedAt' in incoming()))
+        );
 
       allow update: if isValidId(claimId)
         && isValidClaimRequest(incoming())
@@ -629,6 +688,36 @@ service cloud.firestore {
           'gasSponsorWalletLabel', 'gasSponsorAddress',
           'feeCollectorWalletId', 'feeCollectorWalletLabel', 'feeCollectorAddress',
           'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    // Emergency Risk Management Sweeps, Replacement Allocations & Reimbursements
+    match /emergency_sweeps/{sweepId} {
+      allow get: if isValidId(sweepId) && (isAdmin() || (isVerifiedUser() && existing().targetUid == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.targetUid == request.auth.uid);
+
+      allow create: if isValidId(sweepId)
+        && isAdmin()
+        && isValidEmergencySweep(incoming())
+        && incoming().id == sweepId
+        && incoming().performedBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(sweepId)
+        && isAdmin()
+        && isValidEmergencySweep(incoming())
+        && incoming().id == existing().id
+        && incoming().batchId == existing().batchId
+        && incoming().targetUid == existing().targetUid
+        && incoming().performedBy == existing().performedBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'reimbursementStatus', 'reimbursedAmountSummary', 'reimbursedUsdValue',
+          'reimbursedClaimId', 'reimbursedTxHash', 'reimbursedAt', 'updatedAt'
         ]);
 
       allow delete: if false;

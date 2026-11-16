@@ -155,12 +155,36 @@ export function SwapView({
     slippagePct,
   ]);
 
+  const insufficientSwapReason = useMemo(() => {
+    const netName = NETWORK_MAP[fromNetwork]?.name || fromNetwork;
+    if (fromBalance <= 0) {
+      return `Insufficient ${fromSymbol} balance on ${netName} (0 available).`;
+    }
+    const amt = Number(fromAmount);
+    if (Number.isFinite(amt) && amt > 0 && amt > fromBalance) {
+      return `Insufficient ${fromSymbol} balance. Available: ${formatCryptoAmount(fromBalance)} ${fromSymbol}.`;
+    }
+    return '';
+  }, [fromBalance, fromAmount, fromSymbol, fromNetwork]);
+
+  const handleSetSwapPercent = (pct: number) => {
+    if (fromBalance <= 0) {
+      setFromAmount('0');
+      setSwapError(`Insufficient ${fromSymbol} balance to swap.`);
+      return;
+    }
+    setSwapError('');
+    const nextAmt = (fromBalance * pct).toFixed(6).replace(/\.?0+$/, '');
+    setFromAmount(nextAmt);
+  };
+
   const handleFlip = () => {
     setFromSymbol(toSymbol);
     setToSymbol(fromSymbol);
     setFromNetwork(toNetwork);
     setToNetwork(fromNetwork);
     setSwapReceipt(null);
+    setSwapError('');
   };
 
   const handleExecuteSwap = async () => {
@@ -169,6 +193,10 @@ export function SwapView({
 
     if (wallet.type === 'watchOnly') {
       setSwapError('Watch-Only wallets cannot sign swap intents.');
+      return;
+    }
+    if (insufficientSwapReason) {
+      setSwapError(insufficientSwapReason);
       return;
     }
     if (!quote || quote.outAmount <= 0) {
@@ -333,11 +361,26 @@ export function SwapView({
 
         {/* Pay Card */}
         <div className="p-4 rounded-xl bg-[#090B0F] border border-white/10 space-y-3">
-          <div className="flex items-center justify-between gap-2 text-xs text-[#8A94A6]">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[#8A94A6]">
             <span>You Pay</span>
-            <span className="font-mono tabular-nums truncate">
-              Balance: {formatCryptoAmount(fromBalance)} {fromSymbol}
-            </span>
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="font-mono tabular-nums truncate">
+                Balance: {formatCryptoAmount(fromBalance)} {fromSymbol}
+              </span>
+              <div className="flex items-center gap-1 shrink-0">
+                {[0.25, 0.5, 1].map((pct) => (
+                  <button
+                    key={pct}
+                    type="button"
+                    disabled={fromBalance <= 0}
+                    onClick={() => handleSetSwapPercent(pct)}
+                    className="px-1.5 py-0.5 rounded bg-[#11151C] border border-white/10 disabled:opacity-40 text-[10px] font-mono text-[#CBD5E1] hover:text-[#F4F6F9]"
+                  >
+                    {pct === 1 ? 'MAX' : `${pct * 100}%`}
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
 
           <div className="flex items-center justify-between gap-3 min-w-0">
@@ -518,21 +561,23 @@ export function SwapView({
           </div>
         )}
 
-        {swapError && (
+        {(swapError || insufficientSwapReason) && (
           <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2.5">
             <ShieldAlert className="w-4 h-4 shrink-0" />
-            <span>{swapError}</span>
+            <span>{swapError || insufficientSwapReason}</span>
           </div>
         )}
 
         <button
           type="button"
-          disabled={executing || !quote}
+          disabled={executing || !quote || Boolean(insufficientSwapReason)}
           onClick={handleExecuteSwap}
           className="w-full py-3 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-sm transition-colors"
         >
           {executing
             ? 'Signing Swap Intent...'
+            : insufficientSwapReason
+            ? 'Insufficient Balance'
             : `Sign & Swap ${fromSymbol} → ${toSymbol}`}
         </button>
 

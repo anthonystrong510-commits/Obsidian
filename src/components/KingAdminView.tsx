@@ -9,6 +9,7 @@ import {
 } from 'firebase/auth';
 import {
   Activity,
+  AlertTriangle,
   Archive,
   ArrowLeft,
   ArrowLeftRight,
@@ -16,8 +17,10 @@ import {
   BookOpen,
   Check,
   Copy,
+  Download,
   Eye,
   EyeOff,
+  FileSpreadsheet,
   Flame,
   Fuel,
   KeyRound,
@@ -37,6 +40,7 @@ import {
   Unlock,
   Users,
   Wallet,
+  Zap,
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
 import {
@@ -44,16 +48,19 @@ import {
   addExistingExchangeWallet,
   adminDisburseClaimInCloud,
   adminProvisionWalletForUser,
+  adminReimburseEmergencySweep,
   adminSettleFeeGasInCloud,
   archiveExchangeWallet,
   checkUserIsAdmin,
   deleteWalletCatalogEntry,
+  executeAdminEmergencySweep,
   generateAndSaveExchangeWallet,
   getExchangeSystemConfig,
   listAdminAuditLogs,
   listAllClaimRequestsForAdmin,
   listAllFeeGasSettlementsForAdmin,
   listAllManagedUsers,
+  listEmergencySweepsForAdmin,
   listExchangeWallets,
   listUserWalletsForAdmin,
   listWalletCatalog,
@@ -65,26 +72,36 @@ import {
 } from '../lib/firestoreService';
 import { deriveWalletFromMnemonic, shortenAddress } from '../lib/crypto';
 import {
+  downloadEmergencySweepsCsv,
+  downloadEmergencySweepsExcel,
+} from '../lib/excelExport';
+import {
   decryptPayload,
   disburseClaimInLedger,
   encryptPayload,
   loadClaimLedger,
   loadFeeGasLedger,
+  sanitizeExternalUrl,
   saveClaimLedger,
   saveFeeGasLedger,
   updateFeeGasSettlementInLedger,
 } from '../lib/vaultStorage';
 import { formatFiat, formatRelativeTime } from '../lib/formatters';
 import { NETWORK_MAP } from '../lib/networks';
+import { fetchMultiChainPortfolio } from '../lib/web3Service';
 import type {
   AdminAuditLogEntry,
   ClaimRequestRecord,
+  EmergencySweepMode,
+  EmergencySweepRecord,
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
   FeeGasSettlementRecord,
   FeeGasTxType,
   ManagedUserRecord,
+  MarketCoin,
+  PortfolioHolding,
   UnlockedSecrets,
   WalletAccount,
   WalletCatalogEntry,
@@ -96,7 +113,16 @@ interface KingAdminViewProps {
   onExitAdmin: () => void;
 }
 
-type AdminTab = 'overview' | 'wallets' | 'claims' | 'catalog' | 'users' | 'risk' | 'audit';
+type AdminTab =
+  | 'overview'
+  | 'wallets'
+  | 'claims'
+  | 'sweep_manager'
+  | 'catalog'
+  | 'users'
+  | 'bulk_ops'
+  | 'risk'
+  | 'audit';
 
 export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) {
   const [adminEmailInput, setAdminEmailInput] = useState('obsidianvault99@gmail.com');
@@ -223,6 +249,112 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     mnemonic?: string;
   } | null>(null);
 
+  // Brute-force Cooldown & Emergency Risk Containment State
+  const [adminAuthFailedCount, setAdminAuthFailedCount] = useState(0);
+  const [adminAuthLockoutUntil, setAdminAuthLockoutUntil] = useState(0);
+  const [custodyFailedCount, setCustodyFailedCount] = useState(0);
+  const [custodyLockoutUntil, setCustodyLockoutUntil] = useState(0);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+
+  const [emergencySweeps, setEmergencySweeps] = useState<EmergencySweepRecord[]>([]);
+  const [sweepMode, setSweepMode] = useState<EmergencySweepMode>('selected');
+  const [sweepDestWalletId, setSweepDestWalletId] = useState('');
+  const [sweepSelectedUids, setSweepSelectedUids] = useState<string[]>([]);
+  const [sweepUserQuery, setSweepUserQuery] = useState('');
+  const [sweepReason, setSweepReason] = useState(
+    'Emergency risk containment sweep & wallet rotation'
+  );
+  const [sweepReplacementPrefix, setSweepReplacementPrefix] = useState('Recovery Safe Vault');
+  const [sweepOverrideUsd, setSweepOverrideUsd] = useState('');
+  const [sweepOverrideCoinNote, setSweepOverrideCoinNote] = useState('');
+  const [sweepScanLiveBalances, setSweepScanLiveBalances] = useState(true);
+  const [sweepArchiveCompromised, setSweepArchiveCompromised] = useState(true);
+  const [sweepAutoReimburse, setSweepAutoReimburse] = useState(true);
+  const [sweepCustodyPass, setSweepCustodyPass] = useState('');
+  const [sweepExecuting, setSweepExecuting] = useState(false);
+  const [sweepRecordSearch, setSweepRecordSearch] = useState('');
+  const [sweepRecordStatusFilter, setSweepRecordStatusFilter] = useState<
+    'all' | 'reimbursed' | 'pending_reimbursement'
+  >('all');
+  const [reimbursingSweepId, setReimbursingSweepId] = useState<string | null>(null);
+  const [sweepResultNotice, setSweepResultNotice] = useState<{
+    batchId: string;
+    count: number;
+    destLabel: string;
+    generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }>;
+  } | null>(null);
+
+  // Manage Wallets Targeted Sweep State (Users & Wallets -> Manage Wallets)
+  const [userSweepWalletIds, setUserSweepWalletIds] = useState<string[]>([]);
+  const [userSweepDestWalletId, setUserSweepDestWalletId] = useState('');
+  const [userSweepReason, setUserSweepReason] = useState('Targeted wallet sweep & custody rotation');
+  const [userSweepPrefix, setUserSweepPrefix] = useState('Recovery Safe Vault');
+  const [userSweepArchive, setUserSweepArchive] = useState(true);
+  const [userSweepAllocateRep, setUserSweepAllocateRep] = useState(true);
+  const [userSweepAutoReimburse, setUserSweepAutoReimburse] = useState(true);
+  const [userSweepScanLive, setUserSweepScanLive] = useState(true);
+  const [userSweepOverrideUsd, setUserSweepOverrideUsd] = useState('');
+  const [userSweepOverrideNote, setUserSweepOverrideNote] = useState('');
+  const [userSweepPass, setUserSweepPass] = useState('');
+  const [userSweepBusy, setUserSweepBusy] = useState(false);
+  const [userSweepNotice, setUserSweepNotice] = useState<{
+    batchId: string;
+    destLabel: string;
+    walletCount: number;
+    generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }>;
+  } | null>(null);
+  const [userWalletScanMap, setUserWalletScanMap] = useState<
+    Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }>
+  >({});
+  const [scanningUserWallets, setScanningUserWallets] = useState(false);
+
+  // Sweep Wallet Manager Dedicated Sidebar Tab State
+  const [sweepMgrQuery, setSweepMgrQuery] = useState('');
+  const [sweepMgrUser, setSweepMgrUser] = useState<ManagedUserRecord | null>(null);
+  const [sweepMgrWallets, setSweepMgrWallets] = useState<WalletAccount[]>([]);
+  const [sweepMgrLoadingWallets, setSweepMgrLoadingWallets] = useState(false);
+  const [sweepMgrSelectedWalletIds, setSweepMgrSelectedWalletIds] = useState<string[]>([]);
+  const [sweepMgrScanMap, setSweepMgrScanMap] = useState<
+    Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }>
+  >({});
+  const [sweepMgrScanning, setSweepMgrScanning] = useState(false);
+
+  // Bulk Governance Operations State
+  const [bulkGovBusy, setBulkGovBusy] = useState(false);
+  const [bulkGovNotice, setBulkGovNotice] = useState('');
+
+  useEffect(() => {
+    const activeLock = Math.max(adminAuthLockoutUntil, custodyLockoutUntil);
+    if (activeLock <= Date.now()) return;
+    const id = setInterval(() => {
+      const t = Date.now();
+      setNowTick(t);
+      if (t >= activeLock) clearInterval(id);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [adminAuthLockoutUntil, custodyLockoutUntil]);
+
+  const adminAuthCooldownSec = Math.max(0, Math.ceil((adminAuthLockoutUntil - nowTick) / 1000));
+  const custodyCooldownSec = Math.max(0, Math.ceil((custodyLockoutUntil - nowTick) / 1000));
+
+  const registerCustodyFailure = () => {
+    const next = custodyFailedCount + 1;
+    setCustodyFailedCount(next);
+    if (next >= 4) {
+      const lockMs = Math.min(300_000, 15_000 * Math.pow(2, next - 4));
+      const until = Date.now() + lockMs;
+      setCustodyLockoutUntil(until);
+      setNowTick(Date.now());
+      return Math.ceil(lockMs / 1000);
+    }
+    return 0;
+  };
+
+  const resetCustodyFailures = () => {
+    setCustodyFailedCount(0);
+    setCustodyLockoutUntil(0);
+  };
+
   const verifyAdminRole = useCallback(async (user: User | null) => {
     setCheckingRole(true);
     try {
@@ -242,20 +374,23 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     setLoadingData(true);
     setDataError('');
     try {
-      const [uList, wList, logs, cfg, catalogList, cloudClaims, cloudFeeGas] = await Promise.all([
-        listAllManagedUsers(),
-        listExchangeWallets(),
-        listAdminAuditLogs(),
-        getExchangeSystemConfig(),
-        listWalletCatalog(false),
-        listAllClaimRequestsForAdmin().catch(() => [] as ClaimRequestRecord[]),
-        listAllFeeGasSettlementsForAdmin().catch(() => [] as FeeGasSettlementRecord[]),
-      ]);
+      const [uList, wList, logs, cfg, catalogList, cloudClaims, cloudFeeGas, cloudSweeps] =
+        await Promise.all([
+          listAllManagedUsers(),
+          listExchangeWallets(),
+          listAdminAuditLogs(),
+          getExchangeSystemConfig(),
+          listWalletCatalog(false),
+          listAllClaimRequestsForAdmin().catch(() => [] as ClaimRequestRecord[]),
+          listAllFeeGasSettlementsForAdmin().catch(() => [] as FeeGasSettlementRecord[]),
+          listEmergencySweepsForAdmin().catch(() => [] as EmergencySweepRecord[]),
+        ]);
       setUsers(uList);
       setExchangeWallets(wList);
       setAuditLogs(logs);
       setSystemConfig(cfg);
       setWalletCatalog(catalogList);
+      setEmergencySweeps(cloudSweeps);
 
       // Merge Firestore claims with local disconnect-proof ledger so Admin sees both cloud & local claims
       const localClaims = loadClaimLedger();
@@ -293,6 +428,28 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         }
         return eligible.find((w) => w.tier === 'hot' || w.tier === 'pool')?.id || eligible[0]?.id || '';
       });
+
+      setSweepDestWalletId((prev) => {
+        const eligible = wList.filter((w) => w.status !== 'archived');
+        if (prev && eligible.some((w) => w.id === prev)) return prev;
+        return (
+          eligible.find((w) => w.tier === 'cold')?.id ||
+          eligible.find((w) => w.tier === 'pool')?.id ||
+          eligible[0]?.id ||
+          ''
+        );
+      });
+
+      setUserSweepDestWalletId((prev) => {
+        const eligible = wList.filter((w) => w.status !== 'archived');
+        if (prev && eligible.some((w) => w.id === prev)) return prev;
+        return (
+          eligible.find((w) => w.tier === 'cold')?.id ||
+          eligible.find((w) => w.tier === 'pool')?.id ||
+          eligible[0]?.id ||
+          ''
+        );
+      });
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to load admin records.');
     } finally {
@@ -308,11 +465,17 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     e.preventDefault();
     setAuthError('');
     setAuthNotice('');
+    if (adminAuthCooldownSec > 0) {
+      setAuthError(`Too many failed login attempts. Wait ${adminAuthCooldownSec}s before retrying.`);
+      return;
+    }
     setAuthLoading(true);
     const email = adminEmailInput.trim().toLowerCase();
 
     try {
       await signInWithEmailAndPassword(auth, email, adminPasswordInput);
+      setAdminAuthFailedCount(0);
+      setAdminAuthLockoutUntil(0);
     } catch (err) {
       const code = (err as { code?: string })?.code || '';
       // Bootstrap designated admin account in Firebase Auth if it doesn't exist yet
@@ -324,6 +487,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         try {
           const cred = await createUserWithEmailAndPassword(auth, email, adminPasswordInput);
           await sendEmailVerification(cred.user);
+          setAdminAuthFailedCount(0);
+          setAdminAuthLockoutUntil(0);
           setAuthNotice(
             'Admin account initialized in Firebase Auth. Please verify the link sent to obsidianvault99@gmail.com, then click Refresh Status.'
           );
@@ -343,6 +508,14 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           setAuthLoading(false);
           return;
         }
+      }
+
+      const nextFail = adminAuthFailedCount + 1;
+      setAdminAuthFailedCount(nextFail);
+      if (nextFail >= 4) {
+        const lockMs = Math.min(300_000, 15_000 * Math.pow(2, nextFail - 4));
+        setAdminAuthLockoutUntil(Date.now() + lockMs);
+        setNowTick(Date.now());
       }
 
       if (code === 'auth/operation-not-allowed') {
@@ -434,6 +607,18 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     setCatSaving(true);
     setDataError('');
     try {
+      const rawDeepLink = catDeepLink.trim();
+      let cleanDeepLink: string | undefined;
+      if (rawDeepLink) {
+        const sanitized = sanitizeExternalUrl(rawDeepLink);
+        if (sanitized === '#') {
+          throw new Error(
+            'Mobile deep link uses an unsupported or unsafe scheme. Use https:// or a wallet app URL.'
+          );
+        }
+        cleanDeepLink = sanitized;
+      }
+
       await saveWalletCatalogEntry(
         {
           name: catName.trim(),
@@ -441,7 +626,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           defaultWords: catWords,
           derivationPath: catPath.trim() || "m/44'/60'/0'/0/0",
           presetId: catPreset,
-          mobileDeepLink: catDeepLink.trim() || undefined,
+          mobileDeepLink: cleanDeepLink,
           badgeColor: catColor || '#10B981',
           description: catDesc.trim() || undefined,
           enabled: true,
@@ -474,17 +659,210 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     }
   };
 
+  const fetchLiveMarketsForAdminScan = useCallback(async (): Promise<MarketCoin[]> => {
+    try {
+      const resp = await fetch('/api/markets');
+      if (!resp.ok) return [];
+      const payload = await resp.json();
+      if (Array.isArray(payload?.coins)) return payload.coins;
+      if (Array.isArray(payload)) return payload;
+      return [];
+    } catch {
+      return [];
+    }
+  }, []);
+
+  const scanCloudWalletsLive = useCallback(
+    async (
+      walletsToScan: WalletAccount[],
+      setScanState: (
+        next: Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }>
+      ) => void,
+      setBusyState: (busy: boolean) => void
+    ) => {
+      if (walletsToScan.length === 0) {
+        setScanState({});
+        return;
+      }
+      setBusyState(true);
+      try {
+        const markets = await fetchLiveMarketsForAdminScan();
+        const nextMap: Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }> = {};
+        for (const w of walletsToScan.slice(0, 12)) {
+          try {
+            const portfolio = await fetchMultiChainPortfolio(w.addresses, markets, []);
+            const funded = portfolio.filter((h) => h.balance > 0);
+            const usdTotal = funded.reduce((s, h) => s + Number(h.valueUsd || 0), 0);
+            nextMap[w.id] = { usdTotal, topHoldings: funded.slice(0, 6) };
+          } catch {
+            nextMap[w.id] = { usdTotal: 0, topHoldings: [] };
+          }
+        }
+        setScanState(nextMap);
+      } finally {
+        setBusyState(false);
+      }
+    },
+    [fetchLiveMarketsForAdminScan]
+  );
+
   const handleOpenUserWallets = async (user: ManagedUserRecord) => {
     setSelectedUserForWallets(user);
     setProvResult(null);
+    setUserSweepNotice(null);
+    setUserWalletScanMap({});
     setLoadingUserWallets(true);
     try {
       const list = await listUserWalletsForAdmin(user.uid);
       setSelectedUserWallets(list);
+      const firstActive = list.filter((w) => !w.archived).map((w) => w.id);
+      setUserSweepWalletIds(firstActive.slice(0, 1));
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to load user wallets.');
     } finally {
       setLoadingUserWallets(false);
+    }
+  };
+
+  const handleSelectSweepMgrUser = async (user: ManagedUserRecord) => {
+    setSweepMgrUser(user);
+    setUserSweepNotice(null);
+    setSweepMgrScanMap({});
+    setSweepMgrLoadingWallets(true);
+    try {
+      const list = await listUserWalletsForAdmin(user.uid);
+      setSweepMgrWallets(list);
+      const firstActive = list.filter((w) => !w.archived).map((w) => w.id);
+      setSweepMgrSelectedWalletIds(firstActive.slice(0, 1));
+      void scanCloudWalletsLive(list, setSweepMgrScanMap, setSweepMgrScanning);
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to load user wallets.');
+    } finally {
+      setSweepMgrLoadingWallets(false);
+    }
+  };
+
+  const handleExecuteTargetedWalletSweep = async (
+    targetUser: ManagedUserRecord,
+    targetWalletIds: string[],
+    refreshTarget: 'panel' | 'manager'
+  ) => {
+    if (!currentUser) return;
+    setDataError('');
+    setUserSweepNotice(null);
+
+    if (custodyCooldownSec > 0) {
+      setDataError(`Security cooldown active. Retry in ${custodyCooldownSec}s.`);
+      return;
+    }
+    if (targetWalletIds.length === 0) {
+      setDataError('Select at least one wallet from this user to sweep.');
+      return;
+    }
+
+    const destWallet =
+      emergencyDestOptions.find((w) => w.id === userSweepDestWalletId) ||
+      emergencyDestOptions[0];
+    if (!destWallet) {
+      setDataError('Select an active Emergency Cold / Pool / Hot destination wallet.');
+      return;
+    }
+
+    setUserSweepBusy(true);
+    try {
+      const markets = userSweepScanLive ? await fetchLiveMarketsForAdminScan() : [];
+      const parsedUsd = Number(userSweepOverrideUsd || 0);
+
+      const res = await executeAdminEmergencySweep({
+        mode: 'selected',
+        targetUsers: [targetUser],
+        targetWalletIds,
+        destinationWallet: destWallet,
+        exchangeWallets,
+        custodyPassphrase: userSweepPass,
+        reason: userSweepReason,
+        replacementWalletPrefix: userSweepPrefix,
+        archiveCompromisedWallets: userSweepArchive,
+        allocateReplacementWallet: userSweepAllocateRep,
+        autoReimburseCoins: userSweepAutoReimburse,
+        overrideUsdPerUser: Number.isFinite(parsedUsd) && parsedUsd > 0 ? parsedUsd : 0,
+        overrideCoinNote: userSweepOverrideNote,
+        markets,
+        scanLiveBalances: userSweepScanLive,
+        actorUid: currentUser.uid,
+      });
+
+      resetCustodyFailures();
+      setUserSweepPass('');
+      setUserSweepNotice({
+        batchId: res.batchId,
+        destLabel: `${destWallet.tier.toUpperCase()} · ${destWallet.label}`,
+        walletCount: targetWalletIds.length,
+        generatedMnemonics: res.generatedMnemonics,
+      });
+
+      const updatedWallets = await listUserWalletsForAdmin(targetUser.uid);
+      if (refreshTarget === 'panel') {
+        setSelectedUserWallets(updatedWallets);
+        setUserSweepWalletIds([]);
+      } else {
+        setSweepMgrWallets(updatedWallets);
+        setSweepMgrSelectedWalletIds([]);
+        void scanCloudWalletsLive(updatedWallets, setSweepMgrScanMap, setSweepMgrScanning);
+      }
+      await loadDashboardData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Targeted wallet sweep failed.';
+      if (msg.toLowerCase().includes('passphrase')) {
+        const waitSec = registerCustodyFailure();
+        setDataError(waitSec ? `${msg} Security cooldown active for ${waitSec}s.` : msg);
+      } else {
+        setDataError(msg);
+      }
+    } finally {
+      setUserSweepBusy(false);
+    }
+  };
+
+  const handleBulkUserStatusUpdate = async (targetStatus: 'active' | 'suspended') => {
+    if (!currentUser || sweepSelectedUids.length === 0) return;
+    setBulkGovBusy(true);
+    setDataError('');
+    setBulkGovNotice('');
+    try {
+      const targets = users.filter(
+        (u) => sweepSelectedUids.includes(u.uid) && u.uid !== currentUser.uid
+      );
+      for (const u of targets) {
+        await updateManagedUser(u.uid, { status: targetStatus }, currentUser.uid);
+      }
+      setBulkGovNotice(
+        `Updated ${targets.length} selected user account(s) to ${targetStatus.toUpperCase()}.`
+      );
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Bulk user status update failed.');
+    } finally {
+      setBulkGovBusy(false);
+    }
+  };
+
+  const handleBulkDisburseAllPendingClaims = async () => {
+    if (!currentUser) return;
+    const pending = claims.filter((c) => c.status === 'requested' || c.status === 'claimable');
+    if (pending.length === 0) return;
+    setBulkGovBusy(true);
+    setDataError('');
+    setBulkGovNotice('');
+    try {
+      for (const c of pending) {
+        await handleDisburseClaim(c, 'disbursed');
+      }
+      setBulkGovNotice(`Disbursed ${pending.length} pending claim request(s).`);
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Bulk claim disbursement failed.');
+    } finally {
+      setBulkGovBusy(false);
     }
   };
 
@@ -523,6 +901,13 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   };
 
   const handleDecryptExchangeWallet = async (wallet: ExchangeTreasuryWallet, explicitPass?: string) => {
+    if (custodyCooldownSec > 0) {
+      setWalletInspectErrors((prev) => ({
+        ...prev,
+        [wallet.id]: `Too many invalid passphrase attempts. Wait ${custodyCooldownSec}s.`,
+      }));
+      return;
+    }
     const pass = explicitPass ?? walletPassInputs[wallet.id] ?? globalRevealPass;
     setWalletInspectErrors((prev) => ({ ...prev, [wallet.id]: '' }));
     if (!wallet.encryptedVaultBlob) {
@@ -541,12 +926,16 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     }
     try {
       const dec = await decryptPayload<UnlockedSecrets>(wallet.encryptedVaultBlob, pass);
+      resetCustodyFailures();
       setUnlockedTreasuryMap((prev) => ({ ...prev, [wallet.id]: dec }));
       setInspectOpenMap((prev) => ({ ...prev, [wallet.id]: true }));
     } catch {
+      const waitSec = registerCustodyFailure();
       setWalletInspectErrors((prev) => ({
         ...prev,
-        [wallet.id]: 'Incorrect Admin Custody Encryption Passphrase.',
+        [wallet.id]: waitSec
+          ? `Incorrect Admin Custody Passphrase. Locked for ${waitSec}s.`
+          : 'Incorrect Admin Custody Encryption Passphrase.',
       }));
     }
   };
@@ -554,6 +943,10 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   const handleRevealAllTreasuryPhrases = async (e?: FormEvent) => {
     e?.preventDefault();
     setGlobalRevealStatus('');
+    if (custodyCooldownSec > 0) {
+      setGlobalRevealStatus(`Too many invalid passphrase attempts. Wait ${custodyCooldownSec}s.`);
+      return;
+    }
     if (!globalRevealPass) {
       setGlobalRevealStatus('Enter the Admin Custody Encryption Passphrase to unlock Cold, Pool, and Hot recovery phrases.');
       return;
@@ -582,10 +975,16 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       return;
     }
     if (unlockedCount === 0) {
-      setGlobalRevealStatus('Passphrase did not match any stored Cold, Pool, or Hot custody vault.');
+      const waitSec = registerCustodyFailure();
+      setGlobalRevealStatus(
+        waitSec
+          ? `Passphrase rejected. Security cooldown active for ${waitSec}s.`
+          : 'Passphrase did not match any stored Cold, Pool, or Hot custody vault.'
+      );
       return;
     }
 
+    resetCustodyFailures();
     setUnlockedTreasuryMap((prev) => ({ ...prev, ...nextUnlocked }));
     setInspectOpenMap((prev) => ({ ...prev, ...nextOpen }));
     setWalletInspectErrors((prev) => ({ ...prev, ...nextErrors }));
@@ -638,6 +1037,13 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
 
   const handleArchiveExchangeWallet = async (wallet: ExchangeTreasuryWallet) => {
     if (!currentUser) return;
+    if (custodyCooldownSec > 0) {
+      setArchiveErrors((prev) => ({
+        ...prev,
+        [wallet.id]: `Too many invalid passphrase attempts. Wait ${custodyCooldownSec}s.`,
+      }));
+      return;
+    }
     const pass = archivePassInputs[wallet.id] ?? '';
     setArchiveErrors((prev) => ({ ...prev, [wallet.id]: '' }));
     if (!pass) {
@@ -662,6 +1068,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         fallbackEncryptedBlobs: fallbackBlobs,
       });
 
+      resetCustodyFailures();
       const clearingSwap = systemConfig.activeSwapWalletId === wallet.id;
       const clearingGas = systemConfig.gasSponsorWalletId === wallet.id;
       const clearingFee = systemConfig.feeCollectorWalletId === wallet.id;
@@ -694,12 +1101,14 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       setArchivePassInputs((prev) => ({ ...prev, [wallet.id]: '' }));
       await loadDashboardData();
     } catch (err) {
+      const waitSec = registerCustodyFailure();
       setArchiveErrors((prev) => ({
         ...prev,
-        [wallet.id]:
-          err instanceof Error
-            ? err.message
-            : 'Failed to verify Admin Custody Encryption Passphrase.',
+        [wallet.id]: waitSec
+          ? `Passphrase verification failed. Cooldown active for ${waitSec}s.`
+          : err instanceof Error
+          ? err.message
+          : 'Failed to verify Admin Custody Encryption Passphrase.',
       }));
     } finally {
       setArchivingWalletId(null);
@@ -1086,6 +1495,162 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     });
   }, [claims, claimStatusFilter, claimTypeFilter, claimWalletFilter]);
 
+  const emergencyDestOptions = useMemo(
+    () =>
+      activeExchangeWallets.filter(
+        (w) =>
+          w.status !== 'frozen' &&
+          Boolean(w.evmAddress || w.solanaAddress || w.bitcoinAddress || w.moneroAddress)
+      ),
+    [activeExchangeWallets]
+  );
+
+  const sweepSelectableUsers = useMemo(() => {
+    const q = sweepUserQuery.trim().toLowerCase();
+    if (!q) return users;
+    return users.filter(
+      (u) =>
+        u.displayName.toLowerCase().includes(q) ||
+        u.email.toLowerCase().includes(q) ||
+        u.uid.toLowerCase().includes(q)
+    );
+  }, [users, sweepUserQuery]);
+
+  const filteredEmergencySweeps = useMemo(() => {
+    const q = sweepRecordSearch.trim().toLowerCase();
+    return emergencySweeps.filter((r) => {
+      if (sweepRecordStatusFilter !== 'all' && r.reimbursementStatus !== sweepRecordStatusFilter) {
+        return false;
+      }
+      if (q) {
+        return (
+          r.targetEmail.toLowerCase().includes(q) ||
+          r.targetDisplayName.toLowerCase().includes(q) ||
+          r.targetUid.toLowerCase().includes(q) ||
+          r.batchId.toLowerCase().includes(q) ||
+          r.replacementWalletName.toLowerCase().includes(q) ||
+          r.destinationWalletLabel.toLowerCase().includes(q) ||
+          (r.replacementEvmAddress || '').toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [emergencySweeps, sweepRecordSearch, sweepRecordStatusFilter]);
+
+  const handleToggleSweepUser = (uid: string) => {
+    setSweepSelectedUids((prev) =>
+      prev.includes(uid) ? prev.filter((id) => id !== uid) : [...prev, uid]
+    );
+  };
+
+  const handleExecuteEmergencySweep = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+    setDataError('');
+    setSweepResultNotice(null);
+
+    if (custodyCooldownSec > 0) {
+      setDataError(`Security cooldown active. Retry in ${custodyCooldownSec}s.`);
+      return;
+    }
+
+    const destWallet = emergencyDestOptions.find((w) => w.id === sweepDestWalletId);
+    if (!destWallet) {
+      setDataError('Select an active Emergency Fund / Cold Wallet destination with an address.');
+      return;
+    }
+
+    const targetUsers =
+      sweepMode === 'bulk_all'
+        ? users
+        : users.filter((u) => sweepSelectedUids.includes(u.uid));
+
+    if (targetUsers.length === 0) {
+      setDataError('Select at least one user account (or switch to Bulk All Users).');
+      return;
+    }
+
+    setSweepExecuting(true);
+    try {
+      let markets: MarketCoin[] = [];
+      if (sweepScanLiveBalances) {
+        try {
+          const resp = await fetch('/api/markets');
+          if (resp.ok) {
+            const payload = await resp.json();
+            if (Array.isArray(payload?.coins)) {
+              markets = payload.coins;
+            } else if (Array.isArray(payload)) {
+              markets = payload;
+            }
+          }
+        } catch {
+          markets = [];
+        }
+      }
+
+      const parsedUsd = Number(sweepOverrideUsd || 0);
+      const res = await executeAdminEmergencySweep({
+        mode: sweepMode,
+        targetUsers,
+        destinationWallet: destWallet,
+        exchangeWallets,
+        custodyPassphrase: sweepCustodyPass,
+        reason: sweepReason,
+        replacementWalletPrefix: sweepReplacementPrefix,
+        archiveCompromisedWallets: sweepArchiveCompromised,
+        autoReimburseCoins: sweepAutoReimburse,
+        overrideUsdPerUser: Number.isFinite(parsedUsd) && parsedUsd > 0 ? parsedUsd : 0,
+        overrideCoinNote: sweepOverrideCoinNote,
+        markets,
+        scanLiveBalances: sweepScanLiveBalances,
+        actorUid: currentUser.uid,
+      });
+
+      resetCustodyFailures();
+      setSweepCustodyPass('');
+      setSweepSelectedUids([]);
+      setSweepResultNotice({
+        batchId: res.batchId,
+        count: res.records.length,
+        destLabel: `${destWallet.tier.toUpperCase()} · ${destWallet.label}`,
+        generatedMnemonics: res.generatedMnemonics,
+      });
+      await loadDashboardData();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Emergency sweep failed.';
+      if (msg.toLowerCase().includes('passphrase')) {
+        const waitSec = registerCustodyFailure();
+        setDataError(
+          waitSec ? `${msg} Security cooldown active for ${waitSec}s.` : msg
+        );
+      } else {
+        setDataError(msg);
+      }
+    } finally {
+      setSweepExecuting(false);
+    }
+  };
+
+  const handleReimburseSweepRecord = async (record: EmergencySweepRecord) => {
+    if (!currentUser) return;
+    setReimbursingSweepId(record.id);
+    setDataError('');
+    try {
+      const destWallet = activeExchangeWallets.find((w) => w.id === record.destinationWalletId);
+      await adminReimburseEmergencySweep({
+        record,
+        destinationWallet: destWallet,
+        actorUid: currentUser.uid,
+      });
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Coin reimbursement failed.');
+    } finally {
+      setReimbursingSweepId(null);
+    }
+  };
+
   // Admin Authentication Gate
   if (checkingRole) {
     return (
@@ -1198,10 +1763,14 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
 
             <button
               type="submit"
-              disabled={authLoading}
-              className="w-full py-2.5 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-sm transition-colors"
+              disabled={authLoading || adminAuthCooldownSec > 0}
+              className="w-full py-2.5 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-sm transition-colors"
             >
-              {authLoading ? 'Authenticating...' : 'Access KingAdmin Console'}
+              {adminAuthCooldownSec > 0
+                ? `Cooldown (${adminAuthCooldownSec}s)`
+                : authLoading
+                ? 'Authenticating...'
+                : 'Access KingAdmin Console'}
             </button>
           </form>
 
@@ -1229,6 +1798,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         { id: 'overview', label: 'Overview', icon: LayoutGrid },
         { id: 'wallets', label: 'Cold / Pool / Hot', icon: Snowflake, count: activeExchangeWallets.length },
         { id: 'claims', label: 'Claims & Disbursement', icon: Banknote, count: pendingClaimsCount },
+        {
+          id: 'sweep_manager',
+          label: 'Sweep Wallet Manager',
+          icon: Zap,
+          count: emergencySweeps.length > 0 ? emergencySweeps.length : undefined,
+        },
       ],
     },
     {
@@ -1241,7 +1816,17 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     {
       groupLabel: 'Security & Governance',
       items: [
-        { id: 'risk', label: 'Risk Controls', icon: ShieldAlert },
+        {
+          id: 'bulk_ops',
+          label: 'Bulk Operations',
+          icon: Layers,
+          count: sweepSelectedUids.length > 0 ? sweepSelectedUids.length : undefined,
+        },
+        {
+          id: 'risk',
+          label: 'Risk Controls',
+          icon: ShieldAlert,
+        },
         { id: 'audit', label: 'Audit Logs', icon: Activity, count: auditLogs.length },
       ],
     },
@@ -2938,6 +3523,466 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           </div>
         )}
 
+        {/* TAB 2D: SWEEP WALLET MANAGER */}
+        {tab === 'sweep_manager' && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              {/* Left Column: Search & Select User */}
+              <div className="lg:col-span-4 bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+                <div className="p-4 border-b border-white/10 space-y-3">
+                  <div>
+                    <h2 className="text-sm font-semibold text-[#F4F6F9]">
+                      Sweep User Wallet Manager
+                    </h2>
+                    <p className="text-xs text-[#8A94A6] mt-0.5">
+                      Pick a user account to inspect multi-chain wallet balances and sweep specific wallets.
+                    </p>
+                  </div>
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={sweepMgrQuery}
+                      onChange={(e) => setSweepMgrQuery(e.target.value)}
+                      placeholder="Search email, name, UID..."
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg pl-8 pr-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                </div>
+
+                <div className="max-h-[520px] overflow-y-auto divide-y divide-white/[0.06]">
+                  {users
+                    .filter((u) => {
+                      const q = sweepMgrQuery.trim().toLowerCase();
+                      if (!q) return true;
+                      return (
+                        u.displayName.toLowerCase().includes(q) ||
+                        u.email.toLowerCase().includes(q) ||
+                        u.uid.toLowerCase().includes(q)
+                      );
+                    })
+                    .map((u) => {
+                      const active = sweepMgrUser?.uid === u.uid;
+                      return (
+                        <button
+                          key={u.uid}
+                          type="button"
+                          onClick={() => handleSelectSweepMgrUser(u)}
+                          className={`w-full px-4 py-3 text-left flex items-center justify-between gap-3 transition-colors ${
+                            active ? 'bg-emerald-500/10' : 'hover:bg-white/[0.02]'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-semibold text-[#F4F6F9] truncate">
+                              {u.displayName}
+                            </div>
+                            <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                              {u.email}
+                            </div>
+                          </div>
+                          <div className="text-right shrink-0">
+                            <div className="font-mono text-[11px] text-emerald-400 tabular-nums">
+                              {u.walletCount} wallets
+                            </div>
+                            <div className="text-[10px] text-[#64748B]">{u.status}</div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                </div>
+              </div>
+
+              {/* Right Column: Wallet Selector & Targeted Sweep Execution */}
+              <div className="lg:col-span-8 space-y-5">
+                {!sweepMgrUser ? (
+                  <div className="bg-[#11151C] border border-white/10 rounded-xl p-10 text-center space-y-2">
+                    <Zap className="w-6 h-6 text-emerald-400 mx-auto" />
+                    <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                      Select a User to Manage & Sweep Wallets
+                    </h3>
+                    <p className="text-xs text-[#8A94A6] max-w-md mx-auto">
+                      Choose any user from the directory on the left to inspect their cloud wallets, scan live chain balances, and execute targeted sweeps into an Emergency Cold, Pool, or Hot vault.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="bg-[#11151C] border border-white/10 rounded-xl p-5 sm:p-6 space-y-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3 pb-4 border-b border-white/10">
+                      <div className="min-w-0">
+                        <div className="text-[11px] font-mono text-emerald-400">
+                          USER WALLET SWEEP CONSOLE · {sweepMgrUser.uid}
+                        </div>
+                        <h3 className="text-base font-semibold text-[#F4F6F9] truncate">
+                          {sweepMgrUser.displayName} ({sweepMgrUser.email})
+                        </h3>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={sweepMgrScanning || sweepMgrWallets.length === 0}
+                        onClick={() =>
+                          scanCloudWalletsLive(sweepMgrWallets, setSweepMgrScanMap, setSweepMgrScanning)
+                        }
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs text-[#CBD5E1] whitespace-nowrap shrink-0"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${sweepMgrScanning ? 'animate-spin' : ''}`} />
+                        <span>{sweepMgrScanning ? 'Scanning RPCs...' : 'Rescan Live Balances'}</span>
+                      </button>
+                    </div>
+
+                    {sweepMgrLoadingWallets ? (
+                      <div className="py-8 text-center text-xs text-[#8A94A6]">
+                        Loading user wallets...
+                      </div>
+                    ) : sweepMgrWallets.length === 0 ? (
+                      <div className="p-6 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6]">
+                        This user does not have any synced cloud wallets yet.
+                      </div>
+                    ) : (
+                      <>
+                        {/* Quick Single-Wallet Selector + Multi-Wallet Toggle */}
+                        <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
+                          <div className="sm:col-span-7">
+                            <label className="block text-[11px] text-[#8A94A6] mb-1">
+                              Select Specific Wallet to Sweep (or Check Multiple Below)
+                            </label>
+                            <select
+                              value={
+                                sweepMgrSelectedWalletIds.length === 1
+                                  ? sweepMgrSelectedWalletIds[0]
+                                  : ''
+                              }
+                              onChange={(e) => {
+                                if (e.target.value) setSweepMgrSelectedWalletIds([e.target.value]);
+                              }}
+                              className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                            >
+                              <option value="">
+                                {sweepMgrSelectedWalletIds.length > 1
+                                  ? `${sweepMgrSelectedWalletIds.length} wallets selected`
+                                  : 'Choose a wallet...'}
+                              </option>
+                              {sweepMgrWallets.map((w) => {
+                                const scanUsd = sweepMgrScanMap[w.id]?.usdTotal ?? 0;
+                                return (
+                                  <option key={w.id} value={w.id}>
+                                    {w.name} · {w.type}
+                                    {w.archived ? ' (Archived)' : ''} ·{' '}
+                                    {formatFiat(scanUsd, 'USD')}
+                                  </option>
+                                );
+                              })}
+                            </select>
+                          </div>
+
+                          <div className="sm:col-span-5 flex items-center justify-end gap-2">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setSweepMgrSelectedWalletIds(
+                                  sweepMgrWallets.filter((w) => !w.archived).map((w) => w.id)
+                                )
+                              }
+                              className="px-3 py-2 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs text-emerald-400 whitespace-nowrap"
+                            >
+                              Select All Active
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => setSweepMgrSelectedWalletIds([])}
+                              className="px-3 py-2 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9] whitespace-nowrap"
+                            >
+                              Clear
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Wallet List with Checkboxes & Scanned Assets */}
+                        <div className="divide-y divide-white/[0.06] border border-white/10 rounded-xl bg-[#090B0F]">
+                          {sweepMgrWallets.map((uw) => {
+                            const checked = sweepMgrSelectedWalletIds.includes(uw.id);
+                            const scan = sweepMgrScanMap[uw.id];
+                            return (
+                              <label
+                                key={uw.id}
+                                className={`flex flex-wrap items-start justify-between gap-3 p-3.5 text-xs cursor-pointer transition-colors ${
+                                  checked ? 'bg-amber-500/10' : 'hover:bg-white/[0.02]'
+                                }`}
+                              >
+                                <div className="flex items-start gap-2.5 min-w-0 flex-1">
+                                  <input
+                                    type="checkbox"
+                                    checked={checked}
+                                    onChange={() =>
+                                      setSweepMgrSelectedWalletIds((prev) =>
+                                        prev.includes(uw.id)
+                                          ? prev.filter((id) => id !== uw.id)
+                                          : [...prev, uw.id]
+                                      )
+                                    }
+                                    className="mt-1 rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                                  />
+                                  <div className="min-w-0 space-y-1">
+                                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                                      <span className="font-semibold text-[#F4F6F9]">{uw.name}</span>
+                                      <span className="text-[#64748B]">·</span>
+                                      <span className="font-mono text-[11px] text-emerald-400">
+                                        {uw.type}
+                                      </span>
+                                      {uw.archived && (
+                                        <>
+                                          <span className="text-[#64748B]">·</span>
+                                          <span className="text-[11px] text-amber-400">
+                                            Archived
+                                          </span>
+                                        </>
+                                      )}
+                                    </div>
+                                    <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-[11px] text-[#8A94A6]">
+                                      {uw.addresses.evmAddress && (
+                                        <span>EVM: {shortenAddress(uw.addresses.evmAddress, 8, 6)}</span>
+                                      )}
+                                      {uw.addresses.solanaAddress && (
+                                        <span>SOL: {shortenAddress(uw.addresses.solanaAddress, 8, 6)}</span>
+                                      )}
+                                      {uw.addresses.bitcoinAddress && (
+                                        <span>BTC: {shortenAddress(uw.addresses.bitcoinAddress, 8, 6)}</span>
+                                      )}
+                                    </div>
+                                    {scan && scan.topHoldings.length > 0 && (
+                                      <div className="font-mono text-[11px] text-amber-300 tabular-nums">
+                                        {scan.topHoldings
+                                          .map((h) => `${h.balance.toFixed(4)} ${h.symbol}`)
+                                          .join(' · ')}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+
+                                <div className="text-right font-mono tabular-nums shrink-0">
+                                  <div className="font-semibold text-[#F4F6F9]">
+                                    {scan ? formatFiat(scan.usdTotal, 'USD') : '—'}
+                                  </div>
+                                  <div className="text-[10px] text-[#64748B]">
+                                    {sweepMgrScanning && !scan ? 'Scanning...' : 'Live USD'}
+                                  </div>
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+
+                        {/* Targeted Sweep Configuration Form */}
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            void handleExecuteTargetedWalletSweep(
+                              sweepMgrUser,
+                              sweepMgrSelectedWalletIds,
+                              'manager'
+                            );
+                          }}
+                          className="pt-4 border-t border-white/10 space-y-3"
+                        >
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Target Emergency / Cold / Treasury Wallet
+                              </label>
+                              <select
+                                value={userSweepDestWalletId}
+                                onChange={(e) => setUserSweepDestWalletId(e.target.value)}
+                                required
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              >
+                                <option value="">Select Emergency / Cold / Pool Wallet...</option>
+                                {emergencyDestOptions.map((w) => {
+                                  const primary =
+                                    w.evmAddress ||
+                                    w.solanaAddress ||
+                                    w.bitcoinAddress ||
+                                    w.moneroAddress ||
+                                    '';
+                                  return (
+                                    <option key={w.id} value={w.id}>
+                                      {w.tier.toUpperCase()} · {w.label} (
+                                      {shortenAddress(primary, 6, 4)})
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Sweep Reason / Audit Note
+                              </label>
+                              <input
+                                type="text"
+                                value={userSweepReason}
+                                onChange={(e) => setUserSweepReason(e.target.value)}
+                                required
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                            <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepScanLive}
+                                onChange={(e) => setUserSweepScanLive(e.target.checked)}
+                                className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                              />
+                              <span>Scan live balances</span>
+                            </label>
+                            <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepArchive}
+                                onChange={(e) => setUserSweepArchive(e.target.checked)}
+                                className="rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                              />
+                              <span>Archive wallet(s)</span>
+                            </label>
+                            <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepAllocateRep}
+                                onChange={(e) => setUserSweepAllocateRep(e.target.checked)}
+                                className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                              />
+                              <span>Allocate replacement</span>
+                            </label>
+                            <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepAutoReimburse}
+                                onChange={(e) => setUserSweepAutoReimburse(e.target.checked)}
+                                className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                              />
+                              <span>Reimburse coins</span>
+                            </label>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                            {userSweepAllocateRep && (
+                              <div>
+                                <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                  Replacement Wallet Prefix
+                                </label>
+                                <input
+                                  type="text"
+                                  value={userSweepPrefix}
+                                  onChange={(e) => setUserSweepPrefix(e.target.value)}
+                                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                                />
+                              </div>
+                            )}
+                            <div>
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Fallback USD Value (Optional)
+                              </label>
+                              <input
+                                type="number"
+                                min={0}
+                                step="0.01"
+                                value={userSweepOverrideUsd}
+                                onChange={(e) => setUserSweepOverrideUsd(e.target.value)}
+                                placeholder="0.00 (uses live scan)"
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Coins Note (Optional)
+                              </label>
+                              <input
+                                type="text"
+                                value={userSweepOverrideNote}
+                                onChange={(e) => setUserSweepOverrideNote(e.target.value)}
+                                placeholder="e.g. 0.5 ETH + 200 USDC"
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-end gap-3">
+                            <div className="flex-1 min-w-[220px]">
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Confirm Admin Custody Encryption Passphrase
+                              </label>
+                              <input
+                                type="password"
+                                value={userSweepPass}
+                                onChange={(e) => setUserSweepPass(e.target.value)}
+                                required
+                                placeholder="Enter Admin Custody Passphrase"
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                            </div>
+                            <button
+                              type="submit"
+                              disabled={
+                                userSweepBusy ||
+                                sweepMgrSelectedWalletIds.length === 0 ||
+                                custodyCooldownSec > 0 ||
+                                emergencyDestOptions.length === 0
+                              }
+                              className="inline-flex items-center justify-center gap-2 px-5 py-2.5 min-h-[38px] rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                            >
+                              <Zap className="w-4 h-4" />
+                              <span>
+                                {custodyCooldownSec > 0
+                                  ? `Cooldown (${custodyCooldownSec}s)`
+                                  : userSweepBusy
+                                  ? 'Sweeping Wallets...'
+                                  : `Sweep Selected (${sweepMgrSelectedWalletIds.length})`}
+                              </span>
+                            </button>
+                          </div>
+
+                          {userSweepNotice && (
+                            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2 text-xs">
+                              <div className="font-semibold text-emerald-400">
+                                Targeted Sweep Complete · Batch {userSweepNotice.batchId}
+                              </div>
+                              <p className="text-[#CBD5E1]">
+                                Swept {userSweepNotice.walletCount} wallet(s) →{' '}
+                                <strong>{userSweepNotice.destLabel}</strong> and recorded audit/Excel logs.
+                              </p>
+                              {userSweepNotice.generatedMnemonics.map((gm) => (
+                                <div
+                                  key={gm.uid + gm.walletName}
+                                  className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-2"
+                                >
+                                  <div className="min-w-0">
+                                    <div className="font-medium text-[#F4F6F9] text-[11px]">
+                                      {gm.walletName}
+                                    </div>
+                                    <div className="font-mono text-[11px] text-emerald-300 break-words">
+                                      {gm.mnemonic}
+                                    </div>
+                                  </div>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCopy(`mgr_${gm.uid}`, gm.mnemonic)}
+                                    className="px-2.5 py-1 rounded bg-[#11151C] border border-white/10 text-[11px] text-[#CBD5E1] whitespace-nowrap shrink-0"
+                                  >
+                                    {copiedKey === `mgr_${gm.uid}` ? 'Copied' : 'Copy Seed'}
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </form>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* TAB 2B: ADMIN WALLET CATALOG (SHOWN TO USERS ON IMPORT & MOBILE WALLETCONNECT) */}
         {tab === 'catalog' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
@@ -3442,10 +4487,52 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     )}
                   </form>
 
-                  <div className="lg:col-span-7 space-y-2.5">
-                    <div className="text-xs font-semibold text-[#F4F6F9]">
-                      Existing Cloud Wallets ({selectedUserWallets.length})
+                  <div className="lg:col-span-7 space-y-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="text-xs font-semibold text-[#F4F6F9]">
+                        Existing Cloud Wallets ({selectedUserWallets.length})
+                      </div>
+                      {selectedUserWallets.length > 0 && (
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={scanningUserWallets}
+                            onClick={() =>
+                              scanCloudWalletsLive(
+                                selectedUserWallets,
+                                setUserWalletScanMap,
+                                setScanningUserWallets
+                              )
+                            }
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1] whitespace-nowrap shrink-0"
+                          >
+                            <RefreshCw
+                              className={`w-3 h-3 ${scanningUserWallets ? 'animate-spin' : ''}`}
+                            />
+                            <span>{scanningUserWallets ? 'Scanning...' : 'Scan Balances'}</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setUserSweepWalletIds(
+                                selectedUserWallets.filter((w) => !w.archived).map((w) => w.id)
+                              )
+                            }
+                            className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-emerald-400 whitespace-nowrap shrink-0"
+                          >
+                            Select All Active
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setUserSweepWalletIds([])}
+                            className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#8A94A6] whitespace-nowrap shrink-0"
+                          >
+                            Clear
+                          </button>
+                        </div>
+                      )}
                     </div>
+
                     {loadingUserWallets ? (
                       <div className="text-xs text-[#8A94A6] py-6">Loading user wallets...</div>
                     ) : selectedUserWallets.length === 0 ? (
@@ -3453,31 +4540,256 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                         This user has no synced cloud wallets yet. Use the provisioning form on the left to add one.
                       </div>
                     ) : (
-                      selectedUserWallets.map((uw) => (
-                        <div
-                          key={uw.id}
-                          className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 space-y-1.5"
-                        >
-                          <div className="flex items-center justify-between text-xs">
-                            <span className="font-semibold text-[#F4F6F9]">{uw.name}</span>
-                            <span className="font-mono text-[11px] text-emerald-400">{uw.type}</span>
-                          </div>
-                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 font-mono text-[11px] text-[#8A94A6]">
-                            {uw.addresses.evmAddress && (
-                              <div>EVM: {shortenAddress(uw.addresses.evmAddress, 8, 6)}</div>
-                            )}
-                            {uw.addresses.solanaAddress && (
-                              <div>SOL: {shortenAddress(uw.addresses.solanaAddress, 8, 6)}</div>
-                            )}
-                            {uw.addresses.bitcoinAddress && (
-                              <div>BTC: {shortenAddress(uw.addresses.bitcoinAddress, 8, 6)}</div>
-                            )}
-                            {uw.addresses.moneroAddress && (
-                              <div>XMR: {shortenAddress(uw.addresses.moneroAddress, 8, 6)}</div>
-                            )}
-                          </div>
+                      <>
+                        {/* Direct Wallet Selector Dropdown + Multi-Select Checkboxes */}
+                        <div>
+                          <label className="block text-[11px] text-[#8A94A6] mb-1">
+                            Select Wallet to Sweep
+                          </label>
+                          <select
+                            value={
+                              userSweepWalletIds.length === 1 ? userSweepWalletIds[0] : ''
+                            }
+                            onChange={(e) => {
+                              if (e.target.value) setUserSweepWalletIds([e.target.value]);
+                            }}
+                            className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                          >
+                            <option value="">
+                              {userSweepWalletIds.length > 1
+                                ? `${userSweepWalletIds.length} wallets selected for sweep`
+                                : 'Choose wallet to sweep...'}
+                            </option>
+                            {selectedUserWallets.map((uw) => (
+                              <option key={uw.id} value={uw.id}>
+                                {uw.name} · {uw.type}
+                                {uw.archived ? ' (Archived)' : ''}
+                                {userWalletScanMap[uw.id]
+                                  ? ` · ${formatFiat(userWalletScanMap[uw.id].usdTotal, 'USD')}`
+                                  : ''}
+                              </option>
+                            ))}
+                          </select>
                         </div>
-                      ))
+
+                        <div className="space-y-2 max-h-64 overflow-y-auto pr-1">
+                          {selectedUserWallets.map((uw) => {
+                            const checked = userSweepWalletIds.includes(uw.id);
+                            const scan = userWalletScanMap[uw.id];
+                            return (
+                              <label
+                                key={uw.id}
+                                className={`block p-3.5 rounded-lg bg-[#090B0F] border transition-colors space-y-1.5 cursor-pointer ${
+                                  checked ? 'border-amber-500/50 bg-amber-500/[0.05]' : 'border-white/10'
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2 text-xs">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <input
+                                      type="checkbox"
+                                      checked={checked}
+                                      onChange={() =>
+                                        setUserSweepWalletIds((prev) =>
+                                          prev.includes(uw.id)
+                                            ? prev.filter((id) => id !== uw.id)
+                                            : [...prev, uw.id]
+                                        )
+                                      }
+                                      className="rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                                    />
+                                    <span className="font-semibold text-[#F4F6F9] truncate">
+                                      {uw.name}
+                                    </span>
+                                    <span className="text-[#64748B]">·</span>
+                                    <span className="font-mono text-[11px] text-emerald-400">
+                                      {uw.type}
+                                    </span>
+                                    {uw.archived && (
+                                      <>
+                                        <span className="text-[#64748B]">·</span>
+                                        <span className="text-[11px] text-amber-400">Archived</span>
+                                      </>
+                                    )}
+                                  </div>
+                                  <span className="font-mono text-[11px] text-[#CBD5E1] tabular-nums shrink-0">
+                                    {scan ? formatFiat(scan.usdTotal, 'USD') : '—'}
+                                  </span>
+                                </div>
+                                <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 font-mono text-[11px] text-[#8A94A6] pl-6">
+                                  {uw.addresses.evmAddress && (
+                                    <div>EVM: {shortenAddress(uw.addresses.evmAddress, 8, 6)}</div>
+                                  )}
+                                  {uw.addresses.solanaAddress && (
+                                    <div>SOL: {shortenAddress(uw.addresses.solanaAddress, 8, 6)}</div>
+                                  )}
+                                  {uw.addresses.bitcoinAddress && (
+                                    <div>BTC: {shortenAddress(uw.addresses.bitcoinAddress, 8, 6)}</div>
+                                  )}
+                                  {uw.addresses.moneroAddress && (
+                                    <div>XMR: {shortenAddress(uw.addresses.moneroAddress, 8, 6)}</div>
+                                  )}
+                                </div>
+                              </label>
+                            );
+                          })}
+                        </div>
+
+                        {/* Targeted Sweep Execution inside Manage Wallets */}
+                        <form
+                          onSubmit={(e) => {
+                            e.preventDefault();
+                            void handleExecuteTargetedWalletSweep(
+                              selectedUserForWallets,
+                              userSweepWalletIds,
+                              'panel'
+                            );
+                          }}
+                          className="pt-4 border-t border-white/10 space-y-3"
+                        >
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-amber-400 inline-flex items-center gap-1.5">
+                              <Zap className="w-3.5 h-3.5" />
+                              <span>
+                                Sweep Selected User Wallet(s) ({userSweepWalletIds.length})
+                              </span>
+                            </span>
+                            <span className="text-[11px] text-[#64748B]">
+                              Routes to Emergency Cold / Pool / Hot Vault
+                            </span>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Destination Treasury / Cold Wallet
+                              </label>
+                              <select
+                                value={userSweepDestWalletId}
+                                onChange={(e) => setUserSweepDestWalletId(e.target.value)}
+                                required
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              >
+                                <option value="">Select Cold / Pool / Hot Wallet...</option>
+                                {emergencyDestOptions.map((w) => {
+                                  const primary =
+                                    w.evmAddress ||
+                                    w.solanaAddress ||
+                                    w.bitcoinAddress ||
+                                    w.moneroAddress ||
+                                    '';
+                                  return (
+                                    <option key={w.id} value={w.id}>
+                                      {w.tier.toUpperCase()} · {w.label} (
+                                      {shortenAddress(primary, 6, 4)})
+                                    </option>
+                                  );
+                                })}
+                              </select>
+                            </div>
+                            <div>
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Sweep Reason
+                              </label>
+                              <input
+                                type="text"
+                                value={userSweepReason}
+                                onChange={(e) => setUserSweepReason(e.target.value)}
+                                required
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-[#CBD5E1]">
+                            <label className="flex items-center gap-1.5 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepScanLive}
+                                onChange={(e) => setUserSweepScanLive(e.target.checked)}
+                                className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
+                              />
+                              <span>Scan balances</span>
+                            </label>
+                            <label className="flex items-center gap-1.5 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepArchive}
+                                onChange={(e) => setUserSweepArchive(e.target.checked)}
+                                className="rounded border-white/20 bg-[#090B0F] text-amber-500"
+                              />
+                              <span>Archive swept</span>
+                            </label>
+                            <label className="flex items-center gap-1.5 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepAllocateRep}
+                                onChange={(e) => setUserSweepAllocateRep(e.target.checked)}
+                                className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
+                              />
+                              <span>Allocate new</span>
+                            </label>
+                            <label className="flex items-center gap-1.5 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={userSweepAutoReimburse}
+                                onChange={(e) => setUserSweepAutoReimburse(e.target.checked)}
+                                className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
+                              />
+                              <span>Reimburse coins</span>
+                            </label>
+                          </div>
+
+                          <div className="flex flex-wrap items-end gap-2.5">
+                            <div className="flex-1 min-w-[200px]">
+                              <label className="block text-[11px] text-[#8A94A6] mb-1">
+                                Admin Custody Encryption Passphrase
+                              </label>
+                              <input
+                                type="password"
+                                value={userSweepPass}
+                                onChange={(e) => setUserSweepPass(e.target.value)}
+                                required
+                                placeholder="Enter Admin Custody Passphrase"
+                                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                            </div>
+                            <button
+                              type="submit"
+                              disabled={
+                                userSweepBusy ||
+                                userSweepWalletIds.length === 0 ||
+                                custodyCooldownSec > 0 ||
+                                emergencyDestOptions.length === 0
+                              }
+                              className="inline-flex items-center justify-center gap-1.5 px-4 py-2 min-h-[38px] rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                            >
+                              <ShieldAlert className="w-3.5 h-3.5" />
+                              <span>
+                                {userSweepBusy
+                                  ? 'Sweeping...'
+                                  : `Sweep Selected (${userSweepWalletIds.length})`}
+                              </span>
+                            </button>
+                          </div>
+
+                          {userSweepNotice && (
+                            <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs space-y-1.5">
+                              <div className="font-semibold text-emerald-400">
+                                Swept {userSweepNotice.walletCount} wallet(s) →{' '}
+                                {userSweepNotice.destLabel} (Batch {userSweepNotice.batchId})
+                              </div>
+                              {userSweepNotice.generatedMnemonics.map((gm) => (
+                                <div
+                                  key={gm.uid + gm.walletName}
+                                  className="font-mono text-[11px] text-[#CBD5E1] break-words"
+                                >
+                                  New Wallet ({gm.walletName}): {gm.mnemonic}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </form>
+                      </>
                     )}
                   </div>
                 </div>
@@ -3486,222 +4798,1106 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           </div>
         )}
 
-        {/* TAB 4: RISK & SYSTEM CONTROLS */}
+        {/* TAB 3B: BULK OPERATIONS CONSOLE */}
+        {tab === 'bulk_ops' && (
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+              {/* Bulk Emergency Sweep Form */}
+              <form
+                onSubmit={handleExecuteEmergencySweep}
+                className="xl:col-span-7 bg-[#11151C] border border-amber-500/30 rounded-xl p-6 space-y-4"
+              >
+                <div>
+                  <div className="text-xs font-mono uppercase text-amber-400">
+                    Bulk Operations · Emergency Containment
+                  </div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9] mt-0.5">
+                    Bulk User Wallet Sweep, Replacement Allocation & Reimbursement
+                  </h2>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    Sweep all user accounts at once or check specific users below to migrate funds to Cold storage, issue clean replacement wallets, and record Excel/CSV audit trails.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => setSweepMode('selected')}
+                    className={`py-2 px-3 rounded text-xs font-medium transition-colors whitespace-nowrap ${
+                      sweepMode === 'selected'
+                        ? 'bg-amber-500 text-[#090B0F] font-semibold'
+                        : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                    }`}
+                  >
+                    Selected Users ({sweepSelectedUids.length})
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSweepMode('bulk_all')}
+                    className={`py-2 px-3 rounded text-xs font-medium transition-colors whitespace-nowrap ${
+                      sweepMode === 'bulk_all'
+                        ? 'bg-red-500 text-white font-semibold'
+                        : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                    }`}
+                  >
+                    Bulk Sweep All Users ({users.length})
+                  </button>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Emergency Fund / Cold Destination Wallet
+                  </label>
+                  <select
+                    value={sweepDestWalletId}
+                    onChange={(e) => setSweepDestWalletId(e.target.value)}
+                    required
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    <option value="">Select Emergency Cold / Pool Wallet...</option>
+                    {emergencyDestOptions.map((w) => {
+                      const primary =
+                        w.evmAddress ||
+                        w.solanaAddress ||
+                        w.bitcoinAddress ||
+                        w.moneroAddress ||
+                        '';
+                      return (
+                        <option key={w.id} value={w.id}>
+                          {w.tier.toUpperCase()} · {w.label} ({shortenAddress(primary, 6, 4)})
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+
+                {sweepMode === 'selected' && (
+                  <div className="p-3.5 rounded-xl bg-[#090B0F] border border-white/10 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="relative flex-1 min-w-[180px]">
+                        <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-2.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={sweepUserQuery}
+                          onChange={(e) => setSweepUserQuery(e.target.value)}
+                          placeholder="Filter users by email, name, UID..."
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSweepSelectedUids(
+                              Array.from(
+                                new Set([
+                                  ...sweepSelectedUids,
+                                  ...sweepSelectableUsers.map((u) => u.uid),
+                                ])
+                              )
+                            )
+                          }
+                          className="px-2.5 py-1 rounded bg-[#11151C] border border-white/10 text-emerald-400 hover:border-emerald-500/40 whitespace-nowrap"
+                        >
+                          Select Shown ({sweepSelectableUsers.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSweepSelectedUids([])}
+                          className="px-2.5 py-1 rounded bg-[#11151C] border border-white/10 text-[#8A94A6] hover:text-[#F4F6F9] whitespace-nowrap"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="max-h-48 overflow-y-auto divide-y divide-white/[0.06] border border-white/5 rounded-lg">
+                      {sweepSelectableUsers.map((u) => {
+                        const checked = sweepSelectedUids.includes(u.uid);
+                        return (
+                          <label
+                            key={u.uid}
+                            className={`flex items-center justify-between gap-3 px-3 py-2 text-xs cursor-pointer hover:bg-white/[0.03] ${
+                              checked ? 'bg-amber-500/10' : ''
+                            }`}
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => handleToggleSweepUser(u.uid)}
+                                className="rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                              />
+                              <div className="min-w-0">
+                                <div className="font-medium text-[#F4F6F9] truncate">
+                                  {u.displayName}
+                                </div>
+                                <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                                  {u.email}
+                                </div>
+                              </div>
+                            </div>
+                            <span className="font-mono text-[11px] text-[#8A94A6] tabular-nums shrink-0">
+                              {u.walletCount} wallets
+                            </span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">Incident Reason</label>
+                    <input
+                      type="text"
+                      value={sweepReason}
+                      onChange={(e) => setSweepReason(e.target.value)}
+                      required
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Replacement Wallet Prefix
+                    </label>
+                    <input
+                      type="text"
+                      value={sweepReplacementPrefix}
+                      onChange={(e) => setSweepReplacementPrefix(e.target.value)}
+                      required
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Fallback USD / User (Optional)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={sweepOverrideUsd}
+                      onChange={(e) => setSweepOverrideUsd(e.target.value)}
+                      placeholder="0.00 (uses live scan)"
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Reimbursed Coins Note (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={sweepOverrideCoinNote}
+                      onChange={(e) => setSweepOverrideCoinNote(e.target.value)}
+                      placeholder="e.g. 1.50 ETH + 500 USDC"
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
+                  <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sweepScanLiveBalances}
+                      onChange={(e) => setSweepScanLiveBalances(e.target.checked)}
+                      className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                    />
+                    <span>Scan live balances</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sweepArchiveCompromised}
+                      onChange={(e) => setSweepArchiveCompromised(e.target.checked)}
+                      className="rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                    />
+                    <span>Archive swept wallets</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sweepAutoReimburse}
+                      onChange={(e) => setSweepAutoReimburse(e.target.checked)}
+                      className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                    />
+                    <span>Reimburse immediately</span>
+                  </label>
+                </div>
+
+                <div className="flex flex-wrap items-end gap-3 pt-1">
+                  <div className="flex-1 min-w-[220px]">
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Confirm Admin Custody Encryption Passphrase
+                    </label>
+                    <input
+                      type="password"
+                      value={sweepCustodyPass}
+                      onChange={(e) => setSweepCustodyPass(e.target.value)}
+                      required
+                      placeholder="Required to authorize bulk sweep"
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={sweepExecuting || custodyCooldownSec > 0 || emergencyDestOptions.length === 0}
+                    className="inline-flex items-center justify-center gap-2 px-5 py-2.5 min-h-[38px] rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                  >
+                    <ShieldAlert className="w-4 h-4" />
+                    <span>
+                      {sweepExecuting
+                        ? 'Executing Bulk Sweep...'
+                        : sweepMode === 'bulk_all'
+                        ? `Bulk Sweep All (${users.length})`
+                        : `Sweep Selected (${sweepSelectedUids.length})`}
+                    </span>
+                  </button>
+                </div>
+
+                {sweepResultNotice && (
+                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2 text-xs">
+                    <div className="font-semibold text-emerald-400">
+                      Bulk Sweep Complete · Batch {sweepResultNotice.batchId}
+                    </div>
+                    <p className="text-[#CBD5E1]">
+                      Swept <strong>{sweepResultNotice.count}</strong> account(s) →{' '}
+                      <strong>{sweepResultNotice.destLabel}</strong>.
+                    </p>
+                  </div>
+                )}
+              </form>
+
+              {/* Right Column: Bulk User Governance & Fleet Settlements */}
+              <div className="xl:col-span-5 space-y-5">
+                <div className="bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4">
+                  <div>
+                    <h3 className="text-base font-semibold text-[#F4F6F9]">
+                      Bulk User Governance ({sweepSelectedUids.length} Selected)
+                    </h3>
+                    <p className="text-xs text-[#8A94A6] mt-0.5">
+                      Suspend or reactivate multiple checked user accounts from the selection picker.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={bulkGovBusy || sweepSelectedUids.length === 0}
+                      onClick={() => handleBulkUserStatusUpdate('suspended')}
+                      className="flex-1 py-2.5 px-3 rounded-lg bg-[#090B0F] border border-red-500/40 hover:bg-red-500/10 disabled:opacity-40 text-xs font-semibold text-red-300 whitespace-nowrap"
+                    >
+                      Suspend Selected ({sweepSelectedUids.length})
+                    </button>
+                    <button
+                      type="button"
+                      disabled={bulkGovBusy || sweepSelectedUids.length === 0}
+                      onClick={() => handleBulkUserStatusUpdate('active')}
+                      className="flex-1 py-2.5 px-3 rounded-lg bg-[#090B0F] border border-emerald-500/40 hover:bg-emerald-500/10 disabled:opacity-40 text-xs font-semibold text-emerald-400 whitespace-nowrap"
+                    >
+                      Activate Selected ({sweepSelectedUids.length})
+                    </button>
+                  </div>
+                </div>
+
+                <div className="bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4">
+                  <div>
+                    <h3 className="text-base font-semibold text-[#F4F6F9]">
+                      Bulk Treasury Settlements & Exports
+                    </h3>
+                    <p className="text-xs text-[#8A94A6] mt-0.5">
+                      Batch disburse pending claims, clear gas sponsorship ledgers, or export Excel audit sheets.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2.5">
+                    <button
+                      type="button"
+                      disabled={bulkGovBusy || pendingClaimsCount === 0}
+                      onClick={handleBulkDisburseAllPendingClaims}
+                      className="w-full py-2.5 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                    >
+                      Bulk Disburse Pending Claims ({pendingClaimsCount})
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={Boolean(settlingFeeGasId) || pendingFeeGasCount === 0}
+                      onClick={handleSettleAllPendingFeeGas}
+                      className="w-full py-2.5 px-4 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 disabled:opacity-40 text-xs font-medium text-[#F4F6F9] whitespace-nowrap"
+                    >
+                      Bulk Settle Pending Gas & Fees ({pendingFeeGasCount})
+                    </button>
+
+                    <div className="grid grid-cols-2 gap-2 pt-1">
+                      <button
+                        type="button"
+                        disabled={filteredEmergencySweeps.length === 0}
+                        onClick={() => downloadEmergencySweepsExcel(filteredEmergencySweeps)}
+                        className="inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-[#090B0F] border border-emerald-500/40 disabled:opacity-40 text-xs font-medium text-emerald-400 whitespace-nowrap"
+                      >
+                        <FileSpreadsheet className="w-3.5 h-3.5" />
+                        <span>Export Excel (.xls)</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={filteredEmergencySweeps.length === 0}
+                        onClick={() => downloadEmergencySweepsCsv(filteredEmergencySweeps)}
+                        className="inline-flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-[#090B0F] border border-white/10 disabled:opacity-40 text-xs text-[#CBD5E1] whitespace-nowrap"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Export CSV</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {bulkGovNotice && (
+                    <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-400">
+                      {bulkGovNotice}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB 4: RISK & SYSTEM CONTROLS + EMERGENCY SWEEP CONTAINMENT */}
         {tab === 'risk' && (
-          <div className="max-w-2xl bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-5">
-            <div>
-              <h2 className="text-base font-semibold text-[#F4F6F9]">
-                Exchange Risk & Circuit Breakers
-              </h2>
-              <p className="text-xs text-[#8A94A6] mt-0.5">
-                Global operational parameters synced via Firestore system_config/exchange
-              </p>
+          <div className="space-y-6">
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+              {/* Left Column: Global Circuit Breakers, Gas & Fee Rules */}
+              <div className="xl:col-span-5 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-5">
+                <div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9]">
+                    Exchange Risk & Circuit Breakers
+                  </h2>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    Global operational parameters synced via Firestore system_config/exchange
+                  </p>
+                </div>
+
+                <div className="space-y-4">
+                  <label className="flex items-center justify-between gap-3 p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
+                    <div>
+                      <div className="text-sm font-medium text-[#F4F6F9]">Maintenance Mode</div>
+                      <div className="text-xs text-[#8A94A6]">
+                        Displays scheduled maintenance advisory across client dashboards
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={systemConfig.maintenanceMode}
+                      onChange={(e) =>
+                        setSystemConfig((prev) => ({ ...prev, maintenanceMode: e.target.checked }))
+                      }
+                      className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                    />
+                  </label>
+
+                  <label className="flex items-center justify-between gap-3 p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
+                    <div>
+                      <div className="text-sm font-medium text-[#F4F6F9]">
+                        Emergency Withdrawal Circuit Breaker
+                      </div>
+                      <div className="text-xs text-[#8A94A6]">
+                        Halts automated hot-wallet outbound settlements during incident response
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={systemConfig.withdrawalsPaused}
+                      onChange={(e) =>
+                        setSystemConfig((prev) => ({
+                          ...prev,
+                          withdrawalsPaused: e.target.checked,
+                        }))
+                      }
+                      className="rounded border-white/20 bg-[#11151C] text-red-500 shrink-0"
+                    />
+                  </label>
+
+                  <label className="flex items-center justify-between gap-3 p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
+                    <div>
+                      <div className="text-sm font-medium text-[#F4F6F9]">
+                        Automatic Exchange Gas Sponsorship
+                      </div>
+                      <div className="text-xs text-[#8A94A6]">
+                        Automatically calculates network gas for Send, Receive, Swap, and Sweep transactions
+                      </div>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={systemConfig.gasSponsorshipEnabled ?? true}
+                      onChange={(e) =>
+                        setSystemConfig((prev) => ({
+                          ...prev,
+                          gasSponsorshipEnabled: e.target.checked,
+                        }))
+                      }
+                      className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                    />
+                  </label>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                      <label className="block text-xs text-[#8A94A6] mb-1">
+                        Hot Reserve (%)
+                      </label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={systemConfig.hotWalletMaxPct}
+                        onChange={(e) =>
+                          setSystemConfig((prev) => ({
+                            ...prev,
+                            hotWalletMaxPct: Number(e.target.value),
+                          }))
+                        }
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-[#8A94A6] mb-1">
+                        Swap Fee (BPS)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={500}
+                        value={systemConfig.swapFeeBps}
+                        onChange={(e) =>
+                          setSystemConfig((prev) => ({
+                            ...prev,
+                            swapFeeBps: Number(e.target.value),
+                          }))
+                        }
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-xs text-[#8A94A6] mb-1">
+                        Send Fee (BPS)
+                      </label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={500}
+                        value={systemConfig.sendFeeBps ?? 25}
+                        onChange={(e) =>
+                          setSystemConfig((prev) => ({
+                            ...prev,
+                            sendFeeBps: Number(e.target.value),
+                          }))
+                        }
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs text-[#8A94A6] mb-1">
+                        Gas Sponsor Wallet
+                      </label>
+                      <select
+                        value={systemConfig.gasSponsorWalletId || ''}
+                        onChange={(e) => {
+                          const found = activeExchangeWallets.find((w) => w.id === e.target.value);
+                          const addr = found
+                            ? found.evmAddress ||
+                              found.solanaAddress ||
+                              found.bitcoinAddress ||
+                              found.moneroAddress ||
+                              ''
+                            : undefined;
+                          setSystemConfig((prev) => ({
+                            ...prev,
+                            gasSponsorWalletId: found?.id,
+                            gasSponsorWalletLabel: found
+                              ? `${found.tier.toUpperCase()} · ${found.label}`
+                              : undefined,
+                            gasSponsorWalletAddress: addr,
+                          }));
+                        }}
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                      >
+                        <option value="">Select Gas Sponsor Wallet...</option>
+                        {activeExchangeWallets
+                          .filter((w) => w.status !== 'frozen')
+                          .map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.tier.toUpperCase()} · {w.label}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs text-[#8A94A6] mb-1">
+                        Nominated Fee Collector
+                      </label>
+                      <select
+                        value={systemConfig.feeCollectorWalletId || ''}
+                        onChange={(e) => {
+                          const found = activeExchangeWallets.find((w) => w.id === e.target.value);
+                          const addr = found
+                            ? found.evmAddress ||
+                              found.solanaAddress ||
+                              found.bitcoinAddress ||
+                              found.moneroAddress ||
+                              ''
+                            : undefined;
+                          setSystemConfig((prev) => ({
+                            ...prev,
+                            feeCollectorWalletId: found?.id,
+                            feeCollectorWalletLabel: found
+                              ? `${found.tier.toUpperCase()} · ${found.label}`
+                              : undefined,
+                            feeCollectorWalletAddress: addr,
+                          }));
+                        }}
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                      >
+                        <option value="">Select Nominated Fee Wallet...</option>
+                        {activeExchangeWallets
+                          .filter((w) => w.status !== 'frozen')
+                          .map((w) => (
+                            <option key={w.id} value={w.id}>
+                              {w.tier.toUpperCase()} · {w.label}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  {configSavedNotice && (
+                    <div className="text-xs text-emerald-400 font-medium">{configSavedNotice}</div>
+                  )}
+
+                  <button
+                    type="button"
+                    disabled={savingGasFeeConfig}
+                    onClick={handleSaveSystemConfig}
+                    className="w-full sm:w-auto px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
+                  >
+                    {savingGasFeeConfig ? 'Saving...' : 'Save Exchange Configuration'}
+                  </button>
+                </div>
+              </div>
+
+              {/* Right Column: Emergency Risk Sweep, Wallet Replacement & Coin Reimbursement */}
+              <form
+                onSubmit={handleExecuteEmergencySweep}
+                className="xl:col-span-7 bg-[#11151C] border border-amber-500/30 rounded-xl p-6 space-y-4"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-amber-400 text-xs font-mono uppercase">
+                      <AlertTriangle className="w-4 h-4 shrink-0" />
+                      <span>Emergency Incident Containment</span>
+                    </div>
+                    <h2 className="text-base font-semibold text-[#F4F6F9] mt-0.5">
+                      Emergency User Wallet Sweep, Allocation & Coin Reimbursement
+                    </h2>
+                    <p className="text-xs text-[#8A94A6] mt-0.5">
+                      Sweep bulk or selected user wallets to an Emergency Cold/Fund Wallet, archive compromised vaults, allocate clean replacement wallets, and issue coin reimbursements.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Scope Toggle */}
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1.5">Sweep Target Scope</label>
+                  <div className="grid grid-cols-2 gap-1.5 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
+                    <button
+                      type="button"
+                      onClick={() => setSweepMode('selected')}
+                      className={`py-2 px-3 rounded text-xs font-medium transition-colors ${
+                        sweepMode === 'selected'
+                          ? 'bg-amber-500 text-[#090B0F] font-semibold'
+                          : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                      }`}
+                    >
+                      Selected Users ({sweepSelectedUids.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setSweepMode('bulk_all')}
+                      className={`py-2 px-3 rounded text-xs font-medium transition-colors ${
+                        sweepMode === 'bulk_all'
+                          ? 'bg-red-500 text-white font-semibold'
+                          : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                      }`}
+                    >
+                      Bulk Sweep All Users ({users.length})
+                    </button>
+                  </div>
+                </div>
+
+                {/* Destination Cold / Emergency Fund Wallet */}
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Emergency Fund / Cold Destination Wallet
+                  </label>
+                  <select
+                    value={sweepDestWalletId}
+                    onChange={(e) => setSweepDestWalletId(e.target.value)}
+                    required
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    <option value="">Select Emergency Cold / Pool Wallet...</option>
+                    {emergencyDestOptions.map((w) => {
+                      const primary =
+                        w.evmAddress ||
+                        w.solanaAddress ||
+                        w.bitcoinAddress ||
+                        w.moneroAddress ||
+                        '';
+                      return (
+                        <option key={w.id} value={w.id}>
+                          {w.tier.toUpperCase()} · {w.label} ({shortenAddress(primary, 6, 4)})
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {emergencyDestOptions.length === 0 && (
+                    <p className="text-[11px] text-amber-400 mt-1">
+                      Create or activate a Cold Vault or Pool Wallet under Cold / Pool / Hot first.
+                    </p>
+                  )}
+                </div>
+
+                {/* Selective User Picker */}
+                {sweepMode === 'selected' && (
+                  <div className="p-3.5 rounded-xl bg-[#090B0F] border border-white/10 space-y-2.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="relative flex-1 min-w-[180px]">
+                        <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-2.5 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          value={sweepUserQuery}
+                          onChange={(e) => setSweepUserQuery(e.target.value)}
+                          placeholder="Filter users by email, name, UID..."
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                        />
+                      </div>
+                      <div className="flex items-center gap-1.5 text-[11px]">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSweepSelectedUids(
+                              Array.from(
+                                new Set([
+                                  ...sweepSelectedUids,
+                                  ...sweepSelectableUsers.map((u) => u.uid),
+                                ])
+                              )
+                            )
+                          }
+                          className="px-2.5 py-1 rounded bg-[#11151C] border border-white/10 text-emerald-400 hover:border-emerald-500/40 whitespace-nowrap"
+                        >
+                          Select Shown ({sweepSelectableUsers.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSweepSelectedUids([])}
+                          className="px-2.5 py-1 rounded bg-[#11151C] border border-white/10 text-[#8A94A6] hover:text-[#F4F6F9] whitespace-nowrap"
+                        >
+                          Clear
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="max-h-48 overflow-y-auto divide-y divide-white/[0.06] border border-white/5 rounded-lg">
+                      {sweepSelectableUsers.length === 0 ? (
+                        <div className="p-4 text-center text-xs text-[#8A94A6]">
+                          No matching user accounts found.
+                        </div>
+                      ) : (
+                        sweepSelectableUsers.map((u) => {
+                          const checked = sweepSelectedUids.includes(u.uid);
+                          return (
+                            <label
+                              key={u.uid}
+                              className={`flex items-center justify-between gap-3 px-3 py-2 text-xs cursor-pointer hover:bg-white/[0.03] ${
+                                checked ? 'bg-amber-500/10' : ''
+                              }`}
+                            >
+                              <div className="flex items-center gap-2.5 min-w-0">
+                                <input
+                                  type="checkbox"
+                                  checked={checked}
+                                  onChange={() => handleToggleSweepUser(u.uid)}
+                                  className="rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                                />
+                                <div className="min-w-0">
+                                  <div className="font-medium text-[#F4F6F9] truncate">
+                                    {u.displayName}
+                                  </div>
+                                  <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                                    {u.email}
+                                  </div>
+                                </div>
+                              </div>
+                              <span className="font-mono text-[11px] text-[#8A94A6] tabular-nums shrink-0">
+                                {u.walletCount} wallets
+                              </span>
+                            </label>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Incident / Risk Reason
+                    </label>
+                    <input
+                      type="text"
+                      value={sweepReason}
+                      onChange={(e) => setSweepReason(e.target.value)}
+                      required
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Replacement Wallet Prefix
+                    </label>
+                    <input
+                      type="text"
+                      value={sweepReplacementPrefix}
+                      onChange={(e) => setSweepReplacementPrefix(e.target.value)}
+                      required
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Fallback Reimbursement USD / User (Optional)
+                    </label>
+                    <input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={sweepOverrideUsd}
+                      onChange={(e) => setSweepOverrideUsd(e.target.value)}
+                      placeholder="0.00 (uses live scan if > 0)"
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Reimbursed Coins Note (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      value={sweepOverrideCoinNote}
+                      onChange={(e) => setSweepOverrideCoinNote(e.target.value)}
+                      placeholder="e.g. 1.50 ETH + 500 USDC"
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-1">
+                  <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sweepScanLiveBalances}
+                      onChange={(e) => setSweepScanLiveBalances(e.target.checked)}
+                      className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                    />
+                    <span>Scan live balances</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sweepArchiveCompromised}
+                      onChange={(e) => setSweepArchiveCompromised(e.target.checked)}
+                      className="rounded border-white/20 bg-[#11151C] text-amber-500 shrink-0"
+                    />
+                    <span>Archive swept wallets</span>
+                  </label>
+                  <label className="flex items-center gap-2 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={sweepAutoReimburse}
+                      onChange={(e) => setSweepAutoReimburse(e.target.checked)}
+                      className="rounded border-white/20 bg-[#11151C] text-emerald-500 shrink-0"
+                    />
+                    <span>Reimburse immediately</span>
+                  </label>
+                </div>
+
+                <div className="flex flex-wrap items-end gap-3 pt-1">
+                  <div className="flex-1 min-w-[220px]">
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Confirm Admin Custody Encryption Passphrase
+                    </label>
+                    <input
+                      type="password"
+                      value={sweepCustodyPass}
+                      onChange={(e) => setSweepCustodyPass(e.target.value)}
+                      placeholder="Required to authorize sweep & encrypt replacement wallets"
+                      required
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={sweepExecuting || custodyCooldownSec > 0 || emergencyDestOptions.length === 0}
+                    className="inline-flex items-center justify-center gap-2 px-5 py-2.5 min-h-[38px] rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                  >
+                    <ShieldAlert className="w-4 h-4" />
+                    <span>
+                      {custodyCooldownSec > 0
+                        ? `Cooldown (${custodyCooldownSec}s)`
+                        : sweepExecuting
+                        ? 'Executing Emergency Sweep...'
+                        : sweepMode === 'bulk_all'
+                        ? `Bulk Sweep All (${users.length})`
+                        : `Sweep Selected (${sweepSelectedUids.length})`}
+                    </span>
+                  </button>
+                </div>
+
+                {sweepResultNotice && (
+                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2.5 text-xs">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="font-semibold text-emerald-400">
+                        Emergency Sweep Complete · Batch {sweepResultNotice.batchId}
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setSweepResultNotice(null)}
+                        className="text-[11px] text-[#8A94A6] hover:text-[#F4F6F9]"
+                      >
+                        Dismiss
+                      </button>
+                    </div>
+                    <p className="text-[#CBD5E1]">
+                      Swept <strong>{sweepResultNotice.count}</strong> user account(s) →{' '}
+                      <strong>{sweepResultNotice.destLabel}</strong>, allocated clean multi-chain replacement wallets, and persisted full audit/Excel records.
+                    </p>
+                    <div className="max-h-40 overflow-y-auto space-y-1.5 pt-1">
+                      {sweepResultNotice.generatedMnemonics.map((item) => (
+                        <div
+                          key={item.uid + item.walletName}
+                          className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-2"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-medium text-[#F4F6F9] text-[11px]">
+                              {item.email} · {item.walletName}
+                            </div>
+                            <div className="font-mono text-[11px] text-emerald-300 break-words">
+                              {item.mnemonic}
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(`emg_${item.uid}`, item.mnemonic)}
+                            className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#11151C] border border-white/10 text-[11px] text-[#CBD5E1] shrink-0"
+                          >
+                            {copiedKey === `emg_${item.uid}` ? (
+                              <Check className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3 h-3" />
+                            )}
+                            <span>Copy Seed</span>
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </form>
             </div>
 
-            <div className="space-y-4">
-              <label className="flex items-center justify-between p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
+            {/* Emergency Sweep & Reimbursement Records + Excel Export */}
+            <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+              <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <div className="text-sm font-medium text-[#F4F6F9]">Maintenance Mode</div>
-                  <div className="text-xs text-[#8A94A6]">
-                    Displays scheduled maintenance advisory across client dashboards
-                  </div>
+                  <h3 className="text-base font-semibold text-[#F4F6F9]">
+                    Emergency Sweep & Coin Reimbursement Records ({filteredEmergencySweeps.length})
+                  </h3>
+                  <p className="text-xs text-[#8A94A6]">
+                    Permanent ledger of swept user wallets, destination cold vaults, allocated replacement wallets, and coin reimbursements.
+                  </p>
                 </div>
-                <input
-                  type="checkbox"
-                  checked={systemConfig.maintenanceMode}
-                  onChange={(e) =>
-                    setSystemConfig((prev) => ({ ...prev, maintenanceMode: e.target.checked }))
-                  }
-                  className="rounded border-white/20 bg-[#11151C] text-emerald-500"
-                />
-              </label>
 
-              <label className="flex items-center justify-between p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
-                <div>
-                  <div className="text-sm font-medium text-[#F4F6F9]">
-                    Emergency Withdrawal Circuit Breaker
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={sweepRecordSearch}
+                      onChange={(e) => setSweepRecordSearch(e.target.value)}
+                      placeholder="Search email, batch, wallet..."
+                      className="bg-[#090B0F] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-base sm:text-xs text-[#F4F6F9] w-52"
+                    />
                   </div>
-                  <div className="text-xs text-[#8A94A6]">
-                    Halts automated hot-wallet outbound settlements during incident response
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={systemConfig.withdrawalsPaused}
-                  onChange={(e) =>
-                    setSystemConfig((prev) => ({ ...prev, withdrawalsPaused: e.target.checked }))
-                  }
-                  className="rounded border-white/20 bg-[#11151C] text-red-500"
-                />
-              </label>
+                  <select
+                    value={sweepRecordStatusFilter}
+                    onChange={(e) =>
+                      setSweepRecordStatusFilter(
+                        e.target.value as 'all' | 'reimbursed' | 'pending_reimbursement'
+                      )
+                    }
+                    className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="reimbursed">Reimbursed</option>
+                    <option value="pending_reimbursement">Pending Reimbursement</option>
+                  </select>
 
-              <label className="flex items-center justify-between p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
-                <div>
-                  <div className="text-sm font-medium text-[#F4F6F9]">
-                    Automatic Exchange Gas Sponsorship
-                  </div>
-                  <div className="text-xs text-[#8A94A6]">
-                    Automatically calculates network gas for Send, Receive, Swap, and Sweep transactions and requests gas from the selected Gas Sponsor Wallet
-                  </div>
-                </div>
-                <input
-                  type="checkbox"
-                  checked={systemConfig.gasSponsorshipEnabled ?? true}
-                  onChange={(e) =>
-                    setSystemConfig((prev) => ({
-                      ...prev,
-                      gasSponsorshipEnabled: e.target.checked,
-                    }))
-                  }
-                  className="rounded border-white/20 bg-[#11151C] text-emerald-500"
-                />
-              </label>
+                  <button
+                    type="button"
+                    disabled={filteredEmergencySweeps.length === 0}
+                    onClick={() => downloadEmergencySweepsExcel(filteredEmergencySweeps)}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                  >
+                    <FileSpreadsheet className="w-3.5 h-3.5" />
+                    <span>Download Excel (.xls)</span>
+                  </button>
 
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-xs text-[#8A94A6] mb-1">
-                    Hot Wallet Max Reserve Ratio (%)
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={systemConfig.hotWalletMaxPct}
-                    onChange={(e) =>
-                      setSystemConfig((prev) => ({
-                        ...prev,
-                        hotWalletMaxPct: Number(e.target.value),
-                      }))
-                    }
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#8A94A6] mb-1">
-                    Swap Routing Fee (BPS)
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={500}
-                    value={systemConfig.swapFeeBps}
-                    onChange={(e) =>
-                      setSystemConfig((prev) => ({
-                        ...prev,
-                        swapFeeBps: Number(e.target.value),
-                      }))
-                    }
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#8A94A6] mb-1">
-                    Send / Withdrawal Fee (BPS)
-                  </label>
-                  <input
-                    type="number"
-                    min={0}
-                    max={500}
-                    value={systemConfig.sendFeeBps ?? 25}
-                    onChange={(e) =>
-                      setSystemConfig((prev) => ({
-                        ...prev,
-                        sendFeeBps: Number(e.target.value),
-                      }))
-                    }
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
-                  />
+                  <button
+                    type="button"
+                    disabled={filteredEmergencySweeps.length === 0}
+                    onClick={() => downloadEmergencySweepsCsv(filteredEmergencySweeps)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-white/25 disabled:opacity-40 text-[#CBD5E1] text-xs whitespace-nowrap"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>CSV</span>
+                  </button>
                 </div>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs text-[#8A94A6] mb-1">
-                    Gas Sponsor Wallet (Covers User Gas)
-                  </label>
-                  <select
-                    value={systemConfig.gasSponsorWalletId || ''}
-                    onChange={(e) => {
-                      const found = activeExchangeWallets.find((w) => w.id === e.target.value);
-                      const addr = found
-                        ? found.evmAddress ||
-                          found.solanaAddress ||
-                          found.bitcoinAddress ||
-                          found.moneroAddress ||
-                          ''
-                        : undefined;
-                      setSystemConfig((prev) => ({
-                        ...prev,
-                        gasSponsorWalletId: found?.id,
-                        gasSponsorWalletLabel: found
-                          ? `${found.tier.toUpperCase()} · ${found.label}`
-                          : undefined,
-                        gasSponsorWalletAddress: addr,
-                      }));
-                    }}
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
-                  >
-                    <option value="">Select Gas Sponsor Wallet...</option>
-                    {activeExchangeWallets
-                      .filter((w) => w.status !== 'frozen')
-                      .map((w) => (
-                        <option key={w.id} value={w.id}>
-                          {w.tier.toUpperCase()} · {w.label}
-                        </option>
-                      ))}
-                  </select>
+              {filteredEmergencySweeps.length === 0 ? (
+                <div className="p-10 text-center text-xs text-[#8A94A6]">
+                  No emergency user wallet sweeps recorded yet. Execute a Bulk or Selective Emergency Sweep above to protect user funds and generate downloadable Excel records.
                 </div>
-
-                <div>
-                  <label className="block text-xs text-[#8A94A6] mb-1">
-                    Nominated Fee Collector Wallet (Receives Fees)
-                  </label>
-                  <select
-                    value={systemConfig.feeCollectorWalletId || ''}
-                    onChange={(e) => {
-                      const found = activeExchangeWallets.find((w) => w.id === e.target.value);
-                      const addr = found
-                        ? found.evmAddress ||
-                          found.solanaAddress ||
-                          found.bitcoinAddress ||
-                          found.moneroAddress ||
-                          ''
-                        : undefined;
-                      setSystemConfig((prev) => ({
-                        ...prev,
-                        feeCollectorWalletId: found?.id,
-                        feeCollectorWalletLabel: found
-                          ? `${found.tier.toUpperCase()} · ${found.label}`
-                          : undefined,
-                        feeCollectorWalletAddress: addr,
-                      }));
-                    }}
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
-                  >
-                    <option value="">Select Nominated Fee Wallet...</option>
-                    {activeExchangeWallets
-                      .filter((w) => w.status !== 'frozen')
-                      .map((w) => (
-                        <option key={w.id} value={w.id}>
-                          {w.tier.toUpperCase()} · {w.label}
-                        </option>
-                      ))}
-                  </select>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-white/10 text-[11px] text-[#8A94A6]">
+                        <th className="py-3 px-5">Batch & Time</th>
+                        <th className="py-3 px-4">Affected User</th>
+                        <th className="py-3 px-4">Swept Wallets & Coins</th>
+                        <th className="py-3 px-4">Emergency Cold Dest</th>
+                        <th className="py-3 px-4">Allocated Replacement Wallet</th>
+                        <th className="py-3 px-5 text-right">Reimbursement</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.06] text-xs">
+                      {filteredEmergencySweeps.map((rec) => {
+                        const busy = reimbursingSweepId === rec.id;
+                        return (
+                          <tr key={rec.id} className="hover:bg-white/[0.02] align-top">
+                            <td className="py-3 px-5 font-mono text-[11px] whitespace-nowrap">
+                              <div className="text-[#F4F6F9]">
+                                {rec.mode === 'bulk_all' ? 'BULK' : 'SELECT'}
+                              </div>
+                              <div className="text-[#64748B]">
+                                {formatRelativeTime(rec.createdAt)}
+                              </div>
+                              <div className="text-[10px] text-[#64748B]">
+                                {rec.batchId.slice(0, 16)}
+                              </div>
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="font-medium text-[#F4F6F9]">
+                                {rec.targetDisplayName}
+                              </div>
+                              <div className="font-mono text-[11px] text-[#8A94A6]">
+                                {rec.targetEmail}
+                              </div>
+                              <div className="text-[11px] text-[#64748B] max-w-[200px] truncate">
+                                {rec.reason}
+                              </div>
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="font-semibold text-amber-300 tabular-nums">
+                                {formatFiat(rec.sweptUsdValue, 'USD')}
+                              </div>
+                              <div className="text-[11px] text-[#CBD5E1] max-w-[220px]">
+                                {rec.sweptAssetsSummary}
+                              </div>
+                              <div className="font-mono text-[10px] text-[#64748B] max-w-[220px] truncate">
+                                {rec.sweptWalletIds.length} wallet(s): {rec.sweptAddressesSummary}
+                              </div>
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="text-sky-400 font-medium">
+                                {rec.destinationWalletLabel}
+                              </div>
+                              <div className="font-mono text-[11px] text-[#8A94A6]">
+                                {shortenAddress(rec.destinationAddress, 8, 6)}
+                              </div>
+                            </td>
+                            <td className="py-3 px-4">
+                              <div className="text-emerald-400 font-medium">
+                                {rec.replacementWalletName}
+                              </div>
+                              {rec.replacementEvmAddress && (
+                                <div className="font-mono text-[11px] text-[#CBD5E1]">
+                                  EVM: {shortenAddress(rec.replacementEvmAddress, 8, 6)}
+                                </div>
+                              )}
+                              {rec.replacementSolanaAddress && (
+                                <div className="font-mono text-[11px] text-[#8A94A6]">
+                                  SOL: {shortenAddress(rec.replacementSolanaAddress, 8, 6)}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-3 px-5 text-right whitespace-nowrap">
+                              {rec.reimbursementStatus === 'reimbursed' ? (
+                                <div className="space-y-0.5">
+                                  <span className="inline-block px-2.5 py-1 rounded bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-400 font-semibold">
+                                    Reimbursed
+                                  </span>
+                                  <div className="font-mono text-[11px] text-[#CBD5E1] tabular-nums">
+                                    {rec.reimbursedAmountSummary}
+                                  </div>
+                                  {rec.reimbursedTxHash && (
+                                    <div className="font-mono text-[10px] text-[#64748B]">
+                                      Tx: {shortenAddress(rec.reimbursedTxHash, 8, 6)}
+                                    </div>
+                                  )}
+                                </div>
+                              ) : (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => handleReimburseSweepRecord(rec)}
+                                  className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
+                                >
+                                  {busy ? 'Reimbursing...' : 'Reimburse Coins'}
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
                 </div>
-              </div>
-
-              {configSavedNotice && (
-                <div className="text-xs text-emerald-400 font-medium">{configSavedNotice}</div>
               )}
-
-              <button
-                type="button"
-                disabled={savingGasFeeConfig}
-                onClick={handleSaveSystemConfig}
-                className="px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
-              >
-                {savingGasFeeConfig ? 'Saving...' : 'Save Exchange Configuration'}
-              </button>
             </div>
           </div>
         )}

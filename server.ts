@@ -251,9 +251,97 @@ async function fetchCoinHistory(coinId: string, days: string): Promise<Array<[nu
   return points;
 }
 
+const ALLOWED_HISTORY_DAYS = new Set(['1', '7', '30', '90', '365']);
+const ALLOWED_RPC_METHODS = new Set([
+  // EVM read & broadcast
+  'eth_chainId',
+  'net_version',
+  'eth_blockNumber',
+  'eth_gasPrice',
+  'eth_feeHistory',
+  'eth_maxPriorityFeePerGas',
+  'eth_getBalance',
+  'eth_call',
+  'eth_estimateGas',
+  'eth_getTransactionCount',
+  'eth_getTransactionReceipt',
+  'eth_getTransactionByHash',
+  'eth_getCode',
+  'eth_sendRawTransaction',
+  // Solana read & broadcast
+  'getBalance',
+  'getLatestBlockhash',
+  'getSlot',
+  'getFeeForMessage',
+  'getSignaturesForAddress',
+  'getTransaction',
+  'getAccountInfo',
+  'getTokenAccountsByOwner',
+  'sendTransaction',
+  'simulateTransaction',
+]);
+
+const BTC_ADDR_REGEX = /^(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[ac-hj-np-z02-9]{11,71})$/;
+const EVM_ADDR_REGEX = /^0x[a-fA-F0-9]{40}$/;
+const SOL_ADDR_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+const ipRateMap = new Map<string, { count: number; resetAt: number }>();
+let activeSseClients = 0;
+const MAX_SSE_CLIENTS = 100;
+
+function checkApiRateLimit(ip: string, maxPerMin = 300): boolean {
+  const now = Date.now();
+  const entry = ipRateMap.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    ipRateMap.set(ip, { count: 1, resetAt: now + 60_000 });
+    return true;
+  }
+  if (entry.count >= maxPerMin) {
+    return false;
+  }
+  entry.count += 1;
+  return true;
+}
+
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '1mb' }));
+  app.disable('x-powered-by');
+  app.set('trust proxy', 1);
+
+  // Security headers compatible with AI Studio iframe hosting & Firebase Auth popups
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=(), payment=(), usb=()');
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin-allow-popups');
+    res.setHeader(
+      'Content-Security-Policy',
+      [
+        "default-src 'self'",
+        "script-src 'self' 'unsafe-inline' https://apis.google.com https://www.gstatic.com",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' data: https://fonts.gstatic.com",
+        "img-src 'self' data: https: blob:",
+        "connect-src 'self' https: wss: ws:",
+        "frame-src 'self' https://*.firebaseapp.com https://accounts.google.com",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+      ].join('; ')
+    );
+    next();
+  });
+
+  app.use('/api', (req, res, next) => {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkApiRateLimit(clientIp, 300)) {
+      res.status(429).json({ error: 'Rate limit exceeded. Please wait briefly and retry.' });
+      return;
+    }
+    next();
+  });
+
+  app.use(express.json({ limit: '512kb' }));
 
   // Live market prices
   app.get('/api/markets', async (req: Request, res: Response) => {
@@ -261,25 +349,34 @@ async function startServer() {
       const force = req.query.force === '1';
       const data = await getLiveMarkets(force);
       res.json({ coins: data, updatedAt: new Date().toISOString() });
-    } catch (err) {
-      res.status(502).json({ error: err instanceof Error ? err.message : 'Failed to load market prices' });
+    } catch {
+      res.status(502).json({ error: 'Market price feed temporarily unavailable' });
     }
   });
 
   // Historical chart prices
   app.get('/api/markets/history', async (req: Request, res: Response) => {
-    const coinId = String(req.query.coinId || 'ethereum');
+    const coinId = String(req.query.coinId || 'ethereum').toLowerCase();
     const days = String(req.query.days || '7');
+    if (!TRACKED_COINS.some((c) => c.id === coinId) || !ALLOWED_HISTORY_DAYS.has(days)) {
+      res.status(400).json({ error: 'Invalid coinId or timeframe parameter' });
+      return;
+    }
     try {
       const prices = await fetchCoinHistory(coinId, days);
       res.json({ coinId, days, prices });
-    } catch (err) {
-      res.status(502).json({ error: err instanceof Error ? err.message : 'Failed to load price history' });
+    } catch {
+      res.status(502).json({ error: 'Price history temporarily unavailable' });
     }
   });
 
   // Server-Sent Events real-time price stream for price alerts & live ticker
   app.get('/api/stream/prices', async (req: Request, res: Response) => {
+    if (activeSseClients >= MAX_SSE_CLIENTS) {
+      res.status(503).json({ error: 'Price stream capacity reached' });
+      return;
+    }
+    activeSseClients += 1;
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
@@ -288,7 +385,7 @@ async function startServer() {
     const pushSnapshot = async () => {
       try {
         const coins = await getLiveMarkets();
-        if (coins.length > 0) {
+        if (coins.length > 0 && !res.writableEnded) {
           res.write(`data: ${JSON.stringify({ coins, ts: Date.now() })}\n\n`);
         }
       } catch {
@@ -300,20 +397,40 @@ async function startServer() {
     const timer = setInterval(pushSnapshot, 8000);
     req.on('close', () => {
       clearInterval(timer);
+      activeSseClients = Math.max(0, activeSseClients - 1);
       res.end();
     });
   });
 
-  // Multi-chain Web3 RPC proxy
+  // Multi-chain Web3 RPC proxy (strict JSON-RPC 2.0 + method allowlist)
   app.post('/api/rpc', async (req: Request, res: Response) => {
     const network = String(req.query.network || 'ethereum').toLowerCase();
     const endpoints = RPC_ENDPOINTS[network];
     if (!endpoints || endpoints.length === 0) {
-      res.status(400).json({ error: `Unsupported RPC network: ${network}` });
+      res.status(400).json({ error: 'Unsupported RPC network' });
       return;
     }
 
-    let lastError = 'All RPC endpoints failed';
+    const body = req.body as Record<string, unknown> | undefined;
+    if (
+      !body ||
+      typeof body !== 'object' ||
+      Array.isArray(body) ||
+      body.jsonrpc !== '2.0' ||
+      typeof body.method !== 'string' ||
+      !ALLOWED_RPC_METHODS.has(body.method)
+    ) {
+      res.status(400).json({ error: 'Invalid or disallowed JSON-RPC request method' });
+      return;
+    }
+
+    const sanitizedPayload = JSON.stringify({
+      jsonrpc: '2.0',
+      id: body.id ?? 1,
+      method: body.method,
+      params: Array.isArray(body.params) ? body.params : [],
+    });
+
     for (const rpcUrl of endpoints) {
       try {
         const upstream = await fetchWithTimeout(
@@ -321,7 +438,7 @@ async function startServer() {
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(req.body),
+            body: sanitizedPayload,
           },
           7000
         );
@@ -331,18 +448,21 @@ async function startServer() {
           res.send(text);
           return;
         }
-        lastError = `RPC HTTP ${upstream.status} from ${rpcUrl}`;
-      } catch (err) {
-        lastError = err instanceof Error ? err.message : 'RPC fetch failed';
+      } catch {
+        // try next endpoint without leaking upstream URL or stack
       }
     }
 
-    res.status(502).json({ error: lastError });
+    res.status(502).json({ error: 'Upstream RPC providers unavailable' });
   });
 
   // Bitcoin mainnet address & transactions via Mempool.space
   app.get('/api/btc/address/:address', async (req: Request, res: Response) => {
-    const { address } = req.params;
+    const address = String(req.params.address || '').trim();
+    if (!BTC_ADDR_REGEX.test(address)) {
+      res.status(400).json({ error: 'Invalid Bitcoin address format' });
+      return;
+    }
     const baseUrls = ['https://mempool.space/api', 'https://blockstream.info/api'];
 
     for (const base of baseUrls) {
@@ -402,7 +522,6 @@ async function startServer() {
             res.json({
               height: json.result.height,
               healthy: true,
-              node: nodeUrl,
             });
             return;
           }
@@ -416,10 +535,14 @@ async function startServer() {
 
   // On-chain transaction history via Blockscout / Solana RPC
   app.get('/api/txs/:network/:address', async (req: Request, res: Response) => {
-    const { network, address } = req.params;
-    const net = network.toLowerCase();
+    const net = String(req.params.network || '').toLowerCase();
+    const address = String(req.params.address || '').trim();
 
     if (net === 'solana') {
+      if (!SOL_ADDR_REGEX.test(address)) {
+        res.status(400).json({ error: 'Invalid Solana address format' });
+        return;
+      }
       const endpoints = RPC_ENDPOINTS.solana;
       for (const rpcUrl of endpoints) {
         try {
@@ -460,8 +583,8 @@ async function startServer() {
     }
 
     const blockscoutBase = BLOCKSCOUT_URLS[net];
-    if (!blockscoutBase) {
-      res.json({ transactions: [] });
+    if (!blockscoutBase || !EVM_ADDR_REGEX.test(address)) {
+      res.status(400).json({ error: 'Invalid network or EVM address format' });
       return;
     }
 

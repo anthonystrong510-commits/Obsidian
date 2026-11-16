@@ -31,6 +31,7 @@ import {
   isInAppWalletBrowser,
   isMobileUserAgent,
 } from '../lib/walletConnectService';
+import { sanitizeExternalUrl } from '../lib/vaultStorage';
 import { ObsidianLogo } from './ObsidianLogo';
 import type {
   ConnectedExternalWallet,
@@ -482,7 +483,7 @@ export function AuthPortal({
                       {MOBILE_WALLET_APPS.slice(0, 6).map((app) => (
                         <a
                           key={app.id}
-                          href={app.buildDeepLink(walletAuthDeepLinkUrl)}
+                          href={sanitizeExternalUrl(app.buildDeepLink(walletAuthDeepLinkUrl))}
                           className="flex items-center justify-between gap-2.5 p-2.5 rounded-lg bg-[#11151C] border border-white/10 hover:border-emerald-500/40 transition-colors"
                         >
                           <div className="flex items-center gap-2.5 min-w-0">

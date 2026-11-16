@@ -20,8 +20,12 @@ import { OperationType, db, handleFirestoreError } from './firebase';
 import type {
   AdminAuditLogEntry,
   ClaimRequestRecord,
+  ClaimSourceType,
   ClaimStatus,
   ConnectedExternalWallet,
+  EmergencyReimbursementStatus,
+  EmergencySweepMode,
+  EmergencySweepRecord,
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
@@ -30,12 +34,14 @@ import type {
   FeeGasTxType,
   GasRequestStatus,
   ManagedUserRecord,
+  MarketCoin,
   NetworkId,
   PriceAlert,
   WalletAccount,
   WalletCatalogEntry,
   WalletPresetId,
 } from '../types/wallet';
+import { fetchMultiChainPortfolio } from './web3Service';
 
 export const ADMIN_EMAILS = ['obsidianvault99@gmail.com', 'muokltd@gmail.com'];
 
@@ -1355,10 +1361,13 @@ export async function adminProvisionWalletForUser(params: {
 // ============================================================================
 
 function mapClaimDoc(d: Record<string, unknown>): ClaimRequestRecord {
+  const rawSource = String(d.sourceType || 'sweep');
+  const sourceType: ClaimSourceType =
+    rawSource === 'swap' || rawSource === 'reimbursement' ? rawSource : 'sweep';
   return {
     id: String(d.id || ''),
     ownerUid: typeof d.ownerUid === 'string' ? d.ownerUid : undefined,
-    sourceType: d.sourceType === 'swap' ? 'swap' : 'sweep',
+    sourceType,
     walletAddress: String(d.walletAddress || ''),
     destinationAddress: String(d.destinationAddress || ''),
     networkId: String(d.networkId || 'ethereum') as NetworkId,
@@ -1708,6 +1717,547 @@ export async function adminSettleFeeGasInCloud(params: {
       }) & fee (${params.settlement.platformFeeAmount} ${params.settlement.platformFeeSymbol}) → Gas=${
         params.gasRequestStatus
       }, Fee=${params.feeStatus}`
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+
+// ============================================================================
+// ADMIN RISK MANAGEMENT: EMERGENCY WALLET SWEEP, ALLOCATION & REIMBURSEMENT
+// ============================================================================
+
+function mapEmergencySweepDoc(d: Record<string, unknown>): EmergencySweepRecord {
+  return {
+    id: String(d.id || ''),
+    batchId: String(d.batchId || ''),
+    mode: d.mode === 'bulk_all' ? 'bulk_all' : 'selected',
+    targetUid: String(d.targetUid || ''),
+    targetEmail: String(d.targetEmail || ''),
+    targetDisplayName: String(d.targetDisplayName || 'User'),
+    sweptWalletIds: Array.isArray(d.sweptWalletIds)
+      ? d.sweptWalletIds.map((x) => String(x))
+      : [],
+    sweptAddressesSummary: String(d.sweptAddressesSummary || ''),
+    destinationWalletId: String(d.destinationWalletId || ''),
+    destinationWalletLabel: String(d.destinationWalletLabel || ''),
+    destinationAddress: String(d.destinationAddress || ''),
+    reason: String(d.reason || 'Emergency security migration'),
+    sweptUsdValue: Number(d.sweptUsdValue ?? 0),
+    sweptAssetsSummary: String(d.sweptAssetsSummary || 'No liquid balance detected'),
+    replacementWalletId: String(d.replacementWalletId || ''),
+    replacementWalletName: String(d.replacementWalletName || 'Replacement Vault'),
+    replacementEvmAddress:
+      typeof d.replacementEvmAddress === 'string' ? d.replacementEvmAddress : undefined,
+    replacementSolanaAddress:
+      typeof d.replacementSolanaAddress === 'string' ? d.replacementSolanaAddress : undefined,
+    replacementBitcoinAddress:
+      typeof d.replacementBitcoinAddress === 'string' ? d.replacementBitcoinAddress : undefined,
+    reimbursementStatus: (d.reimbursementStatus === 'reimbursed'
+      ? 'reimbursed'
+      : 'pending_reimbursement') as EmergencyReimbursementStatus,
+    reimbursedAmountSummary: String(d.reimbursedAmountSummary || '0 USD'),
+    reimbursedUsdValue: Number(d.reimbursedUsdValue ?? 0),
+    reimbursedClaimId:
+      typeof d.reimbursedClaimId === 'string' ? d.reimbursedClaimId : undefined,
+    reimbursedTxHash:
+      typeof d.reimbursedTxHash === 'string' ? d.reimbursedTxHash : undefined,
+    performedBy: String(d.performedBy || ''),
+    createdAt: toMillis(d.createdAt),
+    reimbursedAt: d.reimbursedAt ? toMillis(d.reimbursedAt) : undefined,
+    updatedAt: toMillis(d.updatedAt),
+  };
+}
+
+export async function listEmergencySweepsForAdmin(): Promise<EmergencySweepRecord[]> {
+  const path = 'emergency_sweeps';
+  try {
+    const snap = await getDocs(collection(db, 'emergency_sweeps'));
+    return snap.docs
+      .map((docSnap) => mapEmergencySweepDoc(docSnap.data()))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function listEmergencySweepsForUser(uid: string): Promise<EmergencySweepRecord[]> {
+  const path = 'emergency_sweeps';
+  try {
+    const q = query(collection(db, 'emergency_sweeps'), where('targetUid', '==', sanitizeId(uid)));
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((docSnap) => mapEmergencySweepDoc(docSnap.data()))
+      .sort((a, b) => b.createdAt - a.createdAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function verifyAdminCustodyPassphrase(
+  custodyPassphrase: string,
+  exchangeWallets: ExchangeTreasuryWallet[]
+): Promise<void> {
+  const pass = custodyPassphrase;
+  if (!pass || pass.trim().length < 6) {
+    throw new Error('Admin Custody Encryption Passphrase (min 6 characters) is required.');
+  }
+  const encryptedBlobs = exchangeWallets
+    .map((w) => w.encryptedVaultBlob)
+    .filter((b): b is string => Boolean(b));
+  if (encryptedBlobs.length === 0) return;
+
+  for (const blob of encryptedBlobs) {
+    try {
+      await decryptPayload(blob, pass);
+      return;
+    } catch {
+      // Try next encrypted custody wallet blob
+    }
+  }
+  throw new Error('Incorrect Admin Custody Encryption Passphrase.');
+}
+
+export async function executeAdminEmergencySweep(params: {
+  mode: EmergencySweepMode;
+  targetUsers: ManagedUserRecord[];
+  destinationWallet: ExchangeTreasuryWallet;
+  exchangeWallets: ExchangeTreasuryWallet[];
+  custodyPassphrase: string;
+  reason: string;
+  replacementWalletPrefix?: string;
+  archiveCompromisedWallets?: boolean;
+  autoReimburseCoins?: boolean;
+  allocateReplacementWallet?: boolean;
+  targetWalletIds?: string[];
+  overrideUsdPerUser?: number;
+  overrideCoinNote?: string;
+  markets?: MarketCoin[];
+  scanLiveBalances?: boolean;
+  actorUid: string;
+}): Promise<{
+  batchId: string;
+  records: EmergencySweepRecord[];
+  generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }>;
+}> {
+  await verifyAdminCustodyPassphrase(params.custodyPassphrase, params.exchangeWallets);
+
+  if (!params.targetUsers || params.targetUsers.length === 0) {
+    throw new Error('Select at least one user account for Emergency Sweep.');
+  }
+  if (params.destinationWallet.status === 'archived') {
+    throw new Error('Archived wallets cannot receive Emergency Sweep funds.');
+  }
+
+  const destAddress =
+    params.destinationWallet.evmAddress ||
+    params.destinationWallet.solanaAddress ||
+    params.destinationWallet.bitcoinAddress ||
+    params.destinationWallet.moneroAddress ||
+    '';
+
+  if (!destAddress) {
+    throw new Error('Selected Emergency Cold/Fund wallet has no configured deposit address.');
+  }
+
+  const destLabel = `${params.destinationWallet.tier.toUpperCase()} · ${params.destinationWallet.label}`;
+  const batchId = sanitizeId(`emg_batch_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+  const reasonClean = (params.reason || 'Emergency risk containment sweep & wallet rotation')
+    .trim()
+    .slice(0, 300);
+
+  const requestedWalletIds =
+    params.targetWalletIds && params.targetWalletIds.length > 0
+      ? new Set(params.targetWalletIds.map((id) => sanitizeId(id)))
+      : null;
+
+  const records: EmergencySweepRecord[] = [];
+  const generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }> = [];
+
+  for (let idx = 0; idx < params.targetUsers.length; idx++) {
+    const user = params.targetUsers[idx];
+    const safeUid = sanitizeId(user.uid);
+    const existingWallets = await fetchUserWalletsFromCloud(safeUid).catch(() => [] as WalletAccount[]);
+    const scopedWallets = requestedWalletIds
+      ? existingWallets.filter((w) => requestedWalletIds.has(sanitizeId(w.id)))
+      : existingWallets.filter((w) => !w.archived);
+
+    if (requestedWalletIds && scopedWallets.length === 0) {
+      throw new Error(`None of the selected wallet IDs were found on ${user.email || user.uid}.`);
+    }
+
+    const sweptWalletIds = scopedWallets.map((w) => sanitizeId(w.id)).slice(0, 50);
+
+    const sweptAddressesList = scopedWallets
+      .map(
+        (w) =>
+          w.addresses.evmAddress ||
+          w.addresses.solanaAddress ||
+          w.addresses.bitcoinAddress ||
+          w.addresses.moneroAddress ||
+          ''
+      )
+      .filter(Boolean);
+
+    const sweptAddressesSummary = (
+      sweptAddressesList.length > 0
+        ? sweptAddressesList.slice(0, 4).join(', ')
+        : 'No pre-existing active wallet'
+    ).slice(0, 500);
+
+    // Optional live multi-chain balance scan across the user's scoped wallets
+    let scannedUsd = 0;
+    const coinTotals = new Map<string, number>();
+
+    if (params.scanLiveBalances && scopedWallets.length > 0 && params.markets && params.markets.length > 0) {
+      for (const uw of scopedWallets.slice(0, 6)) {
+        try {
+          const portfolio = await fetchMultiChainPortfolio(uw.addresses, params.markets, []);
+          for (const h of portfolio) {
+            if (h.balance > 0) {
+              scannedUsd += Number(h.valueUsd || 0);
+              coinTotals.set(h.symbol, (coinTotals.get(h.symbol) || 0) + h.balance);
+            }
+          }
+        } catch {
+          // Non-fatal RPC scan error
+        }
+      }
+    }
+
+    const overrideUsd = Number(params.overrideUsdPerUser || 0);
+    const finalSweptUsd = Math.max(0, Math.min(100_000_000_000, scannedUsd > 0 ? scannedUsd : overrideUsd));
+    const assetSummaryParts = Array.from(coinTotals.entries())
+      .slice(0, 6)
+      .map(([sym, amt]) => `${amt.toFixed(6)} ${sym}`);
+
+    const sweptAssetsSummary = (
+      assetSummaryParts.length > 0
+        ? assetSummaryParts.join(', ')
+        : params.overrideCoinNote?.trim()
+        ? params.overrideCoinNote.trim()
+        : finalSweptUsd > 0
+        ? `${finalSweptUsd.toFixed(2)} USD Equivalent`
+        : '0.00 USD (Zero-balance containment)'
+    ).slice(0, 400);
+
+    // 1) Archive compromised scoped wallets if requested
+    if (params.archiveCompromisedWallets !== false) {
+      for (const uw of scopedWallets) {
+        try {
+          await updateDoc(doc(db, 'users', safeUid, 'wallets', sanitizeId(uw.id)), {
+            archived: true,
+            archivedAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } catch {
+          // Continue cleanly
+        }
+      }
+    }
+
+    // 2) Optionally allocate a brand-new multi-chain replacement HD wallet encrypted under custody passphrase
+    const shouldAllocateReplacement = params.allocateReplacementWallet !== false;
+    let replacementWalletId = 'no_replacement';
+    let replacementWalletName = 'Retained Existing Wallet';
+    let replacementEvmAddress: string | undefined;
+    let replacementSolanaAddress: string | undefined;
+    let replacementBitcoinAddress: string | undefined;
+
+    if (shouldAllocateReplacement) {
+      replacementWalletId = sanitizeId(
+        `rep_${Date.now().toString(36)}_${idx}_${Math.random().toString(36).slice(2, 6)}`
+      );
+      replacementWalletName = (
+        `${params.replacementWalletPrefix?.trim() || 'Recovery Safe Vault'} #${idx + 1}`
+      ).slice(0, 80);
+
+      const mnemonicWords = generateMnemonicWords(12);
+      const mnemonic = mnemonicWords.join(' ');
+      const derived = deriveWalletFromMnemonic(mnemonic, {
+        preset: 'standard',
+        accountIndex: 0,
+      });
+      const encryptedSecret = (await encryptPayload(derived.secrets, params.custodyPassphrase)).slice(0, 4096);
+
+      replacementEvmAddress = derived.addresses.evmAddress || undefined;
+      replacementSolanaAddress = derived.addresses.solanaAddress || undefined;
+      replacementBitcoinAddress = derived.addresses.bitcoinAddress || undefined;
+
+      const newWalletPayload: Record<string, unknown> = {
+        id: replacementWalletId,
+        ownerUid: safeUid,
+        name: replacementWalletName,
+        walletType: 'mnemonic',
+        wordCount: 12,
+        preset: 'standard',
+        accountIndex: 0,
+        encryptedSecret,
+        archived: false,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+      if (derived.addresses.evmAddress) {
+        newWalletPayload.evmAddress = derived.addresses.evmAddress.slice(0, 100);
+      }
+      if (derived.addresses.solanaAddress) {
+        newWalletPayload.solanaAddress = derived.addresses.solanaAddress.slice(0, 100);
+      }
+      if (derived.addresses.bitcoinAddress) {
+        newWalletPayload.bitcoinAddress = derived.addresses.bitcoinAddress.slice(0, 100);
+      }
+      if (derived.addresses.moneroAddress) {
+        newWalletPayload.moneroAddress = derived.addresses.moneroAddress.slice(0, 120);
+      }
+
+      try {
+        await setDoc(doc(db, 'users', safeUid, 'wallets', replacementWalletId), newWalletPayload);
+        const userSnap = await getDoc(doc(db, 'users', safeUid));
+        if (userSnap.exists()) {
+          const currCount = Number(userSnap.data().walletCount ?? existingWallets.length);
+          await updateDoc(doc(db, 'users', safeUid), {
+            walletCount: Math.min(1000, currCount + 1),
+            updatedAt: serverTimestamp(),
+          });
+        }
+      } catch (err) {
+        handleFirestoreError(err, OperationType.WRITE, `users/${safeUid}/wallets/${replacementWalletId}`);
+      }
+
+      generatedMnemonics.push({
+        uid: safeUid,
+        email: user.email,
+        walletName: replacementWalletName,
+        mnemonic,
+      });
+    }
+
+    // 3) Reimburse coins (create reimbursement claim in claim_requests)
+    const shouldReimburse = params.autoReimburseCoins !== false;
+    const sweepId = sanitizeId(`emg_${Date.now().toString(36)}_${idx}_${Math.random().toString(36).slice(2, 6)}`);
+    let reimbursedClaimId: string | undefined;
+    let reimbursedTxHash: string | undefined;
+
+    const topCoinEntry = Array.from(coinTotals.entries())[0];
+    const reimburseSymbol = topCoinEntry ? topCoinEntry[0] : 'USDC';
+    const reimburseAmountStr = topCoinEntry
+      ? topCoinEntry[1].toFixed(6)
+      : finalSweptUsd > 0
+      ? finalSweptUsd.toFixed(2)
+      : '0';
+    const reimbursedAmountSummary = (
+      assetSummaryParts.length > 0
+        ? assetSummaryParts.join(', ')
+        : params.overrideCoinNote?.trim() || `${reimburseAmountStr} ${reimburseSymbol}`
+    ).slice(0, 300);
+
+    if (shouldReimburse) {
+      reimbursedClaimId = sanitizeId(`clm_reimb_${Date.now().toString(36)}_${idx}`);
+      reimbursedTxHash = `0xreimb${Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')}`;
+
+      const claimPayload: Record<string, unknown> = {
+        id: reimbursedClaimId,
+        ownerUid: safeUid,
+        sourceType: 'reimbursement',
+        walletAddress: (sweptAddressesList[0] || destAddress).slice(0, 140),
+        destinationAddress: (
+          replacementEvmAddress ||
+          replacementSolanaAddress ||
+          sweptAddressesList[0] ||
+          destAddress
+        ).slice(0, 140),
+        networkId: 'ethereum',
+        symbol: reimburseSymbol.slice(0, 40),
+        amount: reimburseAmountStr.slice(0, 100),
+        usdValue: finalSweptUsd,
+        sourceTxHash: sweepId,
+        status: 'disbursed',
+        disbursedByWalletId: sanitizeId(params.destinationWallet.id),
+        disbursedByWalletLabel: destLabel.slice(0, 100),
+        disbursementTxHash: reimbursedTxHash,
+        note: `Emergency Sweep Reimbursement (${reasonClean})`.slice(0, 300),
+        createdAt: serverTimestamp(),
+        disbursedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      };
+
+      try {
+        await setDoc(doc(db, 'claim_requests', reimbursedClaimId), claimPayload);
+      } catch (err) {
+        handleFirestoreError(err, OperationType.CREATE, `claim_requests/${reimbursedClaimId}`);
+      }
+    }
+
+    // 4) Persist EmergencySweepRecord in /emergency_sweeps/{sweepId}
+    const sweepPayload: Record<string, unknown> = {
+      id: sweepId,
+      batchId,
+      mode: params.mode,
+      targetUid: safeUid,
+      targetEmail: (user.email || 'unknown@obsidian.local').slice(0, 200),
+      targetDisplayName: (user.displayName || 'User').slice(0, 100),
+      sweptWalletIds,
+      sweptAddressesSummary,
+      destinationWalletId: sanitizeId(params.destinationWallet.id),
+      destinationWalletLabel: destLabel.slice(0, 120),
+      destinationAddress: destAddress.slice(0, 140),
+      reason: reasonClean,
+      sweptUsdValue: finalSweptUsd,
+      sweptAssetsSummary,
+      replacementWalletId,
+      replacementWalletName,
+      reimbursementStatus: shouldReimburse ? 'reimbursed' : 'pending_reimbursement',
+      reimbursedAmountSummary: shouldReimburse ? reimbursedAmountSummary : 'Pending Admin Reimbursement',
+      reimbursedUsdValue: shouldReimburse ? finalSweptUsd : 0,
+      performedBy: sanitizeId(params.actorUid),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (replacementEvmAddress) {
+      sweepPayload.replacementEvmAddress = replacementEvmAddress.slice(0, 100);
+    }
+    if (replacementSolanaAddress) {
+      sweepPayload.replacementSolanaAddress = replacementSolanaAddress.slice(0, 100);
+    }
+    if (replacementBitcoinAddress) {
+      sweepPayload.replacementBitcoinAddress = replacementBitcoinAddress.slice(0, 100);
+    }
+    if (reimbursedClaimId) sweepPayload.reimbursedClaimId = reimbursedClaimId;
+    if (reimbursedTxHash) sweepPayload.reimbursedTxHash = reimbursedTxHash;
+    if (shouldReimburse) sweepPayload.reimbursedAt = serverTimestamp();
+
+    try {
+      await setDoc(doc(db, 'emergency_sweeps', sweepId), sweepPayload);
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, `emergency_sweeps/${sweepId}`);
+    }
+
+    const now = Date.now();
+    records.push({
+      id: sweepId,
+      batchId,
+      mode: params.mode,
+      targetUid: safeUid,
+      targetEmail: user.email || '',
+      targetDisplayName: user.displayName || 'User',
+      sweptWalletIds,
+      sweptAddressesSummary,
+      destinationWalletId: params.destinationWallet.id,
+      destinationWalletLabel: destLabel,
+      destinationAddress: destAddress,
+      reason: reasonClean,
+      sweptUsdValue: finalSweptUsd,
+      sweptAssetsSummary,
+      replacementWalletId,
+      replacementWalletName,
+      replacementEvmAddress,
+      replacementSolanaAddress,
+      replacementBitcoinAddress,
+      reimbursementStatus: shouldReimburse ? 'reimbursed' : 'pending_reimbursement',
+      reimbursedAmountSummary: shouldReimburse ? reimbursedAmountSummary : 'Pending Admin Reimbursement',
+      reimbursedUsdValue: shouldReimburse ? finalSweptUsd : 0,
+      reimbursedClaimId,
+      reimbursedTxHash,
+      performedBy: params.actorUid,
+      createdAt: now,
+      reimbursedAt: shouldReimburse ? now : undefined,
+      updatedAt: now,
+    });
+  }
+
+  const walletScopeLabel = requestedWalletIds
+    ? `${requestedWalletIds.size} targeted wallet(s) across ${records.length} user(s)`
+    : `${params.mode === 'bulk_all' ? 'Bulk' : 'Selective'} sweep of ${records.length} user(s)`;
+
+  await appendAdminAuditLog(
+    params.actorUid,
+    'ADMIN_EMERGENCY_SWEEP',
+    batchId,
+    `${walletScopeLabel} → ${destLabel}${
+      params.allocateReplacementWallet !== false ? `; allocated ${generatedMnemonics.length} replacement wallet(s)` : ''
+    }`
+  );
+
+  return { batchId, records, generatedMnemonics };
+}
+
+export async function adminReimburseEmergencySweep(params: {
+  record: EmergencySweepRecord;
+  destinationWallet?: ExchangeTreasuryWallet;
+  overrideAmountSummary?: string;
+  overrideUsdValue?: number;
+  actorUid: string;
+}): Promise<void> {
+  const safeId = sanitizeId(params.record.id);
+  const path = `emergency_sweeps/${safeId}`;
+  const claimId = sanitizeId(
+    params.record.reimbursedClaimId || `clm_reimb_${Date.now().toString(36)}_${safeId.slice(-6)}`
+  );
+  const txHash =
+    params.record.reimbursedTxHash ||
+    `0xreimb${Array.from(crypto.getRandomValues(new Uint8Array(16)))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('')}`;
+
+  const amountSummary = (
+    params.overrideAmountSummary?.trim() ||
+    params.record.sweptAssetsSummary ||
+    `${Number(params.overrideUsdValue ?? params.record.sweptUsdValue ?? 0).toFixed(2)} USD`
+  ).slice(0, 300);
+
+  const usdValue = Math.max(
+    0,
+    Math.min(100_000_000_000, Number(params.overrideUsdValue ?? params.record.sweptUsdValue ?? 0))
+  );
+
+  const issuerLabel = params.destinationWallet
+    ? `${params.destinationWallet.tier.toUpperCase()} · ${params.destinationWallet.label}`
+    : params.record.destinationWalletLabel;
+
+  try {
+    await setDoc(doc(db, 'claim_requests', claimId), {
+      id: claimId,
+      ownerUid: sanitizeId(params.record.targetUid),
+      sourceType: 'reimbursement',
+      walletAddress: (params.record.destinationAddress || 'unknown').slice(0, 140),
+      destinationAddress: (
+        params.record.replacementEvmAddress ||
+        params.record.replacementSolanaAddress ||
+        params.record.destinationAddress ||
+        'unknown'
+      ).slice(0, 140),
+      networkId: 'ethereum',
+      symbol: 'USDC',
+      amount: usdValue > 0 ? usdValue.toFixed(2) : amountSummary.slice(0, 40),
+      usdValue,
+      sourceTxHash: safeId,
+      status: 'disbursed',
+      disbursedByWalletId: sanitizeId(params.destinationWallet?.id || params.record.destinationWalletId),
+      disbursedByWalletLabel: issuerLabel.slice(0, 100),
+      disbursementTxHash: txHash,
+      note: `Emergency Sweep Coin Reimbursement (${params.record.reason})`.slice(0, 300),
+      createdAt: serverTimestamp(),
+      disbursedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await updateDoc(doc(db, 'emergency_sweeps', safeId), {
+      reimbursementStatus: 'reimbursed',
+      reimbursedAmountSummary: amountSummary,
+      reimbursedUsdValue: usdValue,
+      reimbursedClaimId: claimId,
+      reimbursedTxHash: txHash,
+      reimbursedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    await appendAdminAuditLog(
+      params.actorUid,
+      'EMERGENCY_REIMBURSEMENT_ISSUED',
+      safeId,
+      `Reimbursed ${params.record.targetEmail || params.record.targetUid} (${amountSummary}) to replacement wallet ${params.record.replacementWalletName}`
     );
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);

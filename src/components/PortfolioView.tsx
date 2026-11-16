@@ -9,15 +9,18 @@ import {
   Plus,
   RefreshCw,
   Search,
+  ShieldCheck,
   Wallet,
 } from 'lucide-react';
 import { NETWORKS, NETWORK_MAP } from '../lib/networks';
+import { shortenAddress } from '../lib/crypto';
 import { formatCryptoAmount, formatFiat, formatPercent, formatRelativeTime } from '../lib/formatters';
 import { fetchCoinHistory, fetchCustomErc20Metadata } from '../lib/web3Service';
 import { isAddress } from 'ethers';
 import { NetworkIcon, TokenAvatar } from './NetworkIcon';
 import type {
   ClaimRequestRecord,
+  EmergencySweepRecord,
   MarketCoin,
   NetworkId,
   PortfolioHolding,
@@ -32,6 +35,7 @@ interface PortfolioViewProps {
   markets: MarketCoin[];
   transactions: WalletTransaction[];
   claims?: ClaimRequestRecord[];
+  emergencySweeps?: EmergencySweepRecord[];
   currency: 'USD' | 'EUR' | 'GBP';
   loadingPortfolio: boolean;
   isNewlyCreated?: boolean;
@@ -54,6 +58,7 @@ export function PortfolioView({
   markets,
   transactions,
   claims = [],
+  emergencySweeps = [],
   currency,
   loadingPortfolio,
   isNewlyCreated,
@@ -196,6 +201,64 @@ export function PortfolioView({
 
   return (
     <div className="space-y-8">
+      {emergencySweeps.length > 0 && (
+        <div className="bg-[#11151C] border border-emerald-500/35 rounded-xl p-4 sm:p-5 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2.5">
+              <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+              <div>
+                <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                  Emergency Vault Migration &amp; Coin Reimbursement
+                </h3>
+                <p className="text-xs text-[#8A94A6]">
+                  {emergencySweeps[0].reason} · Destination Cold Protection: {emergencySweeps[0].destinationWalletLabel}
+                </p>
+              </div>
+            </div>
+            <span
+              className={`text-xs font-mono font-semibold ${
+                emergencySweeps[0].reimbursementStatus === 'reimbursed'
+                  ? 'text-emerald-400'
+                  : 'text-amber-400'
+              }`}
+            >
+              {emergencySweeps[0].reimbursementStatus === 'reimbursed'
+                ? 'Coins Reimbursed'
+                : 'Reimbursement Pending'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+            <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10 space-y-1">
+              <div className="text-[11px] text-[#8A94A6]">Newly Allocated Replacement Wallet</div>
+              <div className="font-semibold text-[#F4F6F9]">{emergencySweeps[0].replacementWalletName}</div>
+              {emergencySweeps[0].replacementEvmAddress && (
+                <div className="font-mono text-[11px] text-emerald-400">
+                  EVM: {shortenAddress(emergencySweeps[0].replacementEvmAddress, 8, 6)}
+                </div>
+              )}
+              {emergencySweeps[0].replacementSolanaAddress && (
+                <div className="font-mono text-[11px] text-[#CBD5E1]">
+                  SOL: {shortenAddress(emergencySweeps[0].replacementSolanaAddress, 8, 6)}
+                </div>
+              )}
+            </div>
+            <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10 space-y-1">
+              <div className="text-[11px] text-[#8A94A6]">Reimbursed Balances</div>
+              <div className="font-mono font-semibold text-[#F4F6F9]">
+                {emergencySweeps[0].reimbursedAmountSummary} (
+                {formatFiat(emergencySweeps[0].reimbursedUsdValue || 0, currency)})
+              </div>
+              {emergencySweeps[0].reimbursedTxHash && (
+                <div className="font-mono text-[11px] text-[#64748B] truncate">
+                  Ref: {emergencySweeps[0].reimbursedTxHash}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Top Hero Row: Balance Summary + Historical Chart */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 sm:gap-6 items-stretch">
         <div className="xl:col-span-5 bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-6 flex flex-col justify-between gap-5 sm:gap-6 min-w-0">

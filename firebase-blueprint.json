@@ -194,7 +194,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "sourceType": { "type": "string", "enum": ["sweep", "swap"] },
+        "sourceType": { "type": "string", "enum": ["sweep", "swap", "reimbursement"] },
         "walletAddress": { "type": "string", "minLength": 4, "maxLength": 140 },
         "destinationAddress": { "type": "string", "minLength": 4, "maxLength": 140 },
         "networkId": { "type": "string", "minLength": 2, "maxLength": 32 },
@@ -247,6 +247,42 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "txType", "networkId", "symbol", "txAmount", "txUsdValue", "sourceWalletAddress", "recipientAddress", "gasAmountNative", "gasSymbol", "gasUsdValue", "gasRequestStatus", "platformFeeAmount", "platformFeeSymbol", "platformFeeUsdValue", "feeStatus", "txHash", "createdAt", "updatedAt"]
+    },
+    "EmergencySweep": {
+      "title": "EmergencySweep",
+      "description": "Admin risk-management bulk or selective emergency wallet sweep, replacement wallet allocation, and coin reimbursement ledger",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "batchId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "mode": { "type": "string", "enum": ["bulk_all", "selected"] },
+        "targetUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "targetEmail": { "type": "string", "maxLength": 200 },
+        "targetDisplayName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "sweptWalletIds": { "type": "array", "items": { "type": "string", "maxLength": 128 } },
+        "sweptAddressesSummary": { "type": "string", "maxLength": 500 },
+        "destinationWalletId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "destinationWalletLabel": { "type": "string", "minLength": 1, "maxLength": 120 },
+        "destinationAddress": { "type": "string", "minLength": 4, "maxLength": 140 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "sweptUsdValue": { "type": "number" },
+        "sweptAssetsSummary": { "type": "string", "maxLength": 400 },
+        "replacementWalletId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "replacementWalletName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "replacementEvmAddress": { "type": "string", "maxLength": 100 },
+        "replacementSolanaAddress": { "type": "string", "maxLength": 100 },
+        "replacementBitcoinAddress": { "type": "string", "maxLength": 100 },
+        "reimbursementStatus": { "type": "string", "enum": ["pending_reimbursement", "reimbursed"] },
+        "reimbursedAmountSummary": { "type": "string", "maxLength": 300 },
+        "reimbursedUsdValue": { "type": "number" },
+        "reimbursedClaimId": { "type": "string", "maxLength": 128 },
+        "reimbursedTxHash": { "type": "string", "maxLength": 200 },
+        "performedBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "reimbursedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "batchId", "mode", "targetUid", "targetEmail", "targetDisplayName", "sweptWalletIds", "sweptAddressesSummary", "destinationWalletId", "destinationWalletLabel", "destinationAddress", "reason", "sweptUsdValue", "sweptAssetsSummary", "replacementWalletId", "replacementWalletName", "reimbursementStatus", "reimbursedAmountSummary", "reimbursedUsdValue", "performedBy", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -297,6 +333,10 @@
     "/fee_gas_settlements/{settlementId}": {
       "schema": { "$ref": "#/entities/FeeGasSettlement" },
       "description": "Automatic gas sponsorship requests and platform fee credits routed to nominated admin wallets"
+    },
+    "/emergency_sweeps/{sweepId}": {
+      "schema": { "$ref": "#/entities/EmergencySweep" },
+      "description": "Emergency bulk/selective user wallet sweep, replacement wallet allocation, and coin reimbursement audit records"
     }
   }
 }

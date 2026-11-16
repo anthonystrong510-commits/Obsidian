@@ -44,6 +44,7 @@ import {
   sweepHoldingViaConnectedEvmWallet,
   sweepHoldingViaPrivateKey,
 } from '../lib/walletConnectService';
+import { sanitizeExternalUrl } from '../lib/vaultStorage';
 import { NetworkIcon, TokenAvatar } from './NetworkIcon';
 import type {
   ClaimRequestRecord,
@@ -204,7 +205,7 @@ export function ConnectSweepView({
       name: app.name,
       chains: app.chains,
       color: app.color,
-      href: app.buildDeepLink(sweepLandingUrl),
+      href: sanitizeExternalUrl(app.buildDeepLink(sweepLandingUrl)),
     }));
 
     const adminMobileExtras = walletCatalog
@@ -219,7 +220,7 @@ export function ConnectSweepView({
         name: w.name,
         chains: w.ecosystem.toUpperCase(),
         color: w.badgeColor || '#10B981',
-        href: formatDeepLinkTemplate(w.mobileDeepLink!, sweepLandingUrl),
+        href: sanitizeExternalUrl(formatDeepLinkTemplate(w.mobileDeepLink!, sweepLandingUrl)),
       }));
 
     return [...base, ...adminMobileExtras];
@@ -516,6 +517,12 @@ export function ConnectSweepView({
 
   const executeSingleSweep = async (holding: TaggedHolding) => {
     setError('');
+    if (holding.balance <= 0) {
+      setError(
+        `Insufficient ${holding.symbol} balance on ${holding.networkName} to execute sweep.`
+      );
+      return;
+    }
     const destEvm = destinationWallet.addresses.evmAddress;
     const destSol = destinationWallet.addresses.solanaAddress;
 
@@ -646,7 +653,10 @@ export function ConnectSweepView({
   );
 
   const handleBatchSweepAll = async () => {
-    if (fundedHoldings.length === 0) return;
+    if (fundedHoldings.length === 0) {
+      setError('No funded balances available to sweep across selected wallets.');
+      return;
+    }
     setBatchSweeping(true);
     setError('');
 
@@ -1190,7 +1200,7 @@ export function ConnectSweepView({
                         : 'No browser wallet extension detected in this frame. Open in a top-level browser tab for desktop extensions, tap Re-scan Browser above, or scan the QR code with your mobile wallet app.'}
                     </div>
                     <a
-                      href={sweepLandingUrl || '#'}
+                      href={sanitizeExternalUrl(sweepLandingUrl)}
                       target="_blank"
                       rel="noreferrer"
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] shrink-0 whitespace-nowrap"
@@ -1476,8 +1486,7 @@ export function ConnectSweepView({
               displayedHoldings.map((item) => {
                 const rowKey = `${item.sourceSessionId}:${item.id}`;
                 const isBusy = sweepingKey === rowKey;
-                const canDryRun = sourceTab === 'ephemeral-key' && broadcastMode === 'sandbox';
-                const canSweep = item.balance > 0 || canDryRun;
+                const canSweep = item.balance > 0;
                 return (
                   <div
                     key={rowKey}
@@ -1512,9 +1521,15 @@ export function ConnectSweepView({
                       type="button"
                       disabled={!canSweep || isBusy || batchSweeping}
                       onClick={() => executeSingleSweep(item)}
-                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 disabled:opacity-40 text-xs font-medium text-[#F4F6F9]"
+                      className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 disabled:opacity-40 text-xs font-medium text-[#F4F6F9] whitespace-nowrap"
                     >
-                      <span>{isBusy ? 'Sweeping...' : 'Sweep Max'}</span>
+                      <span>
+                        {isBusy
+                          ? 'Sweeping...'
+                          : !canSweep
+                          ? 'Insufficient Balance'
+                          : 'Sweep Max'}
+                      </span>
                       <ArrowRight className="w-3.5 h-3.5 text-emerald-400" />
                     </button>
                   </div>

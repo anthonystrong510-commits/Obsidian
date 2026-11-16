@@ -74,6 +74,23 @@ export function VaultLockScreen({
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [lockoutUntil, setLockoutUntil] = useState(0);
+  const [cooldownSec, setCooldownSec] = useState(0);
+
+  useEffect(() => {
+    if (!lockoutUntil || Date.now() >= lockoutUntil) {
+      setCooldownSec(0);
+      return;
+    }
+    const tick = () => {
+      const rem = Math.max(0, Math.ceil((lockoutUntil - Date.now()) / 1000));
+      setCooldownSec(rem);
+    };
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [lockoutUntil]);
 
   // Seed Recovery State
   const [seedPhraseInput, setSeedPhraseInput] = useState('');
@@ -171,6 +188,11 @@ export function VaultLockScreen({
 
   const handleSubmitUnlock = async (e: FormEvent) => {
     e.preventDefault();
+    if (lockoutUntil > Date.now()) {
+      const rem = Math.ceil((lockoutUntil - Date.now()) / 1000);
+      setError(`Too many failed attempts. Wait ${rem}s before retrying.`);
+      return;
+    }
     if (!password) {
       setError('Enter your vault password.');
       return;
@@ -183,13 +205,25 @@ export function VaultLockScreen({
       const walletDecryptOk = await canDecryptAnyWallet(wallets, password);
 
       if (!verifierOk && !walletDecryptOk) {
-        setError(
-          'Password did not match these encrypted wallets. Use Seed Phrase Recovery or Account Recovery below.'
-        );
+        const nextFails = failedAttempts + 1;
+        setFailedAttempts(nextFails);
+        if (nextFails >= 4) {
+          const secs = Math.min(120, 15 * 2 ** (nextFails - 4));
+          setLockoutUntil(Date.now() + secs * 1000);
+          setError(
+            `Password incorrect. Security cooldown active for ${secs}s. Or use Seed Phrase / Account Recovery below.`
+          );
+        } else {
+          setError(
+            'Password did not match these encrypted wallets. Use Seed Phrase Recovery or Account Recovery below.'
+          );
+        }
         setLoading(false);
         return;
       }
 
+      setFailedAttempts(0);
+      setLockoutUntil(0);
       // Synchronize local verifier on successful decryption
       await createVaultVerifier(password);
       await onUnlock(password);
@@ -388,11 +422,17 @@ export function VaultLockScreen({
 
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || cooldownSec > 0}
               className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-sm transition-colors whitespace-nowrap"
             >
               <Unlock className="w-4 h-4" />
-              <span>{loading ? 'Decrypting Vault...' : 'Unlock Vault'}</span>
+              <span>
+                {cooldownSec > 0
+                  ? `Cooldown (${cooldownSec}s)`
+                  : loading
+                  ? 'Decrypting Vault...'
+                  : 'Unlock Vault'}
+              </span>
             </button>
 
             <div className="pt-3 border-t border-white/10 space-y-2.5">

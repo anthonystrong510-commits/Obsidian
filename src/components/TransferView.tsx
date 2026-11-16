@@ -332,13 +332,59 @@ export function TransferView({
     setTimeout(() => setCopiedAddr(false), 1800);
   };
 
+  const availableBalance = activeToken?.balance || 0;
+  const nativeTokenBalance = useMemo(() => {
+    const nat = networkHoldings.find((h) => h.isNative);
+    return nat?.balance || 0;
+  }, [networkHoldings]);
+
+  const insufficientBalanceReason = useMemo(() => {
+    const sym = activeToken?.symbol || activeNetwork.symbol;
+    if (availableBalance <= 0) {
+      return `Insufficient ${sym} balance on ${activeNetwork.name} (0 available).`;
+    }
+    const amt = Number(amountInput);
+    if (Number.isFinite(amt) && amt > 0) {
+      if (amt > availableBalance) {
+        return `Insufficient ${sym} balance. Available: ${formatCryptoAmount(availableBalance)} ${sym}.`;
+      }
+      const gasReq = Number(estimatedFeeNative) || sendBreakdown.gasAmountNative || 0;
+      const paysOwnGas = !(exchangeConfig?.gasSponsorshipEnabled ?? true);
+      if (paysOwnGas && activeNetwork.family === 'evm') {
+        if (activeToken?.isNative && amt + gasReq > availableBalance) {
+          return `Insufficient ${sym} to cover transfer plus gas (${gasReq.toFixed(6)} ${activeNetwork.symbol}).`;
+        }
+        if (!activeToken?.isNative && nativeTokenBalance < gasReq) {
+          return `Insufficient native ${activeNetwork.symbol} for gas (${gasReq.toFixed(6)} ${activeNetwork.symbol} required).`;
+        }
+      }
+    }
+    return '';
+  }, [
+    availableBalance,
+    activeToken,
+    activeNetwork.name,
+    activeNetwork.symbol,
+    activeNetwork.family,
+    amountInput,
+    estimatedFeeNative,
+    sendBreakdown.gasAmountNative,
+    exchangeConfig?.gasSponsorshipEnabled,
+    nativeTokenBalance,
+  ]);
+
   const handleSetPercent = (pct: number) => {
     const bal = activeToken?.balance || 0;
     if (bal <= 0) {
-      setAmountInput('0.01');
+      setAmountInput('0');
+      setSendError(`Insufficient ${activeToken?.symbol || activeNetwork.symbol} balance.`);
       return;
     }
-    const feeBuffer = activeToken?.isNative ? Number(estimatedFeeNative) * 1.1 : 0;
+    setSendError('');
+    const feeBuffer =
+      activeToken?.isNative && !(exchangeConfig?.gasSponsorshipEnabled ?? true)
+        ? Number(estimatedFeeNative) * 1.1
+        : 0;
     const usable = Math.max(0, bal - (pct === 1 ? feeBuffer : 0));
     setAmountInput((usable * pct).toFixed(6).replace(/\.?0+$/, ''));
   };
@@ -351,6 +397,12 @@ export function TransferView({
       setSendError('Watch-Only wallets cannot sign transactions. Import or create a signing wallet.');
       return;
     }
+    if (availableBalance <= 0) {
+      setSendError(
+        `Insufficient ${activeToken?.symbol || activeNetwork.symbol} balance to send or withdraw.`
+      );
+      return;
+    }
     if (!isRecipientValid) {
       setSendError(`Enter a valid ${activeNetwork.name} recipient address.`);
       return;
@@ -358,6 +410,10 @@ export function TransferView({
     const amt = Number(amountInput);
     if (!Number.isFinite(amt) || amt <= 0) {
       setSendError('Enter a transfer amount greater than 0.');
+      return;
+    }
+    if (insufficientBalanceReason) {
+      setSendError(insufficientBalanceReason);
       return;
     }
 
@@ -731,21 +787,23 @@ export function TransferView({
               </div>
             </div>
 
-            {sendError && (
+            {(sendError || insufficientBalanceReason) && (
               <div className="flex items-center gap-2 text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2.5">
                 <ShieldAlert className="w-4 h-4 shrink-0" />
-                <span>{sendError}</span>
+                <span>{sendError || insufficientBalanceReason}</span>
               </div>
             )}
 
             <button
               type="button"
-              disabled={sending}
+              disabled={sending || Boolean(insufficientBalanceReason) || Number(amountInput) <= 0}
               onClick={handleExecuteSend}
               className="w-full py-3 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-sm transition-colors"
             >
               {sending
                 ? 'Signing Transaction...'
+                : insufficientBalanceReason
+                ? 'Insufficient Balance'
                 : `Sign & Send ${amountInput || '0'} ${activeToken?.symbol || activeNetwork.symbol}`}
             </button>
           </div>

@@ -58,6 +58,42 @@ function removeScopedRaw(baseKey: string): void {
 }
 
 const SESSION_UNLOCK_PREFIX = 'obsidian_session_unlock_v1__';
+const SESSION_UNLOCK_TTL_MS = 30 * 60 * 1000; // 30-minute session token expiry
+const PBKDF2_ITERATIONS_V2 = 310_000;
+const PBKDF2_ITERATIONS_V1 = 100_000;
+
+const ALLOWED_DEEP_LINK_PROTOCOLS = new Set([
+  'https:',
+  'metamask:',
+  'trust:',
+  'phantom:',
+  'cbwallet:',
+  'okx:',
+  'rainbow:',
+]);
+
+export function sanitizeExternalUrl(rawUrl?: string | null): string {
+  if (!rawUrl || typeof rawUrl !== 'string') return '#';
+  const trimmed = rawUrl.trim();
+  if (!trimmed || /^[\x00-\x1f\s]*(javascript|data|vbscript|file):/i.test(trimmed)) {
+    return '#';
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (ALLOWED_DEEP_LINK_PROTOCOLS.has(parsed.protocol)) {
+      return trimmed;
+    }
+    if (
+      parsed.protocol === 'http:' &&
+      (parsed.hostname === 'localhost' || parsed.hostname === '127.0.0.1')
+    ) {
+      return trimmed;
+    }
+  } catch {
+    // Reject malformed URLs
+  }
+  return '#';
+}
 
 export function saveSessionUnlockToken(uid: string | null, password: string): void {
   if (!uid || !password) return;
@@ -77,7 +113,19 @@ export function loadSessionUnlockToken(uid: string | null): string | null {
     const raw = sessionStorage.getItem(`${SESSION_UNLOCK_PREFIX}${uid}`);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as { pw?: string; ts?: number };
-    if (!parsed.pw) return null;
+    if (
+      !parsed.pw ||
+      typeof parsed.ts !== 'number' ||
+      Date.now() - parsed.ts > SESSION_UNLOCK_TTL_MS
+    ) {
+      sessionStorage.removeItem(`${SESSION_UNLOCK_PREFIX}${uid}`);
+      return null;
+    }
+    // Slide session window forward on active load
+    sessionStorage.setItem(
+      `${SESSION_UNLOCK_PREFIX}${uid}`,
+      JSON.stringify({ pw: parsed.pw, ts: Date.now() })
+    );
     return parsed.pw;
   } catch {
     return null;
@@ -121,7 +169,11 @@ function fromBase64(b64: string): Uint8Array {
   return bytes;
 }
 
-async function deriveAesKey(password: string, salt: Uint8Array): Promise<CryptoKey> {
+async function deriveAesKey(
+  password: string,
+  salt: Uint8Array,
+  iterations = PBKDF2_ITERATIONS_V2
+): Promise<CryptoKey> {
   const keyMaterial = await crypto.subtle.importKey(
     'raw',
     encoder.encode(password),
@@ -133,7 +185,7 @@ async function deriveAesKey(password: string, salt: Uint8Array): Promise<CryptoK
     {
       name: 'PBKDF2',
       salt: salt as BufferSource,
-      iterations: 100_000,
+      iterations,
       hash: 'SHA-256',
     },
     keyMaterial,
@@ -146,11 +198,13 @@ async function deriveAesKey(password: string, salt: Uint8Array): Promise<CryptoK
 export async function encryptPayload(data: unknown, password: string): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveAesKey(password, salt);
+  const key = await deriveAesKey(password, salt, PBKDF2_ITERATIONS_V2);
   const plaintext = encoder.encode(JSON.stringify(data));
   const ciphertext = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plaintext);
   return JSON.stringify({
-    v: 1,
+    v: 2,
+    kdf: 'PBKDF2-SHA256',
+    iterations: PBKDF2_ITERATIONS_V2,
     salt: toBase64(salt),
     iv: toBase64(iv),
     ct: toBase64(new Uint8Array(ciphertext)),
@@ -159,6 +213,8 @@ export async function encryptPayload(data: unknown, password: string): Promise<s
 
 export async function decryptPayload<T>(encryptedJson: string, password: string): Promise<T> {
   const parsed = JSON.parse(encryptedJson) as {
+    v?: number;
+    iterations?: number;
     salt: string;
     iv: string;
     ct: string;
@@ -166,7 +222,11 @@ export async function decryptPayload<T>(encryptedJson: string, password: string)
   const salt = fromBase64(parsed.salt);
   const iv = fromBase64(parsed.iv);
   const ct = fromBase64(parsed.ct);
-  const key = await deriveAesKey(password, salt);
+  const iterations =
+    parsed.v === 2 && typeof parsed.iterations === 'number'
+      ? Math.max(PBKDF2_ITERATIONS_V1, Math.min(1_000_000, parsed.iterations))
+      : PBKDF2_ITERATIONS_V1;
+  const key = await deriveAesKey(password, salt, iterations);
   const plaintext = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: iv as BufferSource },
     key,

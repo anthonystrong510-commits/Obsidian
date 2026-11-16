@@ -81,6 +81,11 @@ export function SecurityView({
   const [revealError, setRevealError] = useState('');
   const [copiedId, setCopiedId] = useState('');
   const [exportingKeystore, setExportingKeystore] = useState(false);
+  const [showKeystoreForm, setShowKeystoreForm] = useState(false);
+  const [keystorePassword, setKeystorePassword] = useState('');
+  const [keystoreError, setKeystoreError] = useState('');
+  const [failedAttempts, setFailedAttempts] = useState(0);
+  const [lockoutUntil, setLockoutUntil] = useState(0);
   const [derivingSub, setDerivingSub] = useState(false);
   const [qrTargetValue, setQrTargetValue] = useState<{ label: string; value: string } | null>(null);
   const [qrImageUrl, setQrImageUrl] = useState('');
@@ -117,8 +122,25 @@ export function SecurityView({
       .catch(() => setQrImageUrl(''));
   }, [qrTargetValue]);
 
+  const recordSecurityFailure = (setter: (msg: string) => void, baseMsg: string) => {
+    const nextFails = failedAttempts + 1;
+    setFailedAttempts(nextFails);
+    if (nextFails >= 4) {
+      const secs = Math.min(120, 15 * 2 ** (nextFails - 4));
+      setLockoutUntil(Date.now() + secs * 1000);
+      setter(`${baseMsg} Too many attempts — retry in ${secs}s.`);
+    } else {
+      setter(baseMsg);
+    }
+  };
+
   const handleRevealKeys = async () => {
     setRevealError('');
+    if (lockoutUntil > Date.now()) {
+      const rem = Math.ceil((lockoutUntil - Date.now()) / 1000);
+      setRevealError(`Security cooldown active. Wait ${rem}s before retrying.`);
+      return;
+    }
     if (!revealPassword) {
       setRevealError('Enter your vault password to decrypt and inspect private keys.');
       return;
@@ -148,14 +170,19 @@ export function SecurityView({
       } else {
         const verifierOk = await verifyVaultPassword(revealPassword);
         if (!verifierOk) {
-          setRevealError('Incorrect vault password.');
+          recordSecurityFailure(setRevealError, 'Incorrect vault password.');
           return;
         }
         setRevealedSecrets(secrets);
       }
+      setFailedAttempts(0);
+      setLockoutUntil(0);
       setRevealPassword('');
     } catch {
-      setRevealError('Incorrect password or unable to decrypt this wallet.');
+      recordSecurityFailure(
+        setRevealError,
+        'Incorrect password or unable to decrypt this wallet.'
+      );
     }
   };
 
@@ -168,19 +195,24 @@ export function SecurityView({
   const handleExportKeystore = async () => {
     const evmKey = revealedSecrets?.evmPrivateKey || secrets.evmPrivateKey;
     if (!evmKey) return;
-    const pw = prompt('Enter an encryption password for the exported UTC JSON keystore:');
-    if (!pw || pw.length < 6) return;
+    setKeystoreError('');
+    if (keystorePassword.length < 8) {
+      setKeystoreError('Enter a UTC keystore encryption password (minimum 8 characters).');
+      return;
+    }
     setExportingKeystore(true);
     try {
       const w = new Wallet(evmKey);
-      const json = await w.encrypt(pw);
+      const json = await w.encrypt(keystorePassword);
       const blob = new Blob([json], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
       a.download = `obsidian-keystore-${w.address.slice(2, 10)}.json`;
       a.click();
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setKeystorePassword('');
+      setShowKeystoreForm(false);
     } finally {
       setExportingKeystore(false);
     }
@@ -201,6 +233,11 @@ export function SecurityView({
 
   const handleConfirmArchive = async (w: WalletAccount) => {
     setArchiveError('');
+    if (lockoutUntil > Date.now()) {
+      const rem = Math.ceil((lockoutUntil - Date.now()) / 1000);
+      setArchiveError(`Security cooldown active. Wait ${rem}s before retrying.`);
+      return;
+    }
     if (activeWallets.length <= 1) {
       setArchiveError('At least one active wallet must remain available in your vault.');
       return;
@@ -212,9 +249,11 @@ export function SecurityView({
       }
       const ok = await verifyVaultPassword(archivePassword);
       if (!ok) {
-        setArchiveError('Incorrect Vault Password.');
+        recordSecurityFailure(setArchiveError, 'Incorrect Vault Password.');
         return;
       }
+      setFailedAttempts(0);
+      setLockoutUntil(0);
     }
     setArchivingBusy(true);
     try {
@@ -228,6 +267,11 @@ export function SecurityView({
 
   const handleConfirmPermanentDelete = async (w: WalletAccount) => {
     setDeleteError('');
+    if (lockoutUntil > Date.now()) {
+      const rem = Math.ceil((lockoutUntil - Date.now()) / 1000);
+      setDeleteError(`Security cooldown active. Wait ${rem}s before retrying.`);
+      return;
+    }
     if (deleteNameConfirm.trim() !== w.name.trim()) {
       setDeleteError(`Type "${w.name}" verbatim to confirm permanent removal.`);
       return;
@@ -239,9 +283,11 @@ export function SecurityView({
       }
       const ok = await verifyVaultPassword(deletePassword);
       if (!ok) {
-        setDeleteError('Incorrect Vault Password.');
+        recordSecurityFailure(setDeleteError, 'Incorrect Vault Password.');
         return;
       }
+      setFailedAttempts(0);
+      setLockoutUntil(0);
     }
     onDeleteWallet(w.id);
     setConfirmDeleteId(null);
@@ -566,7 +612,10 @@ export function SecurityView({
               <button
                 type="button"
                 disabled={exportingKeystore}
-                onClick={handleExportKeystore}
+                onClick={() => {
+                  setShowKeystoreForm((v) => !v);
+                  setKeystoreError('');
+                }}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#CBD5E1] hover:text-[#F4F6F9]"
               >
                 <Download className="w-3.5 h-3.5" />
@@ -574,6 +623,43 @@ export function SecurityView({
               </button>
             )}
           </div>
+
+          {showKeystoreForm && (revealedSecrets?.evmPrivateKey || secrets.evmPrivateKey) && (
+            <div className="p-4 rounded-lg bg-[#090B0F] border border-emerald-500/30 space-y-3">
+              <div className="text-xs font-medium text-[#F4F6F9]">
+                Encrypt & Download Ethereum UTC JSON Keystore
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <input
+                  type="password"
+                  value={keystorePassword}
+                  onChange={(e) => setKeystorePassword(e.target.value)}
+                  placeholder="Keystore encryption password (min 8 chars)"
+                  className="bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9] w-full sm:w-72"
+                />
+                <button
+                  type="button"
+                  disabled={exportingKeystore}
+                  onClick={handleExportKeystore}
+                  className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                >
+                  {exportingKeystore ? 'Encrypting...' : 'Download JSON'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowKeystoreForm(false);
+                    setKeystorePassword('');
+                    setKeystoreError('');
+                  }}
+                  className="px-3 py-2 rounded-lg bg-[#11151C] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9]"
+                >
+                  Cancel
+                </button>
+              </div>
+              {keystoreError && <div className="text-xs text-red-400">{keystoreError}</div>}
+            </div>
+          )}
 
           {activeWallet.type === 'watchOnly' ? (
             <p className="text-xs text-[#8A94A6]">
