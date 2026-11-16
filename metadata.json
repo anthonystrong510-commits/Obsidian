@@ -1,0 +1,6 @@
+{
+  "name": "Obsidian Vault",
+  "description": "Non-custodial multi-chain Web3 crypto wallet supporting 12, 18, and 24-word BIP-39 imports, cross-network sending and receiving, real-time portfolio tracking, token swaps, and live price alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

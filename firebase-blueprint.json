@@ -1,0 +1,167 @@
+{
+  "entities": {
+    "UserPublicProfile": {
+      "title": "UserPublicProfile",
+      "description": "Non-PII user account metadata and role/status visible to owner and admins",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "role": { "type": "string", "enum": ["user", "admin"] },
+        "status": { "type": "string", "enum": ["active", "suspended", "kyc_pending"] },
+        "provider": { "type": "string", "enum": ["google", "password"] },
+        "walletCount": { "type": "number" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "displayName", "role", "status", "provider", "walletCount", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII document containing user email and preferences",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "format": "email", "maxLength": 200 },
+        "currency": { "type": "string", "enum": ["USD", "EUR", "GBP"] },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "currency", "updatedAt"]
+    },
+    "EncryptedUserWallet": {
+      "title": "EncryptedUserWallet",
+      "description": "Client-side AES-GCM encrypted wallet metadata and public derived addresses",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "walletType": { "type": "string", "enum": ["mnemonic", "privateKey", "watchOnly"] },
+        "wordCount": { "type": "number" },
+        "preset": { "type": "string", "maxLength": 40 },
+        "accountIndex": { "type": "number" },
+        "evmAddress": { "type": "string", "maxLength": 100 },
+        "solanaAddress": { "type": "string", "maxLength": 100 },
+        "bitcoinAddress": { "type": "string", "maxLength": 100 },
+        "encryptedSecret": { "type": "string", "maxLength": 4096 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "name", "walletType", "accountIndex", "createdAt", "updatedAt"]
+    },
+    "UserPriceAlert": {
+      "title": "UserPriceAlert",
+      "description": "Real-time price alert rule configured by a user",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "coinId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 20 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "condition": { "type": "string", "enum": ["above", "below", "change24h"] },
+        "targetValue": { "type": "number" },
+        "active": { "type": "boolean" },
+        "repeat": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "coinId", "symbol", "name", "condition", "targetValue", "active", "repeat", "createdAt", "updatedAt"]
+    },
+    "ExchangeTreasuryWallet": {
+      "title": "ExchangeTreasuryWallet",
+      "description": "Exchange-grade Cold, Pool, or Hot custody wallet managed by admins",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tier": { "type": "string", "enum": ["cold", "pool", "hot"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "networkFamily": { "type": "string", "enum": ["multi-chain", "evm", "solana", "bitcoin"] },
+        "evmAddress": { "type": "string", "maxLength": 100 },
+        "solanaAddress": { "type": "string", "maxLength": 100 },
+        "bitcoinAddress": { "type": "string", "maxLength": 100 },
+        "quorum": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "allocationCapPct": { "type": "number" },
+        "status": { "type": "string", "enum": ["active", "frozen", "sweeping"] },
+        "encryptedVaultBlob": { "type": "string", "maxLength": 4096 },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "tier", "label", "networkFamily", "quorum", "allocationCapPct", "status", "createdBy", "createdAt", "updatedAt"]
+    },
+    "AdminRoleMarker": {
+      "title": "AdminRoleMarker",
+      "description": "Trusted marker document granting admin privileges to a UID",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "grantedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "grantedBy", "createdAt"]
+    },
+    "AdminAuditLog": {
+      "title": "AdminAuditLog",
+      "description": "Immutable administrative action log for exchange treasury and user management",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "action": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "targetId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 300 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorUid", "action", "targetId", "summary", "createdAt"]
+    },
+    "ExchangeSystemConfig": {
+      "title": "ExchangeSystemConfig",
+      "description": "Global exchange operational parameters controlled by admins",
+      "type": "object",
+      "properties": {
+        "maintenanceMode": { "type": "boolean" },
+        "withdrawalsPaused": { "type": "boolean" },
+        "hotWalletMaxPct": { "type": "number" },
+        "swapFeeBps": { "type": "number" },
+        "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["maintenanceMode", "withdrawalsPaused", "hotWalletMaxPct", "swapFeeBps", "updatedBy", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublicProfile" },
+      "description": "User profile document with status and role"
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Isolated user PII such as email and currency preference"
+    },
+    "/users/{userId}/wallets/{walletId}": {
+      "schema": { "$ref": "#/entities/EncryptedUserWallet" },
+      "description": "Client-encrypted user wallets synced across devices"
+    },
+    "/users/{userId}/alerts/{alertId}": {
+      "schema": { "$ref": "#/entities/UserPriceAlert" },
+      "description": "User real-time price alerts"
+    },
+    "/admins/{adminUid}": {
+      "schema": { "$ref": "#/entities/AdminRoleMarker" },
+      "description": "Trusted admin UID registry"
+    },
+    "/exchange_wallets/{walletId}": {
+      "schema": { "$ref": "#/entities/ExchangeTreasuryWallet" },
+      "description": "Exchange cold, pool, and hot custody wallets"
+    },
+    "/admin_audit_logs/{logId}": {
+      "schema": { "$ref": "#/entities/AdminAuditLog" },
+      "description": "Immutable administrative audit trail"
+    },
+    "/system_config/{configId}": {
+      "schema": { "$ref": "#/entities/ExchangeSystemConfig" },
+      "description": "Global exchange operational settings"
+    }
+  }
+}
