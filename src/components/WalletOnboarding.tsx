@@ -1,4 +1,4 @@
-import { useMemo, useState, type ClipboardEvent } from 'react';
+import { useEffect, useMemo, useState, type ClipboardEvent } from 'react';
 import {
   Check,
   ChevronRight,
@@ -6,6 +6,7 @@ import {
   Eye,
   EyeOff,
   KeyRound,
+  Link2,
   Plus,
   RefreshCw,
   ShieldCheck,
@@ -26,22 +27,34 @@ import {
   shortenAddress,
   validateMnemonicPhrase,
 } from '../lib/crypto';
+import { DEFAULT_WALLET_CATALOG_SEEDS } from '../lib/firestoreService';
 import { WALLET_PRESETS } from '../lib/networks';
 import { isAddress } from 'ethers';
-import { resolveEnsAddress } from '../lib/web3Service';
+import { formatCryptoAmount, formatFiat } from '../lib/formatters';
+import { fetchMultiChainPortfolio, resolveEnsAddress } from '../lib/web3Service';
 import {
   createVaultVerifier,
   encryptPayload,
   hasVaultPassword,
   verifyVaultPassword,
 } from '../lib/vaultStorage';
-import type { UnlockedSecrets, WalletAccount, WalletPresetId } from '../types/wallet';
+import type {
+  MarketCoin,
+  PortfolioHolding,
+  UnlockedSecrets,
+  WalletAccount,
+  WalletCatalogEntry,
+  WalletPresetId,
+} from '../types/wallet';
 
 type OnboardingTab = 'create' | 'import-seed' | 'import-key' | 'watch';
 
 interface WalletOnboardingProps {
   mode: 'fullPage' | 'modal';
   existingPassword?: string;
+  walletCatalog?: WalletCatalogEntry[];
+  markets?: MarketCoin[];
+  onNavigateSweep?: () => void;
   onComplete: (
     wallet: WalletAccount,
     secrets: UnlockedSecrets,
@@ -53,6 +66,9 @@ interface WalletOnboardingProps {
 export function WalletOnboarding({
   mode,
   existingPassword,
+  walletCatalog,
+  markets,
+  onNavigateSweep,
   onComplete,
   onClose,
 }: WalletOnboardingProps) {
@@ -95,6 +111,29 @@ export function WalletOnboarding({
   const [confirmPassword, setConfirmPassword] = useState(existingPassword || '');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
+
+  const [selectedCatalogId, setSelectedCatalogId] = useState<string>('cat_metamask');
+  const [previewCopied, setPreviewCopied] = useState<string>('');
+  const [previewHoldings, setPreviewHoldings] = useState<PortfolioHolding[]>([]);
+  const [scanningPreview, setScanningPreview] = useState(false);
+
+  const directoryWallets = useMemo<WalletCatalogEntry[]>(() => {
+    const enabledFromCloud = (walletCatalog || []).filter((w) => w.enabled);
+    if (enabledFromCloud.length > 0) return enabledFromCloud;
+    return DEFAULT_WALLET_CATALOG_SEEDS.map((s) => ({
+      ...s,
+      createdBy: 'system',
+      createdAt: 0,
+      updatedAt: 0,
+    }));
+  }, [walletCatalog]);
+
+  const handleSelectCatalogWallet = (entry: WalletCatalogEntry) => {
+    setSelectedCatalogId(entry.id);
+    setImportPreset(entry.presetId || 'standard');
+    setImportWordCount(entry.defaultWords || 12);
+    setImportWalletName(`${entry.name} Import`);
+  };
 
   const handleRegenerateWords = (count: 12 | 18 | 24) => {
     setCreateWordCount(count);
@@ -189,6 +228,16 @@ export function WalletOnboarding({
     }
   }, [importValidation.valid, activeImportSlice, importPreset, accountIndex, passphrase, customEvmPath]);
 
+  const keyPreviewAddresses = useMemo(() => {
+    const raw = privateKeyInput.trim();
+    if (!raw || raw.length < 32) return null;
+    try {
+      return deriveWalletFromPrivateKey(raw, privateKeyType).addresses;
+    } catch {
+      return null;
+    }
+  }, [privateKeyInput, privateKeyType]);
+
   const createPreviewAddresses = useMemo(() => {
     try {
       return deriveWalletFromMnemonic(generatedWords.join(' '), {
@@ -199,6 +248,44 @@ export function WalletOnboarding({
       return null;
     }
   }, [generatedWords]);
+
+  const activePreviewAddresses =
+    tab === 'create'
+      ? createPreviewAddresses
+      : tab === 'import-seed'
+      ? importPreviewAddresses
+      : tab === 'import-key'
+      ? keyPreviewAddresses
+      : null;
+
+  // Debounced live on-chain balance preview when importing seed or private key
+  useEffect(() => {
+    if ((tab !== 'import-seed' && tab !== 'import-key') || !activePreviewAddresses) {
+      setPreviewHoldings([]);
+      setScanningPreview(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setScanningPreview(true);
+      try {
+        const res = await fetchMultiChainPortfolio(activePreviewAddresses, markets || [], []);
+        if (!cancelled) {
+          setPreviewHoldings(res.filter((h) => h.balance > 0));
+        }
+      } catch {
+        if (!cancelled) setPreviewHoldings([]);
+      } finally {
+        if (!cancelled) setScanningPreview(false);
+      }
+    }, 350);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [tab, activePreviewAddresses, markets]);
 
   const wordSuggestions = useMemo(() => {
     if (focusedWordIndex === null) return [];
@@ -609,50 +696,76 @@ export function WalletOnboarding({
                 </div>
               </div>
 
-              {/* Creative Wallet Preset Selector */}
-              <div>
-                <span className="block text-xs text-[#8A94A6] mb-2">
-                  Source Wallet Ecosystem
-                </span>
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
-                  {WALLET_PRESETS.slice(0, 4).map((preset) => (
+              {/* Supported & Admin-Added Wallets Directory */}
+              <div className="space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs text-[#8A94A6]">
+                    Available Wallets to Import ({directoryWallets.length})
+                  </span>
+                  {onNavigateSweep && (
                     <button
-                      key={preset.id}
                       type="button"
-                      onClick={() => handleSelectPreset(preset.id)}
-                      className={`text-left px-3 py-2 rounded-lg border transition-colors ${
-                        importPreset === preset.id
-                          ? 'bg-emerald-500/10 border-emerald-500/50 text-[#F4F6F9]'
-                          : 'bg-[#090B0F] border-white/10 text-[#8A94A6] hover:text-[#F4F6F9]'
-                      }`}
+                      onClick={() => {
+                        onNavigateSweep();
+                        if (onClose) onClose();
+                      }}
+                      className="inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300"
                     >
-                      <div className="text-xs font-medium truncate">
-                        {preset.name.split('/')[0].trim()}
-                      </div>
-                      <div className="text-[11px] font-mono text-[#64748B] truncate mt-0.5">
-                        {preset.defaultWords}w · {preset.evmPathTemplate(0)}
-                      </div>
+                      <Link2 className="w-3.5 h-3.5" />
+                      <span>Or Connect Multiple Extension / Mobile Wallets</span>
                     </button>
-                  ))}
+                  )}
                 </div>
-                <div className="grid grid-cols-3 gap-2 mt-2">
-                  {WALLET_PRESETS.slice(4).map((preset) => (
+
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {directoryWallets.map((entry) => {
+                    const selected = selectedCatalogId === entry.id || importPreset === entry.presetId && importWalletName.startsWith(entry.name);
+                    return (
+                      <button
+                        key={entry.id}
+                        type="button"
+                        onClick={() => handleSelectCatalogWallet(entry)}
+                        className={`text-left px-3 py-2.5 rounded-lg border transition-colors ${
+                          selected
+                            ? 'bg-emerald-500/10 border-emerald-500/50 text-[#F4F6F9]'
+                            : 'bg-[#090B0F] border-white/10 text-[#CBD5E1] hover:border-white/25'
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="w-5 h-5 rounded flex items-center justify-center text-[10px] font-bold shrink-0"
+                            style={{
+                              backgroundColor: `${entry.badgeColor || '#10B981'}25`,
+                              color: entry.badgeColor || '#10B981',
+                            }}
+                          >
+                            {entry.name.slice(0, 2).toUpperCase()}
+                          </span>
+                          <span className="text-xs font-medium truncate">{entry.name}</span>
+                        </div>
+                        <div className="text-[10px] font-mono text-[#64748B] truncate mt-1">
+                          {entry.defaultWords}w · {entry.ecosystem.toUpperCase()} · {entry.derivationPath}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                {/* Standard BIP-44 Derivation Presets */}
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <span className="text-[11px] text-[#64748B] mr-1">Derivation:</span>
+                  {WALLET_PRESETS.map((preset) => (
                     <button
                       key={preset.id}
                       type="button"
                       onClick={() => handleSelectPreset(preset.id)}
-                      className={`text-left px-3 py-2 rounded-lg border transition-colors ${
+                      className={`px-2 py-1 rounded text-[11px] border transition-colors ${
                         importPreset === preset.id
-                          ? 'bg-emerald-500/10 border-emerald-500/50 text-[#F4F6F9]'
+                          ? 'bg-[#1D2432] border-emerald-500/40 text-[#F4F6F9]'
                           : 'bg-[#090B0F] border-white/10 text-[#8A94A6] hover:text-[#F4F6F9]'
                       }`}
                     >
-                      <div className="text-xs font-medium truncate">
-                        {preset.name.split('/')[0].trim()}
-                      </div>
-                      <div className="text-[11px] font-mono text-[#64748B] truncate mt-0.5">
-                        {preset.defaultWords}w standard
-                      </div>
+                      {preset.name.split('/')[0].trim()}
                     </button>
                   ))}
                 </div>
@@ -1060,7 +1173,7 @@ export function WalletOnboarding({
 
             <div>
               <h4 className="text-sm font-semibold text-[#F4F6F9]">
-                Live Derived Chain Addresses
+                Live Import & Address Preview
               </h4>
               <p className="text-xs text-[#8A94A6] mt-1 leading-relaxed">
                 Generated deterministically in-memory using BIP-39, BIP-44, SLIP-0010, and BIP-84 standards.
@@ -1068,61 +1181,124 @@ export function WalletOnboarding({
             </div>
 
             {(() => {
-              const preview =
-                tab === 'create'
-                  ? createPreviewAddresses
-                  : tab === 'import-seed'
-                  ? importPreviewAddresses
-                  : null;
+              const preview = activePreviewAddresses;
 
               if (!preview) {
                 return (
-                  <div className="p-4 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#64748B]">
-                    {tab === 'import-seed'
-                      ? 'Complete all 12, 18, or 24 valid BIP-39 words to preview derived EVM, Solana, Bitcoin, and Monero (XMR) addresses.'
-                      : 'Addresses are derived across Ethereum, Arbitrum, Base, Optimism, Polygon, BNB, Avalanche, Solana, Bitcoin, and Monero.'}
+                  <div className="p-4 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#64748B] space-y-2">
+                    <p>
+                      {tab === 'import-seed'
+                        ? 'Complete all 12, 18, or 24 valid BIP-39 words to preview derived EVM, Solana, Bitcoin, Monero (XMR) addresses and scan live on-chain balances.'
+                        : tab === 'import-key'
+                        ? 'Paste an EVM, Solana Base58, or Monero spend key to preview derived addresses and live balances.'
+                        : 'Addresses are derived across Ethereum, Arbitrum, Base, Optimism, Polygon, BNB, Avalanche, Solana, Bitcoin, and Monero.'}
+                    </p>
                   </div>
                 );
               }
 
+              const copyPreview = async (k: string, val: string) => {
+                await navigator.clipboard.writeText(val);
+                setPreviewCopied(k);
+                setTimeout(() => setPreviewCopied(''), 1500);
+              };
+
+              const totalPreviewUsd = previewHoldings.reduce((acc, h) => acc + h.valueUsd, 0);
+
               return (
                 <div className="space-y-2.5">
-                  <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
-                    <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
-                      <span>EVM (ETH / ARB / BASE / POL)</span>
-                      <span className="font-mono">{preview.evmPath}</span>
+                  {preview.evmAddress && (
+                    <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
+                      <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
+                        <span>EVM (ETH / ARB / BASE / POL)</span>
+                        <button
+                          type="button"
+                          onClick={() => copyPreview('evm', preview.evmAddress)}
+                          className="inline-flex items-center gap-1 hover:text-[#F4F6F9]"
+                        >
+                          {previewCopied === 'evm' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                        </button>
+                      </div>
+                      <div className="font-mono text-xs text-[#F4F6F9] mt-1 truncate">
+                        {shortenAddress(preview.evmAddress, 10, 8)}
+                      </div>
                     </div>
-                    <div className="font-mono text-xs text-[#F4F6F9] mt-1 truncate">
-                      {shortenAddress(preview.evmAddress, 10, 8)}
+                  )}
+                  {preview.solanaAddress && (
+                    <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
+                      <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
+                        <span>Solana (Ed25519)</span>
+                        <button
+                          type="button"
+                          onClick={() => copyPreview('sol', preview.solanaAddress)}
+                          className="inline-flex items-center gap-1 hover:text-[#F4F6F9]"
+                        >
+                          {previewCopied === 'sol' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                        </button>
+                      </div>
+                      <div className="font-mono text-xs text-emerald-400 mt-1 truncate">
+                        {shortenAddress(preview.solanaAddress, 10, 8)}
+                      </div>
                     </div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
-                    <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
-                      <span>Solana (Ed25519)</span>
-                      <span className="font-mono">{preview.solanaPath}</span>
+                  )}
+                  {preview.bitcoinAddress && (
+                    <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
+                      <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
+                        <span>Bitcoin (SegWit bc1q)</span>
+                        <span className="font-mono">{preview.bitcoinPath}</span>
+                      </div>
+                      <div className="font-mono text-xs text-amber-400 mt-1 truncate">
+                        {shortenAddress(preview.bitcoinAddress, 10, 8)}
+                      </div>
                     </div>
-                    <div className="font-mono text-xs text-emerald-400 mt-1 truncate">
-                      {shortenAddress(preview.solanaAddress, 10, 8)}
+                  )}
+                  {preview.moneroAddress && (
+                    <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
+                      <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
+                        <span>Monero (CryptoNote XMR)</span>
+                        <span className="font-mono">{preview.moneroPath}</span>
+                      </div>
+                      <div className="font-mono text-xs text-[#FF6600] mt-1 truncate">
+                        {shortenAddress(preview.moneroAddress, 10, 8)}
+                      </div>
                     </div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
-                    <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
-                      <span>Bitcoin (SegWit bc1q)</span>
-                      <span className="font-mono">{preview.bitcoinPath}</span>
+                  )}
+
+                  {(tab === 'import-seed' || tab === 'import-key') && (
+                    <div className="p-3 rounded-lg bg-[#090B0F] border border-emerald-500/20 space-y-2">
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-[#8A94A6]">On-Chain Balance Scan</span>
+                        {scanningPreview ? (
+                          <span className="text-emerald-400 font-mono">Scanning...</span>
+                        ) : (
+                          <span className="font-mono font-semibold text-emerald-400 tabular-nums">
+                            {formatFiat(totalPreviewUsd)}
+                          </span>
+                        )}
+                      </div>
+                      {!scanningPreview && previewHoldings.length === 0 ? (
+                        <div className="text-[11px] text-[#64748B]">
+                          0 funded tokens detected yet across scanned networks. Ready to import.
+                        </div>
+                      ) : (
+                        <div className="space-y-1 max-h-32 overflow-y-auto">
+                          {previewHoldings.map((h) => (
+                            <div
+                              key={`${h.networkId}-${h.symbol}`}
+                              className="flex items-center justify-between text-[11px] font-mono"
+                            >
+                              <span className="text-[#CBD5E1]">
+                                {formatCryptoAmount(h.balance)} {h.symbol}
+                              </span>
+                              <span className="text-[#8A94A6] tabular-nums">
+                                {formatFiat(h.valueUsd)}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
-                    <div className="font-mono text-xs text-amber-400 mt-1 truncate">
-                      {shortenAddress(preview.bitcoinAddress, 10, 8)}
-                    </div>
-                  </div>
-                  <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
-                    <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
-                      <span>Monero (CryptoNote XMR)</span>
-                      <span className="font-mono">{preview.moneroPath}</span>
-                    </div>
-                    <div className="font-mono text-xs text-[#FF6600] mt-1 truncate">
-                      {shortenAddress(preview.moneroAddress, 10, 8)}
-                    </div>
-                  </div>
+                  )}
                 </div>
               );
             })()}

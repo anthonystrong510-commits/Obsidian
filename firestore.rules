@@ -92,6 +92,28 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidConnectedSession(data) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'providerUuid', 'walletName', 'kind',
+          'address', 'platform', 'selectedForSweep', 'connectedAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'providerUuid', 'walletName', 'kind',
+          'address', 'chainId', 'platform', 'selectedForSweep', 'connectedAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && data.providerUuid is string && data.providerUuid.size() >= 1 && data.providerUuid.size() <= 128
+        && data.walletName is string && data.walletName.size() >= 1 && data.walletName.size() <= 80
+        && data.kind in ['evm', 'solana']
+        && data.address is string && data.address.size() >= 10 && data.address.size() <= 120
+        && (!('chainId' in data) || (data.chainId is number && data.chainId >= 1 && data.chainId <= 1000000000))
+        && data.platform in ['desktop', 'mobile']
+        && data.selectedForSweep is bool
+        && data.connectedAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidUserAlert(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'coinId', 'symbol', 'name', 'condition', 'targetValue', 'active', 'repeat', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly([
@@ -110,6 +132,32 @@ service cloud.firestore {
         && data.repeat is bool
         && (!('soundEnabled' in data) || data.soundEnabled is bool)
         && (!('browserNotification' in data) || data.browserNotification is bool)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidWalletCatalogItem(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'ecosystem', 'defaultWords', 'derivationPath',
+          'presetId', 'enabled', 'featured', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'name', 'ecosystem', 'defaultWords', 'derivationPath',
+          'presetId', 'mobileDeepLink', 'badgeColor', 'description',
+          'enabled', 'featured', 'createdBy', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.ecosystem in ['multi-chain', 'evm', 'solana', 'bitcoin', 'monero']
+        && data.defaultWords is number && data.defaultWords in [12, 18, 24]
+        && data.derivationPath is string && data.derivationPath.size() >= 1 && data.derivationPath.size() <= 64
+        && data.presetId is string && data.presetId.size() >= 1 && data.presetId.size() <= 40
+        && (!('mobileDeepLink' in data) || (data.mobileDeepLink is string && data.mobileDeepLink.size() <= 300))
+        && (!('badgeColor' in data) || (data.badgeColor is string && data.badgeColor.size() <= 20))
+        && (!('description' in data) || (data.description is string && data.description.size() <= 240))
+        && data.enabled is bool
+        && data.featured is bool
+        && isValidId(data.createdBy)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -219,22 +267,22 @@ service cloud.firestore {
         allow delete: if isValidId(userId) && isValidId(docId) && (isOwner(userId) || isAdmin());
       }
 
-      // User Encrypted Wallets
+      // User Encrypted Wallets (Owner or Admin provisioning)
       match /wallets/{walletId} {
         allow get: if isValidId(userId) && isValidId(walletId) && (isOwner(userId) || isAdmin());
-        allow list: if isValidId(userId) && isVerifiedUser() && (request.auth.uid == userId && resource.data.ownerUid == request.auth.uid);
+        allow list: if isValidId(userId) && (isAdmin() || (isVerifiedUser() && request.auth.uid == userId && resource.data.ownerUid == request.auth.uid));
 
         allow create: if isValidId(userId) && isValidId(walletId)
-          && isOwner(userId)
+          && (isOwner(userId) || isAdmin())
           && exists(/databases/$(database)/documents/users/$(userId))
           && isValidUserWallet(incoming())
           && incoming().id == walletId
-          && incoming().ownerUid == request.auth.uid
+          && incoming().ownerUid == userId
           && incoming().createdAt == request.time
           && incoming().updatedAt == request.time;
 
         allow update: if isValidId(userId) && isValidId(walletId)
-          && isOwner(userId)
+          && (isOwner(userId) || isAdmin())
           && isValidUserWallet(incoming())
           && incoming().id == existing().id
           && incoming().ownerUid == existing().ownerUid
@@ -245,6 +293,32 @@ service cloud.firestore {
           && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'encryptedSecret', 'moneroAddress', 'updatedAt']);
 
         allow delete: if isValidId(userId) && isValidId(walletId) && (isOwner(userId) || isAdmin());
+      }
+
+      // Concurrent WalletConnect & Mobile dApp Sessions
+      match /connected_sessions/{sessionId} {
+        allow get: if isValidId(userId) && isValidId(sessionId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && (isAdmin() || (isVerifiedUser() && request.auth.uid == userId && resource.data.ownerUid == request.auth.uid));
+
+        allow create: if isValidId(userId) && isValidId(sessionId)
+          && isOwner(userId)
+          && exists(/databases/$(database)/documents/users/$(userId))
+          && isValidConnectedSession(incoming())
+          && incoming().id == sessionId
+          && incoming().ownerUid == request.auth.uid
+          && incoming().connectedAt == request.time
+          && incoming().updatedAt == request.time;
+
+        allow update: if isValidId(userId) && isValidId(sessionId)
+          && isOwner(userId)
+          && isValidConnectedSession(incoming())
+          && incoming().id == existing().id
+          && incoming().ownerUid == existing().ownerUid
+          && incoming().connectedAt == existing().connectedAt
+          && incoming().updatedAt == request.time
+          && incoming().diff(existing()).affectedKeys().hasOnly(['chainId', 'selectedForSweep', 'walletName', 'updatedAt']);
+
+        allow delete: if isValidId(userId) && isValidId(sessionId) && (isOwner(userId) || isAdmin());
       }
 
       // User Price Alerts
@@ -272,6 +346,34 @@ service cloud.firestore {
 
         allow delete: if isValidId(userId) && isValidId(alertId) && (isOwner(userId) || isAdmin());
       }
+    }
+
+    // Admin-Managed Wallet Directory (Readable if enabled or Admin; Writable only by Admin)
+    match /wallet_catalog/{walletId} {
+      allow get: if isValidId(walletId) && (isAdmin() || (isVerifiedUser() && existing().enabled == true));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.enabled == true);
+
+      allow create: if isValidId(walletId)
+        && isAdmin()
+        && isValidWalletCatalogItem(incoming())
+        && incoming().id == walletId
+        && incoming().createdBy == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(walletId)
+        && isAdmin()
+        && isValidWalletCatalogItem(incoming())
+        && incoming().id == existing().id
+        && incoming().createdBy == existing().createdBy
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'ecosystem', 'defaultWords', 'derivationPath', 'presetId',
+          'mobileDeepLink', 'badgeColor', 'description', 'enabled', 'featured', 'updatedAt'
+        ]);
+
+      allow delete: if isValidId(walletId) && isAdmin();
     }
 
     // Trusted Admin Registry

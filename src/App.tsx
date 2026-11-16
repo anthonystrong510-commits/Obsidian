@@ -18,11 +18,15 @@ import { auth } from './lib/firebase';
 import {
   checkUserIsAdmin,
   deleteUserAlertFromCloud,
+  deleteUserConnectedSessionFromCloud,
   deleteUserWalletFromCloud,
   fetchUserAlertsFromCloud,
+  fetchUserConnectedSessionsFromCloud,
   fetchUserWalletsFromCloud,
   getExchangeSystemConfig,
+  listWalletCatalog,
   saveUserAlertToCloud,
+  saveUserConnectedSessionToCloud,
   saveUserWalletToCloud,
   syncUserProfile,
 } from './lib/firestoreService';
@@ -74,6 +78,7 @@ import type {
   TokenConfig,
   UnlockedSecrets,
   WalletAccount,
+  WalletCatalogEntry,
   WalletTransaction,
 } from './types/wallet';
 
@@ -114,21 +119,34 @@ function playAlertChime() {
 }
 
 export default function App() {
-  // Route state supporting /kingadmin
+  // Route state supporting /kingadmin and #/kingadmin
   const [pathname, setPathname] = useState<string>(() => window.location.pathname);
+  const [hashPath, setHashPath] = useState<string>(() => window.location.hash);
 
   useEffect(() => {
-    const handlePop = () => setPathname(window.location.pathname);
+    const handlePop = () => {
+      setPathname(window.location.pathname);
+      setHashPath(window.location.hash);
+    };
     window.addEventListener('popstate', handlePop);
-    return () => window.removeEventListener('popstate', handlePop);
+    window.addEventListener('hashchange', handlePop);
+    return () => {
+      window.removeEventListener('popstate', handlePop);
+      window.removeEventListener('hashchange', handlePop);
+    };
   }, []);
 
   const navigateRoute = useCallback((targetPath: string) => {
-    if (window.location.pathname !== targetPath) {
+    if (window.location.pathname !== targetPath || window.location.hash) {
       window.history.pushState({}, '', targetPath);
       setPathname(targetPath);
+      setHashPath('');
     }
   }, []);
+
+  const isAdminRoute =
+    pathname.replace(/\/+$/, '').startsWith('/kingadmin') ||
+    hashPath.startsWith('#/kingadmin');
 
   // Firebase Auth State
   const [authReady, setAuthReady] = useState(false);
@@ -169,7 +187,10 @@ export default function App() {
     Record<string, UnlockedSecrets>
   >({});
 
-  const [activeTab, setActiveTab] = useState<NavTab>('portfolio');
+  const [activeTab, setActiveTab] = useState<NavTab>(() => {
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get('tab') === 'sweep' ? 'sweep' : 'portfolio';
+  });
   const [transferInitialMode, setTransferInitialMode] = useState<'send' | 'receive'>('send');
   const [transferInitialNetwork, setTransferInitialNetwork] = useState<NetworkId>('ethereum');
   const [transferInitialSymbol, setTransferInitialSymbol] = useState<string | undefined>(undefined);
@@ -177,7 +198,8 @@ export default function App() {
   const [alertInitialCoinId, setAlertInitialCoinId] = useState<string | undefined>(undefined);
   const [showAddWalletModal, setShowAddWalletModal] = useState(false);
   const [justCreatedWalletId, setJustCreatedWalletId] = useState<string | null>(null);
-  const [connectedExternal, setConnectedExternal] = useState<ConnectedExternalWallet | null>(null);
+  const [connectedExternals, setConnectedExternals] = useState<ConnectedExternalWallet[]>([]);
+  const [walletCatalog, setWalletCatalog] = useState<WalletCatalogEntry[]>([]);
 
   // Market & Portfolio Data
   const [markets, setMarkets] = useState<MarketCoin[]>([]);
@@ -262,8 +284,23 @@ export default function App() {
         setAlerts(mergedAlerts);
         saveAlerts(mergedAlerts);
 
-        // Fetch system config advisory
-        const sysCfg = await getExchangeSystemConfig().catch(() => null);
+        // Fetch saved multi-wallet connect sessions & admin-curated wallet catalog
+        const [cloudSessions, enabledCatalog, sysCfg] = await Promise.all([
+          fetchUserConnectedSessionsFromCloud(authUser.uid).catch(() => []),
+          listWalletCatalog(true).catch(() => []),
+          getExchangeSystemConfig().catch(() => null),
+        ]);
+        if (cloudSessions.length > 0) {
+          setConnectedExternals((prev) => {
+            const map = new Map<string, ConnectedExternalWallet>();
+            for (const s of cloudSessions) map.set(s.id, s);
+            for (const p of prev) map.set(p.id, p);
+            return Array.from(map.values()).sort((a, b) => b.connectedAt - a.connectedAt);
+          });
+        }
+        if (enabledCatalog.length > 0) {
+          setWalletCatalog(enabledCatalog);
+        }
         if (sysCfg) setExchangeConfig(sysCfg);
       } catch (err) {
         console.error('Cloud sync warning:', err);
@@ -625,15 +662,80 @@ export default function App() {
     }
   };
 
+  const handleConnectAccounts = useCallback(
+    async (newConnections: ConnectedExternalWallet[]) => {
+      setConnectedExternals((prev) => {
+        const map = new Map<string, ConnectedExternalWallet>();
+        for (const existing of prev) map.set(existing.id, existing);
+        for (const incoming of newConnections) map.set(incoming.id, incoming);
+        return Array.from(map.values()).sort((a, b) => b.connectedAt - a.connectedAt);
+      });
+      if (authUser && authUser.emailVerified) {
+        await Promise.all(
+          newConnections.map((conn) =>
+            saveUserConnectedSessionToCloud(authUser.uid, conn).catch(() => {})
+          )
+        );
+      }
+      if (newConnections.length > 0) {
+        pushToast(
+          `${newConnections.length} Wallet${newConnections.length > 1 ? 's' : ''} Connected`,
+          newConnections.map((c) => `${c.name} (${shortenAddress(c.address, 5, 4)})`).join(', ')
+        );
+      }
+    },
+    [authUser, pushToast]
+  );
+
+  const handleToggleConnectionSweep = useCallback(
+    async (sessionId: string) => {
+      let updatedTarget: ConnectedExternalWallet | undefined;
+      setConnectedExternals((prev) =>
+        prev.map((c) => {
+          if (c.id !== sessionId) return c;
+          updatedTarget = { ...c, selectedForSweep: !(c.selectedForSweep ?? true) };
+          return updatedTarget;
+        })
+      );
+      if (updatedTarget && authUser && authUser.emailVerified) {
+        await saveUserConnectedSessionToCloud(authUser.uid, updatedTarget).catch(() => {});
+      }
+    },
+    [authUser]
+  );
+
+  const handleDisconnectOne = useCallback(
+    async (sessionId: string) => {
+      setConnectedExternals((prev) => prev.filter((c) => c.id !== sessionId));
+      if (authUser && authUser.emailVerified) {
+        await deleteUserConnectedSessionFromCloud(authUser.uid, sessionId).catch(() => {});
+      }
+    },
+    [authUser]
+  );
+
+  const handleDisconnectAll = useCallback(async () => {
+    const existing = connectedExternals;
+    setConnectedExternals([]);
+    if (authUser && authUser.emailVerified) {
+      await Promise.all(
+        existing.map((c) =>
+          deleteUserConnectedSessionFromCloud(authUser.uid, c.id).catch(() => {})
+        )
+      );
+    }
+  }, [authUser, connectedExternals]);
+
   const handleSignOut = async () => {
     await signOut(auth);
     setSessionPassword(null);
     setUnlockedSecretsMap({});
+    setConnectedExternals([]);
     syncedUidRef.current = null;
   };
 
   // ROUTE 1: Dedicated Admin Panel (/kingadmin)
-  if (pathname.startsWith('/kingadmin')) {
+  if (isAdminRoute) {
     return (
       <KingAdminView
         currentUser={authUser}
@@ -697,6 +799,8 @@ export default function App() {
     return (
       <WalletOnboarding
         mode="fullPage"
+        walletCatalog={walletCatalog}
+        markets={markets}
         onComplete={handleWalletCreated}
       />
     );
@@ -816,17 +920,21 @@ export default function App() {
 
         {/* Bottom User Profile, Stream & Admin Link */}
         <div className="p-5 border-t border-white/10 space-y-3">
-          {connectedExternal && (
+          {connectedExternals.length > 0 && (
             <button
               type="button"
               onClick={() => setActiveTab('sweep')}
               className="w-full p-2.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-left space-y-0.5 hover:bg-emerald-500/15 transition-colors"
             >
               <div className="text-[11px] font-medium text-emerald-400 truncate">
-                Connected · {connectedExternal.name}
+                {connectedExternals.length === 1
+                  ? `Connected · ${connectedExternals[0].name}`
+                  : `${connectedExternals.length} External Wallets Connected`}
               </div>
               <div className="font-mono text-[10px] text-[#CBD5E1] truncate">
-                {shortenAddress(connectedExternal.address, 6, 4)}
+                {connectedExternals.length === 1
+                  ? shortenAddress(connectedExternals[0].address, 6, 4)
+                  : connectedExternals.map((c) => c.name).slice(0, 3).join(', ')}
               </div>
             </button>
           )}
@@ -968,7 +1076,16 @@ export default function App() {
               currency={settings.currency}
               loadingPortfolio={loadingPortfolio}
               isNewlyCreated={activeWallet.id === justCreatedWalletId}
-              connectedExternalName={connectedExternal?.name ?? null}
+              connectedExternalName={
+                connectedExternals.length > 0
+                  ? connectedExternals.length === 1
+                    ? connectedExternals[0].name
+                    : `${connectedExternals.length} Wallets (${connectedExternals
+                        .slice(0, 2)
+                        .map((c) => c.name)
+                        .join(', ')})`
+                  : null
+              }
               onRefresh={() => refreshPortfolio(activeWallet, markets)}
               onNavigateSend={(netId, sym) => {
                 if (netId) setTransferInitialNetwork(netId);
@@ -1045,8 +1162,12 @@ export default function App() {
               justCreatedWalletId={justCreatedWalletId}
               markets={markets}
               currency={settings.currency}
-              connectedExternal={connectedExternal}
-              onConnectedExternalChange={setConnectedExternal}
+              connectedExternals={connectedExternals}
+              walletCatalog={walletCatalog}
+              onConnectAccounts={handleConnectAccounts}
+              onToggleConnectionSweep={handleToggleConnectionSweep}
+              onDisconnectOne={handleDisconnectOne}
+              onDisconnectAll={handleDisconnectAll}
               onSweepExecuted={(tx) => {
                 setLocalTxs((prev) => {
                   const next = [tx, ...prev];
@@ -1184,6 +1305,9 @@ export default function App() {
         <WalletOnboarding
           mode="modal"
           existingPassword={sessionPassword}
+          walletCatalog={walletCatalog}
+          markets={markets}
+          onNavigateSweep={() => setActiveTab('sweep')}
           onComplete={handleWalletCreated}
           onClose={() => setShowAddWalletModal(false)}
         />

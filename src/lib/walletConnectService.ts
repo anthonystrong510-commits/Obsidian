@@ -10,7 +10,7 @@ import {
 import { ed25519 } from '@noble/curves/ed25519.js';
 import bs58 from 'bs58';
 import { NETWORK_MAP } from './networks';
-import { getEvmProvider } from './web3Service';
+import { getEvmFallbackProvider, getEvmProvider } from './web3Service';
 import type {
   ConnectedExternalWallet,
   DiscoveredWalletProvider,
@@ -89,6 +89,118 @@ const ADD_CHAIN_PARAMS: Partial<
   },
 };
 
+export interface MobileWalletAppConfig {
+  id: string;
+  name: string;
+  chains: string;
+  color: string;
+  buildDeepLink: (targetUrl: string) => string;
+}
+
+export const MOBILE_WALLET_APPS: MobileWalletAppConfig[] = [
+  {
+    id: 'metamask',
+    name: 'MetaMask Mobile',
+    chains: 'Ethereum · L2s · EVM',
+    color: '#F6851B',
+    buildDeepLink: (targetUrl) =>
+      `https://metamask.app.link/dapp/${targetUrl.replace(/^https?:\/\//, '')}`,
+  },
+  {
+    id: 'trust',
+    name: 'Trust Wallet',
+    chains: 'Multi-Chain · EVM · SOL',
+    color: '#3375BB',
+    buildDeepLink: (targetUrl) =>
+      `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
+    id: 'coinbase',
+    name: 'Coinbase Wallet',
+    chains: 'Base · EVM · Solana',
+    color: '#0052FF',
+    buildDeepLink: (targetUrl) =>
+      `https://go.cb-w.com/dapp?cb_url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
+    id: 'phantom',
+    name: 'Phantom Mobile',
+    chains: 'Solana · Ethereum · Base',
+    color: '#AB9FF2',
+    buildDeepLink: (targetUrl) => {
+      const origin = typeof window !== 'undefined' ? window.location.origin : '';
+      return `https://phantom.app/ul/browse/${encodeURIComponent(targetUrl)}?ref=${encodeURIComponent(origin)}`;
+    },
+  },
+  {
+    id: 'okx',
+    name: 'OKX Wallet',
+    chains: 'Multi-Chain Web3',
+    color: '#94A3B8',
+    buildDeepLink: (targetUrl) =>
+      `okx://wallet/dapp/url?dappUrl=${encodeURIComponent(targetUrl)}`,
+  },
+  {
+    id: 'safepal',
+    name: 'SafePal App',
+    chains: 'EVM · BNB · Polygon',
+    color: '#4A55FF',
+    buildDeepLink: (targetUrl) =>
+      `https://link.safepal.io/dapp?url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
+    id: 'bitget',
+    name: 'Bitget Wallet',
+    chains: 'Multi-Chain Mobile',
+    color: '#00F0FF',
+    buildDeepLink: (targetUrl) =>
+      `https://bkcode.vip?action=dapp&url=${encodeURIComponent(targetUrl)}`,
+  },
+  {
+    id: 'rainbow',
+    name: 'Rainbow Wallet',
+    chains: 'Ethereum · Optimism · Base',
+    color: '#38BDF8',
+    buildDeepLink: (targetUrl) =>
+      `https://rnbwapp.com/wc?uri=${encodeURIComponent(targetUrl)}`,
+  },
+];
+
+export function isMobileUserAgent(): boolean {
+  if (typeof navigator === 'undefined') return false;
+  return /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(
+    navigator.userAgent
+  );
+}
+
+export function isInAppWalletBrowser(): boolean {
+  if (typeof window === 'undefined') return false;
+  const w = window as unknown as {
+    ethereum?: unknown;
+    phantom?: { solana?: unknown };
+    solana?: unknown;
+  };
+  return Boolean(w.ethereum || w.phantom?.solana || w.solana);
+}
+
+export function buildSweepLandingUrl(destEvm?: string, destSol?: string): string {
+  if (typeof window === 'undefined') return '';
+  const url = new URL(window.location.origin);
+  url.searchParams.set('tab', 'sweep');
+  if (destEvm) url.searchParams.set('destEvm', destEvm);
+  if (destSol) url.searchParams.set('destSol', destSol);
+  return url.toString();
+}
+
+export function formatDeepLinkTemplate(template: string, targetUrl: string): string {
+  const noProto = targetUrl.replace(/^https?:\/\//, '');
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  return template
+    .replace(/\{dappUrlNoProto\}/g, noProto)
+    .replace(/\{dappUrl\}/g, encodeURIComponent(targetUrl))
+    .replace(/\{origin\}/g, encodeURIComponent(origin));
+}
+
 interface Eip6963AnnounceEvent extends Event {
   detail?: {
     info?: { uuid?: string; name?: string; icon?: string; rdns?: string };
@@ -98,10 +210,20 @@ interface Eip6963AnnounceEvent extends Event {
 
 interface WindowWithWallets extends Window {
   ethereum?: Eip1193Provider & {
+    providers?: Array<
+      Eip1193Provider & {
+        isMetaMask?: boolean;
+        isRabby?: boolean;
+        isCoinbaseWallet?: boolean;
+        isTrust?: boolean;
+        isOkxWallet?: boolean;
+      }
+    >;
     isMetaMask?: boolean;
     isRabby?: boolean;
     isCoinbaseWallet?: boolean;
     isTrust?: boolean;
+    isOkxWallet?: boolean;
   };
   phantom?: {
     solana?: {
@@ -115,6 +237,36 @@ interface WindowWithWallets extends Window {
     connect: () => Promise<{ publicKey: { toBase58: () => string } }>;
     disconnect?: () => Promise<void>;
   };
+}
+
+// Live in-memory provider map supporting multiple simultaneous connected wallets
+const sessionProviderMap = new Map<string, Eip1193Provider>();
+
+export function makeSessionId(providerUuid: string, address: string): string {
+  const cleanAddr = address.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24);
+  const cleanProv = providerUuid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
+  return `wc_${cleanProv}_${cleanAddr}`;
+}
+
+export function registerSessionProvider(sessionId: string, provider: Eip1193Provider): void {
+  sessionProviderMap.set(sessionId, provider);
+}
+
+export function resolveProviderForSession(
+  session: ConnectedExternalWallet,
+  discoveredProviders: DiscoveredWalletProvider[]
+): Eip1193Provider | null {
+  const direct = sessionProviderMap.get(session.id);
+  if (direct) return direct;
+  if (session.providerUuid) {
+    const byUuid = discoveredProviders.find((p) => p.uuid === session.providerUuid)?.provider;
+    if (byUuid) return byUuid;
+  }
+  const byName = discoveredProviders.find(
+    (p) => p.name === session.name && p.kind === session.kind
+  )?.provider;
+  if (byName) return byName;
+  return discoveredProviders.find((p) => p.kind === session.kind)?.provider || null;
 }
 
 export function discoverExternalWalletProviders(
@@ -144,24 +296,36 @@ export function discoverExternalWalletProviders(
   window.addEventListener('eip6963:announceProvider', handleAnnounce);
   window.dispatchEvent(new Event('eip6963:requestProvider'));
 
-  // Fallback for legacy window.ethereum wallets that do not announce EIP-6963
+  // Fallback for legacy window.ethereum & mobile in-app wallet browsers
   const fallbackTimer = setTimeout(() => {
-    const hasEvm = Array.from(discovered.values()).some((p) => p.kind === 'evm');
-    if (!hasEvm && win.ethereum) {
-      const name = win.ethereum.isRabby
-        ? 'Rabby Wallet'
-        : win.ethereum.isCoinbaseWallet
-        ? 'Coinbase Wallet'
-        : win.ethereum.isTrust
-        ? 'Trust Wallet'
-        : win.ethereum.isMetaMask
-        ? 'MetaMask'
-        : 'Injected Web3 Wallet';
-      discovered.set('legacy-window-ethereum', {
-        uuid: 'legacy-window-ethereum',
-        name,
-        kind: 'evm',
-        provider: win.ethereum,
+    if (win.ethereum) {
+      const multi = Array.isArray(win.ethereum.providers) && win.ethereum.providers.length > 0
+        ? win.ethereum.providers
+        : [win.ethereum];
+
+      multi.forEach((prov, idx) => {
+        const name = prov.isRabby
+          ? 'Rabby Wallet'
+          : prov.isCoinbaseWallet
+          ? 'Coinbase Wallet'
+          : prov.isTrust
+          ? 'Trust Wallet'
+          : prov.isOkxWallet
+          ? 'OKX Wallet'
+          : prov.isMetaMask
+          ? 'MetaMask'
+          : 'Injected Web3 Wallet';
+        const alreadyHave = Array.from(discovered.values()).some(
+          (p) => p.kind === 'evm' && p.name.toLowerCase().includes(name.toLowerCase().split(' ')[0])
+        );
+        if (!alreadyHave) {
+          discovered.set(`injected-evm-${idx}`, {
+            uuid: `injected-evm-${idx}`,
+            name,
+            kind: 'evm',
+            provider: prov,
+          });
+        }
       });
     }
 
@@ -174,7 +338,7 @@ export function discoverExternalWalletProviders(
       });
     }
     emit();
-  }, 150);
+  }, 160);
 
   return () => {
     clearTimeout(fallbackTimer);
@@ -182,31 +346,53 @@ export function discoverExternalWalletProviders(
   };
 }
 
-export async function connectDiscoveredWallet(
-  item: DiscoveredWalletProvider
-): Promise<ConnectedExternalWallet> {
+export async function connectDiscoveredWalletAccounts(
+  item: DiscoveredWalletProvider,
+  options?: { pickMultipleAccounts?: boolean }
+): Promise<ConnectedExternalWallet[]> {
+  const platform: 'desktop' | 'mobile' = isMobileUserAgent() ? 'mobile' : 'desktop';
+
   if (item.kind === 'solana') {
     const win = window as unknown as WindowWithWallets;
     const sol = win.phantom?.solana || win.solana;
     if (!sol) {
-      throw new Error('No Solana browser wallet detected.');
+      throw new Error('No Solana browser/mobile wallet detected.');
     }
     const resp = await sol.connect();
     const addr = resp.publicKey.toBase58();
-    return {
-      id: item.uuid,
-      name: item.name,
-      icon: item.icon,
-      rdns: item.rdns,
-      kind: 'solana',
-      address: addr,
-      connectedAt: Date.now(),
-    };
+    const sid = makeSessionId(item.uuid, addr);
+    return [
+      {
+        id: sid,
+        providerUuid: item.uuid,
+        name: item.name,
+        icon: item.icon,
+        rdns: item.rdns,
+        kind: 'solana',
+        address: addr,
+        platform,
+        selectedForSweep: true,
+        connectedAt: Date.now(),
+      },
+    ];
   }
 
   if (!item.provider) {
     throw new Error('EVM provider unavailable.');
   }
+
+  // Optionally invoke wallet_requestPermissions so the user can check multiple accounts at once
+  if (options?.pickMultipleAccounts) {
+    try {
+      await item.provider.request({
+        method: 'wallet_requestPermissions',
+        params: [{ eth_accounts: {} }],
+      });
+    } catch {
+      // Fallback smoothly to standard eth_requestAccounts if wallet doesn't implement 2255
+    }
+  }
+
   const accounts = (await item.provider.request({
     method: 'eth_requestAccounts',
   })) as string[];
@@ -216,17 +402,32 @@ export async function connectDiscoveredWallet(
   const chainHex = (await item.provider.request({
     method: 'eth_chainId',
   })) as string;
+  const chainId = chainHex ? parseInt(chainHex, 16) : 1;
 
-  return {
-    id: item.uuid,
-    name: item.name,
-    icon: item.icon,
-    rdns: item.rdns,
-    kind: 'evm',
-    address: accounts[0],
-    chainId: chainHex ? parseInt(chainHex, 16) : 1,
-    connectedAt: Date.now(),
-  };
+  return accounts.map((addr, idx) => {
+    const sid = makeSessionId(item.uuid, addr);
+    registerSessionProvider(sid, item.provider!);
+    return {
+      id: sid,
+      providerUuid: item.uuid,
+      name: accounts.length > 1 ? `${item.name} #${idx + 1}` : item.name,
+      icon: item.icon,
+      rdns: item.rdns,
+      kind: 'evm',
+      address: addr,
+      chainId,
+      platform,
+      selectedForSweep: true,
+      connectedAt: Date.now(),
+    };
+  });
+}
+
+export async function connectDiscoveredWallet(
+  item: DiscoveredWalletProvider
+): Promise<ConnectedExternalWallet> {
+  const list = await connectDiscoveredWalletAccounts(item);
+  return list[0];
 }
 
 export async function switchExternalEvmChain(
@@ -261,14 +462,24 @@ export async function signExternalOwnershipProof(
   destinationVaultAddress: string
 ): Promise<string> {
   const browserProvider = new BrowserProvider(provider);
-  const signer = await browserProvider.getSigner();
+  const signer = await browserProvider.getSigner(externalAddress);
   const message = [
-    'Obsidian Vault — External Wallet Sweep Authorization',
+    'Obsidian Vault — Multi-Wallet Sweep Authorization',
     `Source Address: ${externalAddress}`,
     `Destination Vault: ${destinationVaultAddress}`,
     `Timestamp: ${new Date().toISOString()}`,
   ].join('\n');
   return signer.signMessage(message);
+}
+
+async function getResilientEvmProvider(networkId: NetworkId) {
+  const primary = getEvmProvider(networkId);
+  try {
+    await primary.getBlockNumber();
+    return primary;
+  } catch {
+    return getEvmFallbackProvider(networkId);
+  }
 }
 
 export async function sweepHoldingViaConnectedEvmWallet(params: {
@@ -286,8 +497,8 @@ export async function sweepHoldingViaConnectedEvmWallet(params: {
   await switchExternalEvmChain(provider, holding.networkId);
 
   const browserProvider = new BrowserProvider(provider);
-  const signer = await browserProvider.getSigner();
-  const rpcProvider = getEvmProvider(holding.networkId);
+  const signer = await browserProvider.getSigner(fromAddress);
+  const rpcProvider = await getResilientEvmProvider(holding.networkId);
 
   if (!holding.isNative) {
     const rawAmount = BigInt(holding.balanceRaw || '0');
@@ -363,23 +574,22 @@ function buildSolanaTransferMessage(
   const systemProgram = new Uint8Array(32); // 11111111111111111111111111111111
   const blockhashBytes = bs58.decode(recentBlockhash);
 
-  // Instruction data: u32 LE (2 = Transfer) + u64 LE (lamports)
   const ixData = new Uint8Array(12);
   const view = new DataView(ixData.buffer);
   view.setUint32(0, 2, true);
   view.setBigUint64(4, lamports, true);
 
   const parts: Uint8Array[] = [
-    new Uint8Array([1, 0, 1]), // header: 1 signer, 0 readonly signed, 1 readonly unsigned
-    new Uint8Array([3]), // 3 account keys
+    new Uint8Array([1, 0, 1]),
+    new Uint8Array([3]),
     fromPubkey,
     toPubkey,
     systemProgram,
     blockhashBytes,
-    new Uint8Array([1]), // 1 instruction
-    new Uint8Array([2]), // programIdIndex = 2 (SystemProgram)
-    new Uint8Array([2, 0, 1]), // 2 account indices: [0 (from), 1 (to)]
-    new Uint8Array([12]), // data length = 12
+    new Uint8Array([1]),
+    new Uint8Array([2]),
+    new Uint8Array([2, 0, 1]),
+    new Uint8Array([12]),
     ixData,
   ];
 
@@ -391,6 +601,27 @@ function buildSolanaTransferMessage(
     offset += p.length;
   }
   return message;
+}
+
+async function postSolanaRpc(body: unknown): Promise<Record<string, unknown>> {
+  const tryUrl = async (url: string) => {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const ct = resp.headers.get('content-type') || '';
+    if (!resp.ok || !ct.includes('application/json')) {
+      throw new Error('Solana RPC error');
+    }
+    return (await resp.json()) as Record<string, unknown>;
+  };
+
+  try {
+    return await tryUrl('/api/rpc?network=solana');
+  } catch {
+    return await tryUrl('https://solana-rpc.publicnode.com');
+  }
 }
 
 export async function sweepHoldingViaPrivateKey(params: {
@@ -407,7 +638,7 @@ export async function sweepHoldingViaPrivateKey(params: {
     if (!sourceSecrets.evmPrivateKey) {
       throw new Error('Source EVM private key is unavailable for this sweep.');
     }
-    const provider = getEvmProvider(holding.networkId);
+    const provider = await getResilientEvmProvider(holding.networkId);
     const signer = new Wallet(sourceSecrets.evmPrivateKey, provider);
     const feeData = await provider.getFeeData();
     const gasPrice = feeData.gasPrice ?? feeData.maxFeePerGas ?? parseUnits('15', 'gwei');
@@ -490,7 +721,6 @@ export async function sweepHoldingViaPrivateKey(params: {
       };
     }
 
-    // Native EVM sweep
     const liveBalanceWei = await provider.getBalance(signer.address).catch(() => 0n);
     const gasLimit = 21000n;
     const feeReserveWei = (gasLimit * gasPrice * 115n) / 100n;
@@ -554,17 +784,12 @@ export async function sweepHoldingViaPrivateKey(params: {
     const fromPub = bs58.decode(sourceAddresses.solanaAddress);
     const toPub = bs58.decode(destinationAddresses.solanaAddress);
 
-    const bhResp = await fetch('/api/rpc?network=solana', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'getLatestBlockhash',
-        params: [{ commitment: 'finalized' }],
-      }),
-    });
-    const bhJson = (await bhResp.json()) as {
+    const bhJson = (await postSolanaRpc({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getLatestBlockhash',
+      params: [{ commitment: 'finalized' }],
+    })) as {
       result?: { value?: { blockhash?: string } };
     };
     const blockhash =
@@ -579,7 +804,7 @@ export async function sweepHoldingViaPrivateKey(params: {
     const sig = ed25519.sign(msg, seed32);
 
     const rawTx = new Uint8Array(1 + sig.length + msg.length);
-    rawTx[0] = 1; // 1 signature
+    rawTx[0] = 1;
     rawTx.set(sig, 1);
     rawTx.set(msg, 1 + sig.length);
 
@@ -590,17 +815,12 @@ export async function sweepHoldingViaPrivateKey(params: {
     const txBase64 = btoa(binary);
 
     if (canBroadcast) {
-      const sendResp = await fetch('/api/rpc?network=solana', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 2,
-          method: 'sendTransaction',
-          params: [txBase64, { encoding: 'base64' }],
-        }),
-      });
-      const sendJson = (await sendResp.json()) as {
+      const sendJson = (await postSolanaRpc({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'sendTransaction',
+        params: [txBase64, { encoding: 'base64' }],
+      })) as {
         result?: string;
         error?: { message?: string };
       };

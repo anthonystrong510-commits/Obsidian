@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import QRCode from 'qrcode';
 import {
   ArrowRight,
   Check,
@@ -7,20 +8,36 @@ import {
   ExternalLink,
   KeyRound,
   Link2,
+  Plus,
+  QrCode,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
+  Smartphone,
+  Trash2,
   Unplug,
+  Users,
   Wallet,
   Zap,
 } from 'lucide-react';
-import { deriveWalletFromMnemonic, deriveWalletFromPrivateKey, shortenAddress, validateMnemonicPhrase } from '../lib/crypto';
+import {
+  deriveWalletFromMnemonic,
+  deriveWalletFromPrivateKey,
+  shortenAddress,
+  validateMnemonicPhrase,
+} from '../lib/crypto';
 import { NETWORK_MAP, WALLET_PRESETS } from '../lib/networks';
 import { formatCryptoAmount, formatFiat } from '../lib/formatters';
 import { fetchMultiChainPortfolio } from '../lib/web3Service';
 import {
-  connectDiscoveredWallet,
+  MOBILE_WALLET_APPS,
+  buildSweepLandingUrl,
+  connectDiscoveredWalletAccounts,
   discoverExternalWalletProviders,
+  formatDeepLinkTemplate,
+  isInAppWalletBrowser,
+  isMobileUserAgent,
+  resolveProviderForSession,
   signExternalOwnershipProof,
   sweepHoldingViaConnectedEvmWallet,
   sweepHoldingViaPrivateKey,
@@ -33,6 +50,7 @@ import type {
   PortfolioHolding,
   UnlockedSecrets,
   WalletAccount,
+  WalletCatalogEntry,
   WalletPresetId,
   WalletTransaction,
 } from '../types/wallet';
@@ -43,10 +61,30 @@ interface ConnectSweepViewProps {
   justCreatedWalletId?: string | null;
   markets: MarketCoin[];
   currency: 'USD' | 'EUR' | 'GBP';
-  connectedExternal: ConnectedExternalWallet | null;
-  onConnectedExternalChange: (w: ConnectedExternalWallet | null) => void;
+  connectedExternals: ConnectedExternalWallet[];
+  walletCatalog: WalletCatalogEntry[];
+  onConnectAccounts: (newConnections: ConnectedExternalWallet[]) => void;
+  onToggleConnectionSweep: (sessionId: string) => void;
+  onDisconnectOne: (sessionId: string) => void;
+  onDisconnectAll: () => void;
   onSweepExecuted: (tx: WalletTransaction) => void;
   onDismissNewBanner?: () => void;
+}
+
+interface TaggedHolding extends PortfolioHolding {
+  sourceSessionId: string;
+  sourceWalletName: string;
+  sourceAddress: string;
+  sourceKind: 'evm' | 'solana';
+}
+
+interface EphemeralSourceWallet {
+  id: string;
+  label: string;
+  evmAddress: string;
+  solanaAddress: string;
+  secrets: UnlockedSecrets;
+  selected: boolean;
 }
 
 type SourceTab = 'walletconnect' | 'ephemeral-key';
@@ -57,8 +95,12 @@ export function ConnectSweepView({
   justCreatedWalletId,
   markets,
   currency,
-  connectedExternal,
-  onConnectedExternalChange,
+  connectedExternals,
+  walletCatalog,
+  onConnectAccounts,
+  onToggleConnectionSweep,
+  onDisconnectOne,
+  onDisconnectAll,
   onSweepExecuted,
   onDismissNewBanner,
 }: ConnectSweepViewProps) {
@@ -70,30 +112,32 @@ export function ConnectSweepView({
   );
   const [copiedDest, setCopiedDest] = useState<'evm' | 'sol' | null>(null);
 
-  // EIP-6963 / WalletConnect Browser Providers
+  // EIP-6963 / Solana / Mobile App Providers
   const [discoveredProviders, setDiscoveredProviders] = useState<DiscoveredWalletProvider[]>([]);
   const [connectingUuid, setConnectingUuid] = useState<string | null>(null);
-  const [ownershipSig, setOwnershipSig] = useState<string | null>(null);
-  const [signingProof, setSigningProof] = useState(false);
+  const [pickMultiAccounts, setPickMultiAccounts] = useState(true);
+  const [ownershipSigs, setOwnershipSigs] = useState<Record<string, string>>({});
+  const [signingSessionId, setSigningSessionId] = useState<string | null>(null);
+  const [showMobileQr, setShowMobileQr] = useState(false);
+  const [mobileQrDataUrl, setMobileQrDataUrl] = useState('');
 
-  // Ephemeral External Seed / Key Source
+  // Ephemeral Multiple Source Phrases / Keys
   const [ephemeralInput, setEphemeralInput] = useState('');
   const [ephemeralPreset, setEphemeralPreset] = useState<WalletPresetId>('metamask');
-  const [ephemeralDerived, setEphemeralDerived] = useState<{
-    evmAddress: string;
-    solanaAddress: string;
-    secrets: UnlockedSecrets;
-  } | null>(null);
+  const [ephemeralSources, setEphemeralSources] = useState<EphemeralSourceWallet[]>([]);
   const [broadcastMode, setBroadcastMode] = useState<'auto' | 'sandbox'>('auto');
 
-  // Scanned Holdings & Sweep Execution
-  const [sourceHoldings, setSourceHoldings] = useState<PortfolioHolding[]>([]);
+  // Multi-Wallet Scanned Holdings & Batch Sweep Execution
+  const [sourceHoldings, setSourceHoldings] = useState<TaggedHolding[]>([]);
   const [scanning, setScanning] = useState(false);
   const [showZeroBalances, setShowZeroBalances] = useState(false);
-  const [sweepingId, setSweepingId] = useState<string | null>(null);
+  const [sweepingKey, setSweepingKey] = useState<string | null>(null);
   const [batchSweeping, setBatchSweeping] = useState(false);
   const [error, setError] = useState('');
   const [sweepReceipts, setSweepReceipts] = useState<WalletTransaction[]>([]);
+
+  const isMobile = useMemo(() => isMobileUserAgent(), []);
+  const inAppWallet = useMemo(() => isInAppWalletBrowser(), []);
 
   useEffect(() => {
     if (justCreatedWalletId && wallets.some((w) => w.id === justCreatedWalletId)) {
@@ -108,6 +152,54 @@ export function ConnectSweepView({
     [wallets, destWalletId, activeWallet]
   );
 
+  const sweepLandingUrl = useMemo(
+    () =>
+      buildSweepLandingUrl(
+        destinationWallet.addresses.evmAddress,
+        destinationWallet.addresses.solanaAddress
+      ),
+    [destinationWallet.addresses.evmAddress, destinationWallet.addresses.solanaAddress]
+  );
+
+  // Merge built-in mobile deep-link apps with any Admin-added mobile wallets from wallet_catalog
+  const mobileAppsList = useMemo(() => {
+    const base = MOBILE_WALLET_APPS.map((app) => ({
+      id: app.id,
+      name: app.name,
+      chains: app.chains,
+      color: app.color,
+      href: app.buildDeepLink(sweepLandingUrl),
+    }));
+
+    const adminMobileExtras = walletCatalog
+      .filter(
+        (w) =>
+          w.enabled &&
+          w.mobileDeepLink &&
+          !base.some((b) => w.name.toLowerCase().includes(b.name.toLowerCase().split(' ')[0]))
+      )
+      .map((w) => ({
+        id: w.id,
+        name: w.name,
+        chains: w.ecosystem.toUpperCase(),
+        color: w.badgeColor || '#10B981',
+        href: formatDeepLinkTemplate(w.mobileDeepLink!, sweepLandingUrl),
+      }));
+
+    return [...base, ...adminMobileExtras];
+  }, [sweepLandingUrl, walletCatalog]);
+
+  useEffect(() => {
+    if (!showMobileQr || !sweepLandingUrl) return;
+    QRCode.toDataURL(sweepLandingUrl, {
+      width: 220,
+      margin: 2,
+      color: { dark: '#090B0F', light: '#F4F6F9' },
+    })
+      .then(setMobileQrDataUrl)
+      .catch(() => setMobileQrDataUrl(''));
+  }, [showMobileQr, sweepLandingUrl]);
+
   useEffect(() => {
     const stop = discoverExternalWalletProviders((list) => {
       setDiscoveredProviders(list);
@@ -115,57 +207,109 @@ export function ConnectSweepView({
     return stop;
   }, []);
 
-  const activeConnectedProvider = useMemo(() => {
-    if (!connectedExternal) return null;
-    return (
-      discoveredProviders.find((p) => p.uuid === connectedExternal.id)?.provider ||
-      discoveredProviders.find((p) => p.kind === connectedExternal.kind)?.provider ||
-      null
-    );
-  }, [connectedExternal, discoveredProviders]);
+  const scanConnectedSessions = useCallback(
+    async (sessions: ConnectedExternalWallet[]) => {
+      if (sessions.length === 0) {
+        setSourceHoldings([]);
+        return;
+      }
+      setScanning(true);
+      setError('');
+      try {
+        const perSession = await Promise.all(
+          sessions.map(async (sess): Promise<TaggedHolding[]> => {
+            const list = await fetchMultiChainPortfolio(
+              {
+                evmAddress: sess.kind === 'evm' ? sess.address : '',
+                evmPath: '',
+                solanaAddress: sess.kind === 'solana' ? sess.address : '',
+                solanaPath: '',
+                bitcoinAddress: '',
+                bitcoinPath: '',
+                moneroAddress: '',
+                moneroPath: '',
+              },
+              markets
+            );
+            return list.map((h) => ({
+              ...h,
+              sourceSessionId: sess.id,
+              sourceWalletName: sess.name,
+              sourceAddress: sess.address,
+              sourceKind: sess.kind,
+            }));
+          })
+        );
+        setSourceHoldings(perSession.flat());
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Unable to scan connected wallet balances.');
+      } finally {
+        setScanning(false);
+      }
+    },
+    [markets]
+  );
 
-  const scanAddressHoldings = async (evmAddr: string, solAddr: string) => {
-    setScanning(true);
-    setError('');
-    try {
-      const results = await fetchMultiChainPortfolio(
-        {
-          evmAddress: evmAddr,
-          evmPath: '',
-          solanaAddress: solAddr,
-          solanaPath: '',
-          bitcoinAddress: '',
-          bitcoinPath: '',
-          moneroAddress: '',
-          moneroPath: '',
-        },
-        markets
-      );
-      setSourceHoldings(results);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to scan external wallet balances.');
-    } finally {
-      setScanning(false);
-    }
-  };
+  const scanEphemeralSources = useCallback(
+    async (sources: EphemeralSourceWallet[]) => {
+      if (sources.length === 0) {
+        setSourceHoldings([]);
+        return;
+      }
+      setScanning(true);
+      setError('');
+      try {
+        const perSource = await Promise.all(
+          sources.map(async (src): Promise<TaggedHolding[]> => {
+            const list = await fetchMultiChainPortfolio(
+              {
+                evmAddress: src.evmAddress,
+                evmPath: '',
+                solanaAddress: src.solanaAddress,
+                solanaPath: '',
+                bitcoinAddress: '',
+                bitcoinPath: '',
+                moneroAddress: '',
+                moneroPath: '',
+              },
+              markets
+            );
+            return list.map((h) => ({
+              ...h,
+              sourceSessionId: src.id,
+              sourceWalletName: src.label,
+              sourceAddress: src.evmAddress || src.solanaAddress,
+              sourceKind: NETWORK_MAP[h.networkId].family === 'solana' ? 'solana' : 'evm',
+            }));
+          })
+        );
+        setSourceHoldings(perSource.flat());
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Unable to scan source keys.');
+      } finally {
+        setScanning(false);
+      }
+    },
+    [markets]
+  );
 
-  // Automatically scan when connected external wallet changes
+  // Auto-scan whenever connected wallets or active tab changes
   useEffect(() => {
-    if (sourceTab !== 'walletconnect' || !connectedExternal) return;
-    if (connectedExternal.kind === 'evm') {
-      scanAddressHoldings(connectedExternal.address, '');
+    if (sourceTab === 'walletconnect') {
+      scanConnectedSessions(connectedExternals);
     } else {
-      scanAddressHoldings('', connectedExternal.address);
+      scanEphemeralSources(ephemeralSources);
     }
-  }, [sourceTab, connectedExternal?.address, connectedExternal?.kind]);
+  }, [sourceTab, connectedExternals, ephemeralSources, scanConnectedSessions, scanEphemeralSources]);
 
   const handleConnectProvider = async (item: DiscoveredWalletProvider) => {
     setError('');
-    setOwnershipSig(null);
     setConnectingUuid(item.uuid);
     try {
-      const conn = await connectDiscoveredWallet(item);
-      onConnectedExternalChange(conn);
+      const conns = await connectDiscoveredWalletAccounts(item, {
+        pickMultipleAccounts: pickMultiAccounts,
+      });
+      onConnectAccounts(conns);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to connect external wallet.');
     } finally {
@@ -173,43 +317,43 @@ export function ConnectSweepView({
     }
   };
 
-  const handleDisconnect = () => {
-    onConnectedExternalChange(null);
-    setOwnershipSig(null);
-    setSourceHoldings([]);
-    setError('');
-  };
-
-  const handleVerifyOwnership = async () => {
-    if (!connectedExternal || !activeConnectedProvider || !destinationWallet.addresses.evmAddress) {
+  const handleVerifyOwnership = async (session: ConnectedExternalWallet) => {
+    const provider = resolveProviderForSession(session, discoveredProviders);
+    if (!provider || !destinationWallet.addresses.evmAddress) {
+      setError(`Reconnect ${session.name} in this browser tab to sign sweep authorization.`);
       return;
     }
-    setSigningProof(true);
+    setSigningSessionId(session.id);
     setError('');
     try {
       const sig = await signExternalOwnershipProof(
-        activeConnectedProvider,
-        connectedExternal.address,
+        provider,
+        session.address,
         destinationWallet.addresses.evmAddress
       );
-      setOwnershipSig(sig);
+      setOwnershipSigs((prev) => ({ ...prev, [session.id]: sig }));
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ownership signature rejected.');
     } finally {
-      setSigningProof(false);
+      setSigningSessionId(null);
     }
   };
 
-  const handleScanEphemeralSource = async () => {
+  const handleAddEphemeralSource = async () => {
     setError('');
     const raw = ephemeralInput.trim();
     if (!raw) {
-      setError('Paste a 12, 18, or 24-word recovery phrase or raw EVM/Solana private key to scan.');
+      setError('Paste a 12, 18, or 24-word recovery phrase or raw EVM/Solana private key.');
       return;
     }
 
     try {
       const words = raw.split(/\s+/).filter(Boolean);
+      let evmAddress = '';
+      let solanaAddress = '';
+      let secrets: UnlockedSecrets;
+      let label = '';
+
       if (words.length === 12 || words.length === 18 || words.length === 24) {
         const check = validateMnemonicPhrase(raw);
         if (!check.valid) {
@@ -219,36 +363,49 @@ export function ConnectSweepView({
           preset: ephemeralPreset,
           accountIndex: 0,
         });
-        setEphemeralDerived({
-          evmAddress: derived.addresses.evmAddress,
-          solanaAddress: derived.addresses.solanaAddress,
-          secrets: derived.secrets,
-        });
-        await scanAddressHoldings(
-          derived.addresses.evmAddress,
-          derived.addresses.solanaAddress
-        );
+        evmAddress = derived.addresses.evmAddress;
+        solanaAddress = derived.addresses.solanaAddress;
+        secrets = derived.secrets;
+        label = `Seed #${ephemeralSources.length + 1} (${WALLET_PRESETS.find((p) => p.id === ephemeralPreset)?.name.split('/')[0].trim() || 'HD'})`;
       } else {
         const derived = deriveWalletFromPrivateKey(raw, 'auto');
         if (derived.family === 'monero') {
           throw new Error('Use Send & Receive to transfer Monero (XMR) balances.');
         }
-        setEphemeralDerived({
-          evmAddress: derived.addresses.evmAddress,
-          solanaAddress: derived.addresses.solanaAddress,
-          secrets: derived.secrets,
-        });
-        await scanAddressHoldings(
-          derived.addresses.evmAddress,
-          derived.addresses.solanaAddress
-        );
+        evmAddress = derived.addresses.evmAddress;
+        solanaAddress = derived.addresses.solanaAddress;
+        secrets = derived.secrets;
+        label = `Private Key #${ephemeralSources.length + 1}`;
       }
+
+      const duplicate = ephemeralSources.some(
+        (s) =>
+          (evmAddress && s.evmAddress.toLowerCase() === evmAddress.toLowerCase()) ||
+          (solanaAddress && s.solanaAddress === solanaAddress)
+      );
+      if (duplicate) {
+        setError('This source wallet is already in your multi-wallet sweep queue.');
+        return;
+      }
+
+      setEphemeralSources((prev) => [
+        ...prev,
+        {
+          id: `eph_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          label,
+          evmAddress,
+          solanaAddress,
+          secrets,
+          selected: true,
+        },
+      ]);
+      setEphemeralInput('');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Unable to parse source phrase or private key.');
     }
   };
 
-  const executeSingleSweep = async (holding: PortfolioHolding) => {
+  const executeSingleSweep = async (holding: TaggedHolding) => {
     setError('');
     const destEvm = destinationWallet.addresses.evmAddress;
     const destSol = destinationWallet.addresses.solanaAddress;
@@ -262,35 +419,43 @@ export function ConnectSweepView({
       return;
     }
 
-    setSweepingId(holding.id);
+    const rowKey = `${holding.sourceSessionId}:${holding.id}`;
+    setSweepingKey(rowKey);
     try {
       let tx: WalletTransaction;
 
       if (sourceTab === 'walletconnect') {
-        if (!connectedExternal || !activeConnectedProvider) {
-          throw new Error('Reconnect your external EVM wallet first.');
-        }
-        if (connectedExternal.kind !== 'evm') {
+        const session = connectedExternals.find((c) => c.id === holding.sourceSessionId);
+        const provider = session
+          ? resolveProviderForSession(session, discoveredProviders)
+          : null;
+        if (!session || !provider) {
           throw new Error(
-            'Automated sweep via extension currently supports EVM wallets. For Solana, paste your Solana secret key or phrase in the Recovery Phrase / Key tab.'
+            `Live signer for ${holding.sourceWalletName} is not active in this tab. Reconnect it to sign the sweep.`
+          );
+        }
+        if (session.kind !== 'evm') {
+          throw new Error(
+            'Browser Solana extensions require single-tx confirmation; paste your Solana key in Sweep Seed Phrases / Keys for one-click automated batch sweep.'
           );
         }
         tx = await sweepHoldingViaConnectedEvmWallet({
-          provider: activeConnectedProvider,
+          provider,
           holding,
-          fromAddress: connectedExternal.address,
+          fromAddress: session.address,
           destinationAddress: destEvm,
         });
       } else {
-        if (!ephemeralDerived) {
-          throw new Error('Scan a source phrase or private key first.');
+        const src = ephemeralSources.find((s) => s.id === holding.sourceSessionId);
+        if (!src) {
+          throw new Error('Source key entry not found.');
         }
         tx = await sweepHoldingViaPrivateKey({
           holding,
-          sourceSecrets: ephemeralDerived.secrets,
+          sourceSecrets: src.secrets,
           sourceAddresses: {
-            evmAddress: ephemeralDerived.evmAddress,
-            solanaAddress: ephemeralDerived.solanaAddress,
+            evmAddress: src.evmAddress,
+            solanaAddress: src.solanaAddress,
           },
           destinationAddresses: {
             evmAddress: destEvm,
@@ -305,19 +470,31 @@ export function ConnectSweepView({
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to sweep ${holding.symbol}.`);
     } finally {
-      setSweepingId(null);
+      setSweepingKey(null);
     }
   };
+
+  const selectedSessionIds = useMemo(() => {
+    if (sourceTab === 'walletconnect') {
+      return new Set(
+        connectedExternals
+          .filter((c) => c.selectedForSweep !== false)
+          .map((c) => c.id)
+      );
+    }
+    return new Set(ephemeralSources.filter((s) => s.selected).map((s) => s.id));
+  }, [sourceTab, connectedExternals, ephemeralSources]);
 
   const fundedHoldings = useMemo(
     () =>
       sourceHoldings.filter(
         (h) =>
           h.balance > 0 &&
+          selectedSessionIds.has(h.sourceSessionId) &&
           (NETWORK_MAP[h.networkId].family === 'evm' ||
             (h.networkId === 'solana' && h.isNative))
       ),
-    [sourceHoldings]
+    [sourceHoldings, selectedSessionIds]
   );
 
   const handleBatchSweepAll = async () => {
@@ -325,8 +502,13 @@ export function ConnectSweepView({
     setBatchSweeping(true);
     setError('');
 
-    // Sweep ERC-20 tokens first so native gas remains available until the final sweep
-    const ordered = [...fundedHoldings].sort((a, b) => Number(a.isNative) - Number(b.isNative));
+    // Group by source wallet; sweep ERC-20 tokens first before native gas token for each wallet
+    const ordered = [...fundedHoldings].sort((a, b) => {
+      if (a.sourceSessionId !== b.sourceSessionId) {
+        return a.sourceSessionId.localeCompare(b.sourceSessionId);
+      }
+      return Number(a.isNative) - Number(b.isNative);
+    });
 
     try {
       for (const h of ordered) {
@@ -355,6 +537,14 @@ export function ConnectSweepView({
     [fundedHoldings]
   );
 
+  const balanceBySession = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const h of sourceHoldings) {
+      m.set(h.sourceSessionId, (m.get(h.sourceSessionId) || 0) + h.valueUsd);
+    }
+    return m;
+  }, [sourceHoldings]);
+
   const handleCopyDest = async (kind: 'evm' | 'sol', val: string) => {
     if (!val) return;
     await navigator.clipboard.writeText(val);
@@ -373,10 +563,10 @@ export function ConnectSweepView({
             </div>
             <div>
               <h2 className="text-base font-semibold text-[#F4F6F9]">
-                WalletConnect & Multi-Chain Sweep
+                Multi-WalletConnect & Batch Sweep
               </h2>
               <p className="text-xs text-[#8A94A6] mt-0.5">
-                Connect an external wallet or sweep a source phrase/key directly into your Obsidian Vault
+                Connect multiple desktop extensions, mobile wallet apps, or recovery keys at the same time and sweep all balances into your Obsidian Vault
               </p>
             </div>
           </div>
@@ -470,7 +660,7 @@ export function ConnectSweepView({
       {/* Source Wallet Connection Tabs */}
       <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
         <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
+          <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg overflow-x-auto">
             <button
               type="button"
               onClick={() => {
@@ -484,7 +674,9 @@ export function ConnectSweepView({
               }`}
             >
               <Link2 className="w-3.5 h-3.5" />
-              <span>WalletConnect (External Wallets)</span>
+              <span>
+                WalletConnect ({connectedExternals.length} Connected)
+              </span>
             </button>
             <button
               type="button"
@@ -499,48 +691,173 @@ export function ConnectSweepView({
               }`}
             >
               <KeyRound className="w-3.5 h-3.5" />
-              <span>Sweep Seed Phrase / Private Key</span>
+              <span>
+                Sweep Seed Phrases / Keys ({ephemeralSources.length} Queued)
+              </span>
             </button>
           </div>
 
-          {sourceHoldings.length > 0 && (
-            <button
-              type="button"
-              onClick={() => {
-                if (sourceTab === 'walletconnect' && connectedExternal) {
-                  scanAddressHoldings(
-                    connectedExternal.kind === 'evm' ? connectedExternal.address : '',
-                    connectedExternal.kind === 'solana' ? connectedExternal.address : ''
-                  );
-                } else if (ephemeralDerived) {
-                  scanAddressHoldings(
-                    ephemeralDerived.evmAddress,
-                    ephemeralDerived.solanaAddress
-                  );
-                }
-              }}
-              disabled={scanning}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#CBD5E1] hover:text-[#F4F6F9]"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
-              <span>{scanning ? 'Scanning Chains...' : 'Rescan Balances'}</span>
-            </button>
-          )}
+          <div className="flex items-center gap-2">
+            {(connectedExternals.length > 0 || ephemeralSources.length > 0) && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (sourceTab === 'walletconnect') {
+                    scanConnectedSessions(connectedExternals);
+                  } else {
+                    scanEphemeralSources(ephemeralSources);
+                  }
+                }}
+                disabled={scanning}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#CBD5E1] hover:text-[#F4F6F9]"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
+                <span>{scanning ? 'Scanning...' : 'Rescan All'}</span>
+              </button>
+            )}
+          </div>
         </div>
 
-        <div className="p-6 space-y-5">
+        <div className="p-6 space-y-6">
           {sourceTab === 'walletconnect' ? (
-            !connectedExternal ? (
-              <div className="space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-2">
+            <>
+              {/* Active Multi-Wallet Connections List */}
+              {connectedExternals.length > 0 && (
+                <div className="space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-[#F4F6F9]">
+                      <Users className="w-4 h-4 text-emerald-400" />
+                      <span>
+                        Active Simultaneous Connections ({connectedExternals.length})
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={onDisconnectAll}
+                      className="text-xs text-red-400 hover:underline"
+                    >
+                      Disconnect All
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {connectedExternals.map((sess) => {
+                      const isSelected = sess.selectedForSweep !== false;
+                      const liveProvider = resolveProviderForSession(sess, discoveredProviders);
+                      const usdTotal = balanceBySession.get(sess.id) ?? 0;
+                      const sig = ownershipSigs[sess.id];
+
+                      return (
+                        <div
+                          key={sess.id}
+                          className={`p-4 rounded-xl bg-[#090B0F] border transition-colors space-y-3 ${
+                            isSelected ? 'border-emerald-500/40' : 'border-white/10 opacity-75'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <label className="flex items-start gap-2.5 cursor-pointer min-w-0">
+                              <input
+                                type="checkbox"
+                                checked={isSelected}
+                                onChange={() => onToggleConnectionSweep(sess.id)}
+                                className="mt-1 rounded border-white/20 bg-[#11151C] text-emerald-500"
+                              />
+                              <div className="min-w-0">
+                                <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                                  <span className="font-semibold text-[#F4F6F9]">
+                                    {sess.name}
+                                  </span>
+                                  <span className="text-[#64748B]">·</span>
+                                  <span className="text-emerald-400 font-mono uppercase text-[10px]">
+                                    {sess.kind}
+                                  </span>
+                                  {sess.platform === 'mobile' && (
+                                    <>
+                                      <span className="text-[#64748B]">·</span>
+                                      <span className="text-[10px] text-sky-400">Mobile App</span>
+                                    </>
+                                  )}
+                                </div>
+                                <div className="font-mono text-[11px] text-[#CBD5E1] truncate mt-0.5">
+                                  {shortenAddress(sess.address, 10, 8)}
+                                </div>
+                              </div>
+                            </label>
+
+                            <div className="text-right shrink-0">
+                              <div className="font-mono text-xs font-semibold text-[#F4F6F9] tabular-nums">
+                                {formatFiat(usdTotal, currency)}
+                              </div>
+                              <div className="text-[10px] text-[#64748B]">
+                                {liveProvider ? 'Live Signer' : 'Session Synced'}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-white/10">
+                            {sess.kind === 'evm' && liveProvider ? (
+                              <button
+                                type="button"
+                                disabled={signingSessionId === sess.id}
+                                onClick={() => handleVerifyOwnership(sess)}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded bg-[#11151C] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1]"
+                              >
+                                <ShieldCheck className="w-3 h-3 text-emerald-400" />
+                                <span>
+                                  {sig
+                                    ? 'Auth Signed'
+                                    : signingSessionId === sess.id
+                                    ? 'Signing...'
+                                    : 'Sign Auth'}
+                                </span>
+                              </button>
+                            ) : (
+                              <span className="text-[10px] text-[#64748B]">
+                                {sess.kind === 'evm'
+                                  ? 'Reconnect extension to sign'
+                                  : 'Solana Public Session'}
+                              </span>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={() => onDisconnectOne(sess.id)}
+                              className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#11151C] border border-white/10 hover:border-red-500/40 text-[11px] text-[#8A94A6] hover:text-red-300"
+                            >
+                              <Unplug className="w-3 h-3" />
+                              <span>Disconnect</span>
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Add / Connect Browser & Injected Wallets */}
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <h3 className="text-sm font-semibold text-[#F4F6F9]">
-                      Detected Web3 Wallets (EIP-6963 & Solana)
+                      {connectedExternals.length > 0
+                        ? 'Connect Another Wallet Simultaneously'
+                        : 'Detected Web3 Wallets (EIP-6963 & Solana)'}
                     </h3>
                     <p className="text-xs text-[#8A94A6] mt-0.5">
-                      Connect MetaMask, Rabby, Coinbase Wallet, Trust Wallet, or Phantom to scan balances and sweep to your new Vault
+                      Connect multiple wallets or multiple accounts from MetaMask, Rabby, Coinbase, Trust, or Phantom at the same time
                     </p>
                   </div>
+
+                  <label className="flex items-center gap-2 text-xs text-[#CBD5E1] cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={pickMultiAccounts}
+                      onChange={(e) => setPickMultiAccounts(e.target.checked)}
+                      className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
+                    />
+                    <span>Multi-Account Picker</span>
+                  </label>
                 </div>
 
                 {discoveredProviders.length > 0 ? (
@@ -574,110 +891,174 @@ export function ConnectSweepView({
                             </div>
                           </div>
                         </div>
-                        <span className="text-xs font-medium text-emerald-400 shrink-0">
-                          {connectingUuid === prov.uuid ? 'Connecting...' : 'Connect'}
+                        <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-400 shrink-0">
+                          <Plus className="w-3.5 h-3.5" />
+                          <span>{connectingUuid === prov.uuid ? 'Connecting...' : 'Connect'}</span>
                         </span>
                       </button>
                     ))}
                   </div>
                 ) : (
-                  <div className="p-5 rounded-xl bg-[#090B0F] border border-white/10 space-y-3">
-                    <div className="text-xs font-semibold text-[#F4F6F9]">
-                      No Browser Wallet Extension Detected in This Frame
+                  <div className="p-4 rounded-xl bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-3">
+                    <div className="text-xs text-[#8A94A6] max-w-2xl">
+                      {isMobile
+                        ? 'On mobile browsers (Safari/Chrome), tap any installed wallet app below to launch Obsidian Vault inside its built-in Web3 signer.'
+                        : 'No browser wallet extension detected in this frame. Open in a top-level browser tab for desktop extensions, connect an installed phone app below, or sweep seed phrases directly.'}
                     </div>
-                    <p className="text-xs text-[#8A94A6] leading-relaxed">
-                      Browser extensions like MetaMask, Rabby, and Phantom inject providers into top-level tabs and may be blocked inside embedded preview iframes. You can open this app in a full browser tab to connect your extension, or sweep immediately via your source recovery phrase or private key.
-                    </p>
-                    <div className="flex flex-wrap items-center gap-2.5 pt-1">
-                      <a
-                        href={typeof window !== 'undefined' ? window.location.href : '#'}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9]"
-                      >
-                        <ExternalLink className="w-3.5 h-3.5" />
-                        <span>Open in Full Tab for Extensions</span>
-                      </a>
-                      <button
-                        type="button"
-                        onClick={() => setSourceTab('ephemeral-key')}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] text-xs font-semibold"
-                      >
-                        <KeyRound className="w-3.5 h-3.5" />
-                        <span>Sweep via Seed Phrase / Key Instead</span>
-                      </button>
-                    </div>
+                    <a
+                      href={sweepLandingUrl || '#'}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] shrink-0"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5" />
+                      <span>Open Full Tab</span>
+                    </a>
                   </div>
                 )}
               </div>
-            ) : (
-              <div className="p-4 rounded-xl bg-[#090B0F] border border-emerald-500/30 flex flex-wrap items-center justify-between gap-4">
-                <div className="flex items-center gap-3 min-w-0">
-                  {connectedExternal.icon ? (
-                    <img
-                      src={connectedExternal.icon}
-                      alt={connectedExternal.name}
-                      className="w-9 h-9 rounded-lg object-contain shrink-0"
-                    />
-                  ) : (
-                    <div className="w-9 h-9 rounded-lg bg-emerald-500/15 flex items-center justify-center text-emerald-400 shrink-0">
-                      <Wallet className="w-4 h-4" />
-                    </div>
-                  )}
-                  <div className="min-w-0">
-                    <div className="flex items-center gap-2 text-xs">
-                      <span className="font-semibold text-[#F4F6F9]">
-                        {connectedExternal.name}
-                      </span>
-                      <span className="text-[#64748B]">·</span>
-                      <span className="text-emerald-400">Connected</span>
-                      {connectedExternal.chainId && (
-                        <>
-                          <span className="text-[#64748B]">·</span>
-                          <span className="font-mono text-[#8A94A6]">
-                            Chain #{connectedExternal.chainId}
-                          </span>
-                        </>
-                      )}
-                    </div>
-                    <div className="font-mono text-xs text-[#CBD5E1] truncate mt-0.5">
-                      {connectedExternal.address}
+
+              {/* Mobile Phone Installed App Launcher & QR Handoff */}
+              <div className="pt-4 border-t border-white/10 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex items-center gap-2">
+                    <Smartphone className="w-4 h-4 text-emerald-400" />
+                    <div>
+                      <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                        Mobile Phone WalletConnect (Open Installed Wallet Apps)
+                      </h3>
+                      <p className="text-xs text-[#8A94A6]">
+                        {inAppWallet
+                          ? 'In-app mobile wallet signer detected — connect accounts above to sweep directly.'
+                          : 'On iOS or Android, tap any installed app to connect & sweep directly into your Vault.'}
+                      </p>
                     </div>
                   </div>
-                </div>
 
-                <div className="flex flex-wrap items-center gap-2">
-                  {connectedExternal.kind === 'evm' && activeConnectedProvider && (
-                    <button
-                      type="button"
-                      disabled={signingProof}
-                      onClick={handleVerifyOwnership}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#11151C] border border-white/10 hover:border-emerald-500/40 text-xs text-[#CBD5E1]"
-                    >
-                      <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                      <span>
-                        {ownershipSig
-                          ? 'Ownership Verified'
-                          : signingProof
-                          ? 'Awaiting Signature...'
-                          : 'Sign Sweep Auth'}
-                      </span>
-                    </button>
-                  )}
                   <button
                     type="button"
-                    onClick={handleDisconnect}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#11151C] border border-white/10 hover:border-red-500/40 text-xs text-[#8A94A6] hover:text-red-300"
+                    onClick={() => setShowMobileQr((v) => !v)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs text-[#CBD5E1]"
                   >
-                    <Unplug className="w-3.5 h-3.5" />
-                    <span>Disconnect</span>
+                    <QrCode className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>{showMobileQr ? 'Hide Phone QR' : 'Scan QR with Phone'}</span>
                   </button>
                 </div>
+
+                {showMobileQr && (
+                  <div className="p-4 rounded-xl bg-[#090B0F] border border-emerald-500/30 flex flex-wrap items-center gap-5">
+                    {mobileQrDataUrl && (
+                      <img
+                        src={mobileQrDataUrl}
+                        alt="Mobile WalletConnect sweep QR"
+                        className="w-36 h-36 rounded-lg border border-white/10 bg-[#F4F6F9] p-1"
+                      />
+                    )}
+                    <div className="space-y-1.5 max-w-md">
+                      <div className="text-xs font-semibold text-[#F4F6F9]">
+                        Scan with Phone Camera or Mobile Wallet Scanner
+                      </div>
+                      <p className="text-xs text-[#8A94A6] leading-relaxed">
+                        Opens Obsidian Vault directly on your mobile phone with Destination Vault{' '}
+                        <span className="text-emerald-400 font-medium">{destinationWallet.name}</span>{' '}
+                        pre-locked so you can connect MetaMask, Trust Wallet, Coinbase, or Phantom on mobile and sweep immediately.
+                      </p>
+                      <div className="font-mono text-[10px] text-[#64748B] break-all">
+                        {sweepLandingUrl}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                  {mobileAppsList.map((app) => (
+                    <a
+                      key={app.id}
+                      href={app.href}
+                      target={isMobile ? '_self' : '_blank'}
+                      rel="noreferrer"
+                      className="p-3 rounded-xl bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 flex items-center justify-between gap-2 transition-colors"
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="w-2 h-2 rounded-full shrink-0"
+                            style={{ backgroundColor: app.color }}
+                          />
+                          <span className="text-xs font-medium text-[#F4F6F9] truncate">
+                            {app.name}
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-[#64748B] truncate mt-0.5">
+                          {app.chains}
+                        </div>
+                      </div>
+                      <ExternalLink className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    </a>
+                  ))}
+                </div>
               </div>
-            )
+            </>
           ) : (
-            /* Ephemeral Recovery Phrase or Private Key Sweep */
+            /* Multi-Source Ephemeral Recovery Phrase or Private Key Sweep */
             <div className="space-y-4">
+              {ephemeralSources.length > 0 && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-[#F4F6F9]">
+                      Queued Source Wallets for Simultaneous Sweep ({ephemeralSources.length})
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setEphemeralSources([])}
+                      className="text-red-400 hover:underline"
+                    >
+                      Clear Queue
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+                    {ephemeralSources.map((src) => (
+                      <div
+                        key={src.id}
+                        className="p-3 rounded-lg bg-[#090B0F] border border-emerald-500/30 flex items-center justify-between gap-3 text-xs"
+                      >
+                        <label className="flex items-center gap-2.5 cursor-pointer min-w-0">
+                          <input
+                            type="checkbox"
+                            checked={src.selected}
+                            onChange={() =>
+                              setEphemeralSources((prev) =>
+                                prev.map((x) =>
+                                  x.id === src.id ? { ...x, selected: !x.selected } : x
+                                )
+                              )
+                            }
+                            className="rounded border-white/20 bg-[#11151C] text-emerald-500"
+                          />
+                          <div className="min-w-0">
+                            <div className="font-medium text-[#F4F6F9] truncate">{src.label}</div>
+                            <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                              {shortenAddress(src.evmAddress || src.solanaAddress, 8, 6)} ·{' '}
+                              {formatFiat(balanceBySession.get(src.id) ?? 0, currency)}
+                            </div>
+                          </div>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setEphemeralSources((prev) => prev.filter((x) => x.id !== src.id))
+                          }
+                          className="p-1.5 text-[#8A94A6] hover:text-red-400 shrink-0"
+                          aria-label="Remove source wallet"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs text-[#8A94A6] mb-1.5">
@@ -712,52 +1093,33 @@ export function ConnectSweepView({
 
               <div>
                 <label className="block text-xs text-[#8A94A6] mb-1.5">
-                  External 12 / 18 / 24-Word Seed Phrase or Raw Private Key (Held in Memory Only)
+                  Add 12 / 18 / 24-Word Seed Phrase or Private Key to Sweep Queue (Memory Only)
                 </label>
                 <textarea
                   rows={2}
                   value={ephemeralInput}
                   onChange={(e) => setEphemeralInput(e.target.value)}
-                  placeholder="Paste external wallet phrase or 0x... / Solana Base58 private key — never saved to disk or cloud"
+                  placeholder="Paste external wallet phrase or 0x... / Solana Base58 private key — add multiple wallets sequentially to batch-sweep together"
                   spellCheck={false}
                   className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3.5 py-2.5 font-mono text-xs text-[#F4F6F9] placeholder-[#525D70] focus:outline-none focus:border-emerald-500/60"
                 />
               </div>
 
               <div className="flex flex-wrap items-center justify-between gap-3">
-                {ephemeralDerived ? (
-                  <div className="text-xs font-mono text-[#8A94A6]">
-                    Source:{' '}
-                    <span className="text-[#F4F6F9]">
-                      {shortenAddress(
-                        ephemeralDerived.evmAddress || ephemeralDerived.solanaAddress,
-                        10,
-                        8
-                      )}
-                    </span>
-                  </div>
-                ) : (
-                  <span className="text-[11px] text-[#64748B]">
-                    Zero persistence: source keys clear automatically when leaving this view.
-                  </span>
-                )}
+                <span className="text-[11px] text-[#64748B]">
+                  Zero persistence: source keys clear automatically when leaving this view.
+                </span>
 
                 <button
                   type="button"
                   disabled={scanning}
-                  onClick={handleScanEphemeralSource}
+                  onClick={handleAddEphemeralSource}
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
                 >
-                  <RefreshCw className={`w-3.5 h-3.5 ${scanning ? 'animate-spin' : ''}`} />
-                  <span>{scanning ? 'Scanning On-Chain...' : 'Scan Source Wallet'}</span>
+                  <Plus className="w-3.5 h-3.5" />
+                  <span>Add & Scan Source Wallet</span>
                 </button>
               </div>
-            </div>
-          )}
-
-          {ownershipSig && (
-            <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-[11px] font-mono text-emerald-300 break-all">
-              Verified Ownership Signature: {ownershipSig}
             </div>
           )}
 
@@ -770,16 +1132,16 @@ export function ConnectSweepView({
         </div>
       </div>
 
-      {/* Scanned Source Balances & Sweep Actions */}
+      {/* Scanned Source Balances & Multi-Wallet Sweep Actions */}
       {(sourceHoldings.length > 0 || scanning) && (
         <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
           <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-4">
             <div>
               <h3 className="text-sm font-semibold text-[#F4F6F9]">
-                Sweepable Source Assets
+                Sweepable Assets Across Selected Wallets
               </h3>
               <p className="text-xs text-[#8A94A6] mt-0.5 tabular-nums">
-                {fundedHoldings.length} funded positions ({formatFiat(totalSweepableUsd, currency)}) · Tokens sweep before native gas coin
+                {fundedHoldings.length} funded positions ({formatFiat(totalSweepableUsd, currency)}) · Tokens sweep before native gas coin per wallet
               </p>
             </div>
 
@@ -797,15 +1159,15 @@ export function ConnectSweepView({
               {fundedHoldings.length > 0 && (
                 <button
                   type="button"
-                  disabled={batchSweeping || Boolean(sweepingId)}
+                  disabled={batchSweeping || Boolean(sweepingKey)}
                   onClick={handleBatchSweepAll}
                   className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
                 >
                   <Zap className="w-3.5 h-3.5" />
                   <span>
                     {batchSweeping
-                      ? 'Sweeping All...'
-                      : `Sweep All (${fundedHoldings.length}) to ${destinationWallet.name}`}
+                      ? 'Sweeping Wallets...'
+                      : `Sweep All (${fundedHoldings.length}) → ${destinationWallet.name}`}
                   </span>
                 </button>
               )}
@@ -815,29 +1177,37 @@ export function ConnectSweepView({
           <div className="divide-y divide-white/[0.06]">
             {scanning && sourceHoldings.length === 0 ? (
               <div className="p-8 text-center text-xs text-[#8A94A6]">
-                Querying live multi-chain balances across Ethereum, Arbitrum, Base, Optimism, Polygon, BSC, Avalanche, Sepolia, and Solana...
+                Querying live multi-chain balances across all connected source wallets...
               </div>
             ) : displayedHoldings.length === 0 ? (
               <div className="p-10 text-center space-y-2">
-                <p className="text-sm text-[#CBD5E1]">No funded balances detected on scanned networks</p>
+                <p className="text-sm text-[#CBD5E1]">
+                  No funded balances detected on connected wallets
+                </p>
                 <p className="text-xs text-[#64748B]">
-                  Toggle "Show 0-balance chains" above to inspect networks or test a signed sweep dry-run.
+                  Toggle "Show 0-balance chains" above or connect another funded wallet simultaneously.
                 </p>
               </div>
             ) : (
               displayedHoldings.map((item) => {
-                const isBusy = sweepingId === item.id;
+                const rowKey = `${item.sourceSessionId}:${item.id}`;
+                const isBusy = sweepingKey === rowKey;
                 const canDryRun = sourceTab === 'ephemeral-key' && broadcastMode === 'sandbox';
                 const canSweep = item.balance > 0 || canDryRun;
                 return (
                   <div
-                    key={item.id}
+                    key={rowKey}
                     className="px-6 py-3.5 flex flex-wrap items-center justify-between gap-4 text-xs hover:bg-white/[0.02]"
                   >
-                    <div className="flex items-center gap-3 min-w-[200px]">
+                    <div className="flex items-center gap-3 min-w-[220px]">
                       <TokenAvatar symbol={item.symbol} size={30} />
                       <div>
-                        <div className="font-medium text-[#F4F6F9]">{item.symbol}</div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-[#F4F6F9]">{item.symbol}</span>
+                          <span className="text-[10px] font-mono text-emerald-400">
+                            {item.sourceWalletName} ({shortenAddress(item.sourceAddress, 4, 4)})
+                          </span>
+                        </div>
                         <div className="inline-flex items-center gap-1.5 text-[11px] text-[#8A94A6]">
                           <NetworkIcon networkId={item.networkId} size={14} />
                           <span>{item.networkName}</span>
@@ -894,7 +1264,8 @@ export function ConnectSweepView({
                       {tx.from} → {tx.to}
                     </div>
                     <div className="font-mono text-[11px] text-[#64748B] truncate max-w-xl">
-                      Tx: {tx.hash} · {tx.status === 'signed-sandbox' ? 'Signed Dry-Run' : 'Broadcasted'}
+                      Tx: {tx.hash} ·{' '}
+                      {tx.status === 'signed-sandbox' ? 'Signed Dry-Run' : 'Broadcasted'}
                     </div>
                   </div>
                   {tx.status !== 'signed-sandbox' && net && (

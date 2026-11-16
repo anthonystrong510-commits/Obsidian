@@ -50,6 +50,25 @@
       },
       "required": ["id", "ownerUid", "name", "walletType", "accountIndex", "createdAt", "updatedAt"]
     },
+    "ConnectedWalletSession": {
+      "title": "ConnectedWalletSession",
+      "description": "Active external WalletConnect or mobile dApp session metadata for multi-wallet sweep",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "providerUuid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "walletName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "kind": { "type": "string", "enum": ["evm", "solana"] },
+        "address": { "type": "string", "minLength": 10, "maxLength": 120 },
+        "chainId": { "type": "number" },
+        "platform": { "type": "string", "enum": ["desktop", "mobile"] },
+        "selectedForSweep": { "type": "boolean" },
+        "connectedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "providerUuid", "walletName", "kind", "address", "platform", "selectedForSweep", "connectedAt", "updatedAt"]
+    },
     "UserPriceAlert": {
       "title": "UserPriceAlert",
       "description": "Real-time price alert rule configured by a user",
@@ -68,6 +87,28 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "coinId", "symbol", "name", "condition", "targetValue", "active", "repeat", "createdAt", "updatedAt"]
+    },
+    "WalletCatalogItem": {
+      "title": "WalletCatalogItem",
+      "description": "Admin-managed supported wallet provider directory shown during import and mobile connect",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "ecosystem": { "type": "string", "enum": ["multi-chain", "evm", "solana", "bitcoin", "monero"] },
+        "defaultWords": { "type": "number" },
+        "derivationPath": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "presetId": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "mobileDeepLink": { "type": "string", "maxLength": 300 },
+        "badgeColor": { "type": "string", "maxLength": 20 },
+        "description": { "type": "string", "maxLength": 240 },
+        "enabled": { "type": "boolean" },
+        "featured": { "type": "boolean" },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "name", "ecosystem", "defaultWords", "derivationPath", "presetId", "enabled", "featured", "createdBy", "createdAt", "updatedAt"]
     },
     "ExchangeTreasuryWallet": {
       "title": "ExchangeTreasuryWallet",
@@ -143,11 +184,19 @@
     },
     "/users/{userId}/wallets/{walletId}": {
       "schema": { "$ref": "#/entities/EncryptedUserWallet" },
-      "description": "Client-encrypted user wallets synced across devices"
+      "description": "Client-encrypted or admin-provisioned user wallets synced across devices"
+    },
+    "/users/{userId}/connected_sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/ConnectedWalletSession" },
+      "description": "Per-user concurrent WalletConnect and mobile dApp connections"
     },
     "/users/{userId}/alerts/{alertId}": {
       "schema": { "$ref": "#/entities/UserPriceAlert" },
       "description": "User real-time price alerts"
+    },
+    "/wallet_catalog/{walletId}": {
+      "schema": { "$ref": "#/entities/WalletCatalogItem" },
+      "description": "Admin-managed directory of supported wallets shown during import and mobile connect"
     },
     "/admins/{adminUid}": {
       "schema": { "$ref": "#/entities/AdminRoleMarker" },

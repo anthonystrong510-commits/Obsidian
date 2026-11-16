@@ -27,7 +27,50 @@ const ERC20_ABI = [
   'function transfer(address to, uint256 amount) returns (bool)',
 ];
 
+const PUBLIC_RPC_FALLBACKS: Record<NetworkId, string> = {
+  ethereum: 'https://ethereum-rpc.publicnode.com',
+  arbitrum: 'https://arb1.arbitrum.io/rpc',
+  optimism: 'https://mainnet.optimism.io',
+  base: 'https://mainnet.base.org',
+  polygon: 'https://polygon-bor-rpc.publicnode.com',
+  bsc: 'https://bsc-rpc.publicnode.com',
+  avalanche: 'https://avalanche-c-chain-rpc.publicnode.com',
+  sepolia: 'https://ethereum-sepolia-rpc.publicnode.com',
+  solana: 'https://solana-rpc.publicnode.com',
+  bitcoin: 'https://mempool.space/api',
+  monero: 'https://xmr-node.cakewallet.com:18081/json_rpc',
+};
+
+const apiRpcBrokenMap = new Set<NetworkId>();
+
+async function postJsonRpc(networkId: NetworkId, body: unknown): Promise<unknown> {
+  const tryEndpoint = async (url: string) => {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const ct = resp.headers.get('content-type') || '';
+    if (!resp.ok || !ct.includes('application/json')) {
+      throw new Error(`Non-JSON or error response from ${url}`);
+    }
+    return resp.json();
+  };
+
+  if (!apiRpcBrokenMap.has(networkId)) {
+    try {
+      return await tryEndpoint(`${window.location.origin}/api/rpc?network=${networkId}`);
+    } catch {
+      apiRpcBrokenMap.add(networkId);
+    }
+  }
+  return tryEndpoint(PUBLIC_RPC_FALLBACKS[networkId]);
+}
+
 function getRpcUrl(networkId: NetworkId): string {
+  if (apiRpcBrokenMap.has(networkId)) {
+    return PUBLIC_RPC_FALLBACKS[networkId];
+  }
   return `${window.location.origin}/api/rpc?network=${networkId}`;
 }
 
@@ -40,6 +83,16 @@ export function getEvmProvider(networkId: NetworkId): JsonRpcProvider {
   });
 }
 
+export function getEvmFallbackProvider(networkId: NetworkId): JsonRpcProvider {
+  apiRpcBrokenMap.add(networkId);
+  const cfg = NETWORK_MAP[networkId];
+  const chainId = cfg.chainId || 1;
+  const staticNet = Network.from({ name: cfg.id, chainId });
+  return new JsonRpcProvider(PUBLIC_RPC_FALLBACKS[networkId], staticNet, {
+    staticNetwork: staticNet,
+  });
+}
+
 export async function resolveEnsAddress(nameOrAddress: string): Promise<string | null> {
   const trimmed = nameOrAddress.trim();
   if (!trimmed.includes('.')) return null;
@@ -47,7 +100,11 @@ export async function resolveEnsAddress(nameOrAddress: string): Promise<string |
     const provider = getEvmProvider('ethereum');
     return await provider.resolveName(trimmed);
   } catch {
-    return null;
+    try {
+      return await getEvmFallbackProvider('ethereum').resolveName(trimmed);
+    } catch {
+      return null;
+    }
   }
 }
 
@@ -55,41 +112,183 @@ export async function fetchCustomErc20Metadata(
   networkId: NetworkId,
   contractAddress: string
 ): Promise<TokenConfig> {
-  const provider = getEvmProvider(networkId);
-  const contract = new Contract(contractAddress, ERC20_ABI, provider);
-  const [symbol, name, decimals] = await Promise.all([
-    contract.symbol() as Promise<string>,
-    contract.name() as Promise<string>,
-    contract.decimals() as Promise<bigint>,
-  ]);
-  return {
-    symbol,
-    name,
-    decimals: Number(decimals),
-    address: contractAddress,
-    coinGeckoId: symbol.toLowerCase(),
-    networkId,
-    isCustom: true,
-  };
+  let provider = getEvmProvider(networkId);
+  try {
+    const contract = new Contract(contractAddress, ERC20_ABI, provider);
+    const [symbol, name, decimals] = await Promise.all([
+      contract.symbol() as Promise<string>,
+      contract.name() as Promise<string>,
+      contract.decimals() as Promise<bigint>,
+    ]);
+    return {
+      symbol,
+      name,
+      decimals: Number(decimals),
+      address: contractAddress,
+      coinGeckoId: symbol.toLowerCase(),
+      networkId,
+      isCustom: true,
+    };
+  } catch {
+    provider = getEvmFallbackProvider(networkId);
+    const contract = new Contract(contractAddress, ERC20_ABI, provider);
+    const [symbol, name, decimals] = await Promise.all([
+      contract.symbol() as Promise<string>,
+      contract.name() as Promise<string>,
+      contract.decimals() as Promise<bigint>,
+    ]);
+    return {
+      symbol,
+      name,
+      decimals: Number(decimals),
+      address: contractAddress,
+      coinGeckoId: symbol.toLowerCase(),
+      networkId,
+      isCustom: true,
+    };
+  }
 }
 
+const DIRECT_MARKET_IDS = [
+  'bitcoin',
+  'ethereum',
+  'solana',
+  'binancecoin',
+  'matic-network',
+  'avalanche-2',
+  'arbitrum',
+  'optimism',
+  'chainlink',
+  'uniswap',
+  'aave',
+  'usd-coin',
+  'tether',
+  'wrapped-bitcoin',
+  'dai',
+  'monero',
+];
+
 export async function fetchLiveMarkets(force = false): Promise<MarketCoin[]> {
-  const resp = await fetch(`/api/markets${force ? '?force=1' : ''}`);
-  if (!resp.ok) throw new Error('Market feed temporarily unavailable');
-  const json = (await resp.json()) as { coins: MarketCoin[] };
-  return json.coins || [];
+  try {
+    const resp = await fetch(`/api/markets${force ? '?force=1' : ''}`);
+    const ct = resp.headers.get('content-type') || '';
+    if (resp.ok && ct.includes('application/json')) {
+      const json = (await resp.json()) as { coins: MarketCoin[] };
+      if (json.coins && json.coins.length > 0) return json.coins;
+    }
+  } catch {
+    // Fall back to direct CoinGecko / CryptoCompare for static SPA hosts
+  }
+
+  try {
+    const cgUrl = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${encodeURIComponent(
+      DIRECT_MARKET_IDS.join(',')
+    )}&order=market_cap_desc&per_page=50&page=1&sparkline=true&price_change_percentage=24h`;
+    const resp = await fetch(cgUrl);
+    if (resp.ok) {
+      const data = (await resp.json()) as Array<{
+        id: string;
+        symbol: string;
+        name: string;
+        current_price: number;
+        price_change_percentage_24h: number | null;
+        market_cap: number;
+        total_volume: number;
+        high_24h: number;
+        low_24h: number;
+        sparkline_in_7d?: { price: number[] };
+        last_updated: string;
+      }>;
+      return data.map((d) => ({
+        id: d.id,
+        symbol: d.symbol.toUpperCase() === 'MATIC' ? 'POL' : d.symbol.toUpperCase(),
+        name: d.name,
+        current_price: d.current_price,
+        price_change_percentage_24h: d.price_change_percentage_24h ?? 0,
+        market_cap: d.market_cap ?? 0,
+        total_volume: d.total_volume ?? 0,
+        high_24h: d.high_24h ?? d.current_price,
+        low_24h: d.low_24h ?? d.current_price,
+        sparkline_in_7d: d.sparkline_in_7d,
+        last_updated: d.last_updated || new Date().toISOString(),
+        source: 'coingecko-direct',
+      }));
+    }
+  } catch {
+    // ignore
+  }
+
+  const ccResp = await fetch(
+    'https://min-api.cryptocompare.com/data/pricemultifull?fsyms=BTC,ETH,SOL,BNB,POL,MATIC,AVAX,ARB,OP,LINK,UNI,AAVE,USDC,USDT,WBTC,DAI,XMR&tsyms=USD'
+  );
+  if (!ccResp.ok) throw new Error('Market feed temporarily unavailable');
+  const ccJson = (await ccResp.json()) as { RAW?: Record<string, { USD?: Record<string, number> }> };
+  const raw = ccJson.RAW || {};
+  const mapList: Array<[string, string, string]> = [
+    ['bitcoin', 'BTC', 'Bitcoin'],
+    ['ethereum', 'ETH', 'Ethereum'],
+    ['solana', 'SOL', 'Solana'],
+    ['binancecoin', 'BNB', 'BNB'],
+    ['matic-network', 'POL', 'Polygon'],
+    ['avalanche-2', 'AVAX', 'Avalanche'],
+    ['arbitrum', 'ARB', 'Arbitrum'],
+    ['optimism', 'OP', 'Optimism'],
+    ['chainlink', 'LINK', 'Chainlink'],
+    ['uniswap', 'UNI', 'Uniswap'],
+    ['aave', 'AAVE', 'Aave'],
+    ['usd-coin', 'USDC', 'USD Coin'],
+    ['tether', 'USDT', 'Tether'],
+    ['wrapped-bitcoin', 'WBTC', 'Wrapped Bitcoin'],
+    ['dai', 'DAI', 'Dai'],
+    ['monero', 'XMR', 'Monero'],
+  ];
+  return mapList
+    .map(([id, sym, name]) => {
+      const entry = raw[sym]?.USD || (sym === 'POL' ? raw['MATIC']?.USD : undefined);
+      const price = entry?.PRICE ?? (sym === 'USDC' || sym === 'USDT' || sym === 'DAI' ? 1 : 0);
+      return {
+        id,
+        symbol: sym,
+        name,
+        current_price: price,
+        price_change_percentage_24h: entry?.CHANGEPCT24HOUR ?? 0,
+        market_cap: entry?.MKTCAP ?? 0,
+        total_volume: entry?.TOTALVOLUME24HTO ?? 0,
+        high_24h: entry?.HIGH24HOUR ?? price,
+        low_24h: entry?.LOW24HOUR ?? price,
+        last_updated: new Date().toISOString(),
+        source: 'cryptocompare-direct',
+      };
+    })
+    .filter((c) => c.current_price > 0);
 }
 
 export async function fetchCoinHistory(
   coinId: string,
   days: string
 ): Promise<Array<[number, number]>> {
-  const resp = await fetch(
-    `/api/markets/history?coinId=${encodeURIComponent(coinId)}&days=${encodeURIComponent(days)}`
-  );
-  if (!resp.ok) return [];
-  const json = (await resp.json()) as { prices?: Array<[number, number]> };
-  return json.prices || [];
+  try {
+    const resp = await fetch(
+      `/api/markets/history?coinId=${encodeURIComponent(coinId)}&days=${encodeURIComponent(days)}`
+    );
+    const ct = resp.headers.get('content-type') || '';
+    if (resp.ok && ct.includes('application/json')) {
+      const json = (await resp.json()) as { prices?: Array<[number, number]> };
+      if (json.prices && json.prices.length > 0) return json.prices;
+    }
+  } catch {
+    // Fallback
+  }
+  try {
+    const resp = await fetch(
+      `https://api.coingecko.com/api/v3/coins/${encodeURIComponent(coinId)}/market_chart?vs_currency=usd&days=${encodeURIComponent(days)}`
+    );
+    if (!resp.ok) return [];
+    const json = (await resp.json()) as { prices?: Array<[number, number]> };
+    return json.prices || [];
+  } catch {
+    return [];
+  }
 }
 
 async function fetchSolanaBalances(
@@ -101,17 +300,12 @@ async function fetchSolanaBalances(
   const holdings: PortfolioHolding[] = [];
 
   try {
-    const resp = await fetch(getRpcUrl('solana'), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'getBalance',
-        params: [address],
-      }),
-    });
-    const json = (await resp.json()) as { result?: { value?: number } };
+    const json = (await postJsonRpc('solana', {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'getBalance',
+      params: [address],
+    })) as { result?: { value?: number } };
     const lamports = json.result?.value ?? 0;
     const solAmount = lamports / 1e9;
     const market = priceMap.get('solana');
@@ -136,21 +330,16 @@ async function fetchSolanaBalances(
     // Fetch SPL token accounts for tracked SPL mints
     const splTokens = tokens.filter((t) => t.address !== 'native');
     if (splTokens.length > 0) {
-      const splResp = await fetch(getRpcUrl('solana'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc: '2.0',
-          id: 2,
-          method: 'getTokenAccountsByOwner',
-          params: [
-            address,
-            { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
-            { encoding: 'jsonParsed' },
-          ],
-        }),
-      });
-      const splJson = (await splResp.json()) as {
+      const splJson = (await postJsonRpc('solana', {
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'getTokenAccountsByOwner',
+        params: [
+          address,
+          { programId: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA' },
+          { encoding: 'jsonParsed' },
+        ],
+      })) as {
         result?: {
           value?: Array<{
             account?: {
@@ -233,9 +422,27 @@ async function fetchBitcoinBalance(
   const price = market?.current_price ?? 0;
 
   try {
+    let btcVal = 0;
+    let satsVal = 0;
     const resp = await fetch(`/api/btc/address/${encodeURIComponent(address)}`);
-    if (!resp.ok) throw new Error('BTC fetch failed');
-    const json = (await resp.json()) as { btc: number; satoshis: number };
+    const ct = resp.headers.get('content-type') || '';
+    if (resp.ok && ct.includes('application/json')) {
+      const json = (await resp.json()) as { btc: number; satoshis: number };
+      btcVal = json.btc;
+      satsVal = json.satoshis;
+    } else {
+      const memResp = await fetch(`https://mempool.space/api/address/${encodeURIComponent(address)}`);
+      if (!memResp.ok) throw new Error('BTC fetch failed');
+      const info = (await memResp.json()) as {
+        chain_stats?: { funded_txo_sum: number; spent_txo_sum: number };
+        mempool_stats?: { funded_txo_sum: number; spent_txo_sum: number };
+      };
+      satsVal =
+        (info.chain_stats?.funded_txo_sum ?? 0) -
+        (info.chain_stats?.spent_txo_sum ?? 0) +
+        ((info.mempool_stats?.funded_txo_sum ?? 0) - (info.mempool_stats?.spent_txo_sum ?? 0));
+      btcVal = satsVal / 1e8;
+    }
     return [
       {
         id: 'bitcoin:native',
@@ -246,11 +453,11 @@ async function fetchBitcoinBalance(
         address: 'native',
         decimals: 8,
         coinGeckoId: 'bitcoin',
-        balance: json.btc,
-        balanceRaw: String(json.satoshis),
+        balance: btcVal,
+        balanceRaw: String(satsVal),
         priceUsd: price,
         change24h: market?.price_change_percentage_24h ?? 0,
-        valueUsd: json.btc * price,
+        valueUsd: btcVal * price,
         isNative: true,
       },
     ];
@@ -291,7 +498,13 @@ export async function fetchMultiChainPortfolio(
     if (net.family === 'evm' && addresses.evmAddress) {
       tasks.push(
         (async (): Promise<PortfolioHolding[]> => {
-          const provider = getEvmProvider(net.id);
+          let provider = getEvmProvider(net.id);
+          // Probe provider once; if /api/rpc returns non-JSON (e.g. static SPA host), switch to public CORS RPC
+          try {
+            await provider.getBlockNumber();
+          } catch {
+            provider = getEvmFallbackProvider(net.id);
+          }
           const results: PortfolioHolding[] = [];
 
           await Promise.all(

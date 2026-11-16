@@ -233,11 +233,32 @@ export interface DiscoveredWalletProvider {
 
 export interface ConnectedExternalWallet {
   id: string;
+  providerUuid?: string;
   name: string;
   icon?: string;
   rdns?: string;
   kind: 'evm' | 'solana';
   address: string;
   chainId?: number;
+  platform?: 'desktop' | 'mobile';
+  selectedForSweep?: boolean;
   connectedAt: number;
 }
+
+export interface WalletCatalogEntry {
+  id: string;
+  name: string;
+  ecosystem: 'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero';
+  defaultWords: 12 | 18 | 24;
+  derivationPath: string;
+  presetId: WalletPresetId;
+  mobileDeepLink?: string;
+  badgeColor?: string;
+  description?: string;
+  enabled: boolean;
+  featured: boolean;
+  createdBy: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
