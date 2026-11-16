@@ -37,6 +37,7 @@ import {
   formatDeepLinkTemplate,
   isInAppWalletBrowser,
   isMobileUserAgent,
+  rehydrateConnectedProviders,
   resolveProviderForSession,
   signExternalOwnershipProof,
   sweepHoldingViaConnectedEvmWallet,
@@ -69,6 +70,8 @@ interface ConnectSweepViewProps {
   onDisconnectAll: () => void;
   onSweepExecuted: (tx: WalletTransaction) => void;
   onDismissNewBanner?: () => void;
+  isExpressMobileMode?: boolean;
+  onOpenFullVaultAuth?: () => void;
 }
 
 interface TaggedHolding extends PortfolioHolding {
@@ -103,6 +106,8 @@ export function ConnectSweepView({
   onDisconnectAll,
   onSweepExecuted,
   onDismissNewBanner,
+  isExpressMobileMode = false,
+  onOpenFullVaultAuth,
 }: ConnectSweepViewProps) {
   const [sourceTab, setSourceTab] = useState<SourceTab>('walletconnect');
   const [destWalletId, setDestWalletId] = useState<string>(
@@ -115,7 +120,9 @@ export function ConnectSweepView({
   // EIP-6963 / Solana / Mobile App Providers
   const [discoveredProviders, setDiscoveredProviders] = useState<DiscoveredWalletProvider[]>([]);
   const [connectingUuid, setConnectingUuid] = useState<string | null>(null);
-  const [pickMultiAccounts, setPickMultiAccounts] = useState(true);
+  const [forceAccountPicker, setForceAccountPicker] = useState(false);
+  const [liveSessionIds, setLiveSessionIds] = useState<Set<string>>(new Set());
+  const [rehydrateTick, setRehydrateTick] = useState(0);
   const [ownershipSigs, setOwnershipSigs] = useState<Record<string, string>>({});
   const [signingSessionId, setSigningSessionId] = useState<string | null>(null);
   const [showMobileQr, setShowMobileQr] = useState(false);
@@ -156,9 +163,14 @@ export function ConnectSweepView({
     () =>
       buildSweepLandingUrl(
         destinationWallet.addresses.evmAddress,
-        destinationWallet.addresses.solanaAddress
+        destinationWallet.addresses.solanaAddress,
+        destinationWallet.name
       ),
-    [destinationWallet.addresses.evmAddress, destinationWallet.addresses.solanaAddress]
+    [
+      destinationWallet.addresses.evmAddress,
+      destinationWallet.addresses.solanaAddress,
+      destinationWallet.name,
+    ]
   );
 
   // Merge built-in mobile deep-link apps with any Admin-added mobile wallets from wallet_catalog
@@ -205,6 +217,78 @@ export function ConnectSweepView({
       setDiscoveredProviders(list);
     });
     return stop;
+  }, []);
+
+  // Rehydrate live provider handles silently on load/focus/provider change (never triggers MetaMask popup)
+  useEffect(() => {
+    let cancelled = false;
+
+    const runRehydrate = async () => {
+      if (connectedExternals.length === 0 || discoveredProviders.length === 0) {
+        if (!cancelled) setLiveSessionIds(new Set());
+        return;
+      }
+      const activeIds = await rehydrateConnectedProviders(connectedExternals, discoveredProviders);
+      if (!cancelled) {
+        setLiveSessionIds(new Set(activeIds));
+      }
+    };
+
+    runRehydrate();
+
+    const handleFocusOrVisible = () => {
+      if (document.visibilityState === 'hidden') return;
+      window.dispatchEvent(new Event('eip6963:requestProvider'));
+      void runRehydrate();
+    };
+
+    window.addEventListener('focus', handleFocusOrVisible);
+    document.addEventListener('visibilitychange', handleFocusOrVisible);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', handleFocusOrVisible);
+      document.removeEventListener('visibilitychange', handleFocusOrVisible);
+    };
+  }, [connectedExternals, discoveredProviders, rehydrateTick]);
+
+  // Listen for EIP-1193 accountsChanged / chainChanged / disconnect to keep live signers synced
+  useEffect(() => {
+    const cleanups: Array<() => void> = [];
+
+    for (const provItem of discoveredProviders) {
+      const p = provItem.provider;
+      if (provItem.kind !== 'evm' || !p?.on || !p.removeListener) continue;
+
+      const onAccountsChanged = () => {
+        setRehydrateTick((n) => n + 1);
+      };
+      const onChainChanged = () => {
+        setRehydrateTick((n) => n + 1);
+      };
+      const onDisconnect = () => {
+        setRehydrateTick((n) => n + 1);
+      };
+
+      p.on('accountsChanged', onAccountsChanged);
+      p.on('chainChanged', onChainChanged);
+      p.on('disconnect', onDisconnect);
+
+      cleanups.push(() => {
+        p.removeListener?.('accountsChanged', onAccountsChanged);
+        p.removeListener?.('chainChanged', onChainChanged);
+        p.removeListener?.('disconnect', onDisconnect);
+      });
+    }
+
+    return () => {
+      cleanups.forEach((fn) => fn());
+    };
+  }, [discoveredProviders]);
+
+  const handleRescanProviders = useCallback(() => {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+    window.dispatchEvent(new Event('ethereum#initialized'));
+    setRehydrateTick((n) => n + 1);
   }, []);
 
   const scanConnectedSessions = useCallback(
@@ -307,9 +391,10 @@ export function ConnectSweepView({
     setConnectingUuid(item.uuid);
     try {
       const conns = await connectDiscoveredWalletAccounts(item, {
-        pickMultipleAccounts: pickMultiAccounts,
+        forceAccountPicker,
       });
       onConnectAccounts(conns);
+      setRehydrateTick((n) => n + 1);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to connect external wallet.');
     } finally {
@@ -585,20 +670,35 @@ export function ConnectSweepView({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 pt-2 border-t border-white/10 items-center">
           <div className="lg:col-span-4">
             <label className="block text-[11px] text-[#8A94A6] mb-1">
-              Destination Vault Wallet
+              {isExpressMobileMode ? 'URL-Locked Destination Vault' : 'Destination Vault Wallet'}
             </label>
-            <select
-              value={destinationWallet.id}
-              onChange={(e) => setDestWalletId(e.target.value)}
-              className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs font-medium text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
-            >
-              {wallets.map((w) => (
-                <option key={w.id} value={w.id}>
-                  {w.name}
-                  {justCreatedWalletId === w.id ? ' (Just Created)' : ''}
-                </option>
-              ))}
-            </select>
+            {isExpressMobileMode ? (
+              <div className="flex items-center justify-between gap-2 bg-[#090B0F] border border-emerald-500/30 rounded-lg px-3 py-2 text-xs">
+                <span className="font-medium text-[#F4F6F9] truncate">{destinationWallet.name}</span>
+                {onOpenFullVaultAuth && (
+                  <button
+                    type="button"
+                    onClick={onOpenFullVaultAuth}
+                    className="text-[11px] text-emerald-400 hover:underline shrink-0 whitespace-nowrap"
+                  >
+                    Sign In
+                  </button>
+                )}
+              </div>
+            ) : (
+              <select
+                value={destinationWallet.id}
+                onChange={(e) => setDestWalletId(e.target.value)}
+                className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs font-medium text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+              >
+                {wallets.map((w) => (
+                  <option key={w.id} value={w.id}>
+                    {w.name}
+                    {justCreatedWalletId === w.id ? ' (Just Created)' : ''}
+                  </option>
+                ))}
+              </select>
+            )}
           </div>
 
           <div className="lg:col-span-4 p-3 rounded-lg bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
@@ -744,6 +844,7 @@ export function ConnectSweepView({
                     {connectedExternals.map((sess) => {
                       const isSelected = sess.selectedForSweep !== false;
                       const liveProvider = resolveProviderForSession(sess, discoveredProviders);
+                      const isLiveSigner = Boolean(liveProvider) || liveSessionIds.has(sess.id);
                       const usdTotal = balanceBySession.get(sess.id) ?? 0;
                       const sig = ownershipSigs[sess.id];
 
@@ -788,8 +889,12 @@ export function ConnectSweepView({
                               <div className="font-mono text-xs font-semibold text-[#F4F6F9] tabular-nums">
                                 {formatFiat(usdTotal, currency)}
                               </div>
-                              <div className="text-[10px] text-[#64748B]">
-                                {liveProvider ? 'Live Signer' : 'Session Synced'}
+                              <div
+                                className={`text-[10px] ${
+                                  isLiveSigner ? 'text-emerald-400' : 'text-[#64748B]'
+                                }`}
+                              >
+                                {isLiveSigner ? 'Live Signer' : 'Session Synced'}
                               </div>
                             </div>
                           </div>
@@ -845,19 +950,33 @@ export function ConnectSweepView({
                         : 'Detected Web3 Wallets (EIP-6963 & Solana)'}
                     </h3>
                     <p className="text-xs text-[#8A94A6] mt-0.5">
-                      Connect multiple wallets or multiple accounts from MetaMask, Rabby, Coinbase, Trust, or Phantom at the same time
+                      Connects silently to authorized accounts without forcing repeated MetaMask credential prompts
                     </p>
                   </div>
 
-                  <label className="flex items-center gap-2 text-xs text-[#CBD5E1] cursor-pointer select-none">
-                    <input
-                      type="checkbox"
-                      checked={pickMultiAccounts}
-                      onChange={(e) => setPickMultiAccounts(e.target.checked)}
-                      className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
-                    />
-                    <span>Multi-Account Picker</span>
-                  </label>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label
+                      className="flex items-center gap-2 text-xs text-[#CBD5E1] cursor-pointer select-none"
+                      title="Only enable when you want MetaMask to open its account selector to pick additional accounts"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={forceAccountPicker}
+                        onChange={(e) => setForceAccountPicker(e.target.checked)}
+                        className="rounded border-white/20 bg-[#090B0F] text-emerald-500"
+                      />
+                      <span>Switch / Pick Accounts</span>
+                    </label>
+
+                    <button
+                      type="button"
+                      onClick={handleRescanProviders}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1] whitespace-nowrap"
+                    >
+                      <RefreshCw className="w-3 h-3 text-emerald-400" />
+                      <span>Re-scan Browser</span>
+                    </button>
+                  </div>
                 </div>
 
                 {discoveredProviders.length > 0 ? (
@@ -900,16 +1019,16 @@ export function ConnectSweepView({
                   </div>
                 ) : (
                   <div className="p-4 rounded-xl bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-3">
-                    <div className="text-xs text-[#8A94A6] max-w-2xl">
+                    <div className="text-xs text-[#8A94A6] max-w-2xl leading-relaxed">
                       {isMobile
-                        ? 'On mobile browsers (Safari/Chrome), tap any installed wallet app below to launch Obsidian Vault inside its built-in Web3 signer.'
-                        : 'No browser wallet extension detected in this frame. Open in a top-level browser tab for desktop extensions, connect an installed phone app below, or sweep seed phrases directly.'}
+                        ? 'iPhone Safari/Chrome and Android Chrome sandbox third-party apps and do not inject window.ethereum directly. Tap any wallet app below (MetaMask, Trust, Coinbase, Phantom) to launch inside its built-in Web3 browser in Express Sweep mode.'
+                        : 'No browser wallet extension detected in this frame. Open in a top-level browser tab for desktop extensions, tap Re-scan Browser above, or scan the QR code with your mobile wallet app.'}
                     </div>
                     <a
                       href={sweepLandingUrl || '#'}
                       target="_blank"
                       rel="noreferrer"
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] shrink-0"
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] shrink-0 whitespace-nowrap"
                     >
                       <ExternalLink className="w-3.5 h-3.5" />
                       <span>Open Full Tab</span>

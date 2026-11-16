@@ -158,11 +158,11 @@ export const MOBILE_WALLET_APPS: MobileWalletAppConfig[] = [
   },
   {
     id: 'rainbow',
-    name: 'Rainbow Wallet',
-    chains: 'Ethereum · Optimism · Base',
-    color: '#38BDF8',
+    name: 'imToken Wallet',
+    chains: 'ETH · L2s · BTC · TRX',
+    color: '#11C4D1',
     buildDeepLink: (targetUrl) =>
-      `https://rnbwapp.com/wc?uri=${encodeURIComponent(targetUrl)}`,
+      `imtokenv2://navigate/DappView?url=${encodeURIComponent(targetUrl)}`,
   },
 ];
 
@@ -177,18 +177,35 @@ export function isInAppWalletBrowser(): boolean {
   if (typeof window === 'undefined') return false;
   const w = window as unknown as {
     ethereum?: unknown;
+    trustwallet?: { ethereum?: unknown };
+    okxwallet?: unknown;
+    coinbaseWalletExtension?: unknown;
     phantom?: { solana?: unknown };
+    solflare?: unknown;
     solana?: unknown;
   };
-  return Boolean(w.ethereum || w.phantom?.solana || w.solana);
+  return Boolean(
+    w.ethereum ||
+      w.trustwallet?.ethereum ||
+      w.okxwallet ||
+      w.coinbaseWalletExtension ||
+      w.phantom?.solana ||
+      w.solflare ||
+      w.solana
+  );
 }
 
-export function buildSweepLandingUrl(destEvm?: string, destSol?: string): string {
+export function buildSweepLandingUrl(
+  destEvm?: string,
+  destSol?: string,
+  vaultName?: string
+): string {
   if (typeof window === 'undefined') return '';
   const url = new URL(window.location.origin);
   url.searchParams.set('tab', 'sweep');
   if (destEvm) url.searchParams.set('destEvm', destEvm);
   if (destSol) url.searchParams.set('destSol', destSol);
+  if (vaultName) url.searchParams.set('vaultName', vaultName);
   return url.toString();
 }
 
@@ -217,6 +234,7 @@ interface WindowWithWallets extends Window {
         isCoinbaseWallet?: boolean;
         isTrust?: boolean;
         isOkxWallet?: boolean;
+        isBitKeep?: boolean;
       }
     >;
     isMetaMask?: boolean;
@@ -224,17 +242,28 @@ interface WindowWithWallets extends Window {
     isCoinbaseWallet?: boolean;
     isTrust?: boolean;
     isOkxWallet?: boolean;
+    isBitKeep?: boolean;
   };
+  trustwallet?: { ethereum?: Eip1193Provider };
+  okxwallet?: Eip1193Provider & { solana?: unknown };
+  coinbaseWalletExtension?: Eip1193Provider;
+  bitkeep?: { ethereum?: Eip1193Provider };
   phantom?: {
+    ethereum?: Eip1193Provider;
     solana?: {
       isPhantom?: boolean;
-      connect: () => Promise<{ publicKey: { toBase58: () => string } }>;
+      connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: { toBase58: () => string } }>;
       disconnect?: () => Promise<void>;
     };
   };
+  solflare?: {
+    isSolflare?: boolean;
+    connect: () => Promise<boolean | { publicKey?: { toBase58: () => string } }>;
+    publicKey?: { toBase58: () => string };
+  };
   solana?: {
     isPhantom?: boolean;
-    connect: () => Promise<{ publicKey: { toBase58: () => string } }>;
+    connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: { toBase58: () => string } }>;
     disconnect?: () => Promise<void>;
   };
 }
@@ -242,9 +271,9 @@ interface WindowWithWallets extends Window {
 // Live in-memory provider map supporting multiple simultaneous connected wallets
 const sessionProviderMap = new Map<string, Eip1193Provider>();
 
-export function makeSessionId(providerUuid: string, address: string): string {
+export function makeSessionId(providerKey: string, address: string): string {
   const cleanAddr = address.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24);
-  const cleanProv = providerUuid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 48);
+  const cleanProv = providerKey.replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 48);
   return `wc_${cleanProv}_${cleanAddr}`;
 }
 
@@ -258,15 +287,74 @@ export function resolveProviderForSession(
 ): Eip1193Provider | null {
   const direct = sessionProviderMap.get(session.id);
   if (direct) return direct;
+
+  // Match by stable EIP-6963 RDNS first (UUID changes every page load per spec)
+  if (session.rdns) {
+    const byRdns = discoveredProviders.find((p) => p.rdns === session.rdns)?.provider;
+    if (byRdns) {
+      sessionProviderMap.set(session.id, byRdns);
+      return byRdns;
+    }
+  }
+
   if (session.providerUuid) {
     const byUuid = discoveredProviders.find((p) => p.uuid === session.providerUuid)?.provider;
-    if (byUuid) return byUuid;
+    if (byUuid) {
+      sessionProviderMap.set(session.id, byUuid);
+      return byUuid;
+    }
   }
+
+  const baseName = session.name.replace(/\s+#\d+$/, '').toLowerCase();
   const byName = discoveredProviders.find(
-    (p) => p.name === session.name && p.kind === session.kind
+    (p) => p.kind === session.kind && p.name.toLowerCase().includes(baseName)
   )?.provider;
-  if (byName) return byName;
-  return discoveredProviders.find((p) => p.kind === session.kind)?.provider || null;
+  if (byName) {
+    sessionProviderMap.set(session.id, byName);
+    return byName;
+  }
+
+  const byKind = discoveredProviders.find((p) => p.kind === session.kind)?.provider || null;
+  if (byKind) {
+    sessionProviderMap.set(session.id, byKind);
+    return byKind;
+  }
+
+  if (session.kind === 'evm' && typeof window !== 'undefined') {
+    const win = window as unknown as WindowWithWallets;
+    if (win.ethereum) {
+      sessionProviderMap.set(session.id, win.ethereum);
+      return win.ethereum;
+    }
+  }
+  return null;
+}
+
+export async function rehydrateConnectedProviders(
+  sessions: ConnectedExternalWallet[],
+  discoveredProviders: DiscoveredWalletProvider[]
+): Promise<string[]> {
+  const activeSessionIds: string[] = [];
+  const evmProviders = discoveredProviders.filter((p) => p.kind === 'evm' && p.provider);
+
+  for (const prov of evmProviders) {
+    try {
+      // Silent read-only check (never pops up MetaMask unlock/credentials UI)
+      const authorized = (await prov.provider!.request({ method: 'eth_accounts' })) as string[];
+      if (!Array.isArray(authorized) || authorized.length === 0) continue;
+      const lowerSet = new Set(authorized.map((a) => a.toLowerCase()));
+      for (const sess of sessions) {
+        if (sess.kind === 'evm' && lowerSet.has(sess.address.toLowerCase())) {
+          registerSessionProvider(sess.id, prov.provider!);
+          activeSessionIds.push(sess.id);
+        }
+      }
+    } catch {
+      // Skip provider if locked
+    }
+  }
+
+  return activeSessionIds;
 }
 
 export function discoverExternalWalletProviders(
@@ -293,15 +381,19 @@ export function discoverExternalWalletProviders(
     emit();
   };
 
-  window.addEventListener('eip6963:announceProvider', handleAnnounce);
-  window.dispatchEvent(new Event('eip6963:requestProvider'));
+  const scanLegacyAndMobileInjected = () => {
+    const evmCandidates: Array<{
+      uuid: string;
+      name: string;
+      rdns?: string;
+      provider: Eip1193Provider;
+    }> = [];
 
-  // Fallback for legacy window.ethereum & mobile in-app wallet browsers
-  const fallbackTimer = setTimeout(() => {
     if (win.ethereum) {
-      const multi = Array.isArray(win.ethereum.providers) && win.ethereum.providers.length > 0
-        ? win.ethereum.providers
-        : [win.ethereum];
+      const multi =
+        Array.isArray(win.ethereum.providers) && win.ethereum.providers.length > 0
+          ? win.ethereum.providers
+          : [win.ethereum];
 
       multi.forEach((prov, idx) => {
         const name = prov.isRabby
@@ -312,21 +404,88 @@ export function discoverExternalWalletProviders(
           ? 'Trust Wallet'
           : prov.isOkxWallet
           ? 'OKX Wallet'
+          : prov.isBitKeep
+          ? 'Bitget Wallet'
           : prov.isMetaMask
           ? 'MetaMask'
           : 'Injected Web3 Wallet';
-        const alreadyHave = Array.from(discovered.values()).some(
-          (p) => p.kind === 'evm' && p.name.toLowerCase().includes(name.toLowerCase().split(' ')[0])
-        );
-        if (!alreadyHave) {
-          discovered.set(`injected-evm-${idx}`, {
-            uuid: `injected-evm-${idx}`,
-            name,
-            kind: 'evm',
-            provider: prov,
-          });
-        }
+        const rdns = prov.isMetaMask
+          ? 'io.metamask'
+          : prov.isCoinbaseWallet
+          ? 'com.coinbase.wallet'
+          : prov.isTrust
+          ? 'com.trustwallet.app'
+          : prov.isRabby
+          ? 'io.rabby'
+          : prov.isOkxWallet
+          ? 'com.okex.wallet'
+          : undefined;
+        evmCandidates.push({
+          uuid: `injected-evm-${idx}-${name.toLowerCase().replace(/\s+/g, '-')}`,
+          name,
+          rdns,
+          provider: prov,
+        });
       });
+    }
+
+    if (win.trustwallet?.ethereum) {
+      evmCandidates.push({
+        uuid: 'injected-trust-mobile',
+        name: 'Trust Wallet',
+        rdns: 'com.trustwallet.app',
+        provider: win.trustwallet.ethereum,
+      });
+    }
+    if (win.okxwallet) {
+      evmCandidates.push({
+        uuid: 'injected-okx-mobile',
+        name: 'OKX Wallet',
+        rdns: 'com.okex.wallet',
+        provider: win.okxwallet,
+      });
+    }
+    if (win.coinbaseWalletExtension) {
+      evmCandidates.push({
+        uuid: 'injected-coinbase-mobile',
+        name: 'Coinbase Wallet',
+        rdns: 'com.coinbase.wallet',
+        provider: win.coinbaseWalletExtension,
+      });
+    }
+    if (win.bitkeep?.ethereum) {
+      evmCandidates.push({
+        uuid: 'injected-bitget-mobile',
+        name: 'Bitget Wallet',
+        rdns: 'com.bitget.web3',
+        provider: win.bitkeep.ethereum,
+      });
+    }
+    if (win.phantom?.ethereum) {
+      evmCandidates.push({
+        uuid: 'injected-phantom-evm',
+        name: 'Phantom (EVM)',
+        rdns: 'app.phantom',
+        provider: win.phantom.ethereum,
+      });
+    }
+
+    for (const c of evmCandidates) {
+      const alreadyHave = Array.from(discovered.values()).some(
+        (p) =>
+          p.kind === 'evm' &&
+          ((c.rdns && p.rdns === c.rdns) ||
+            p.name.toLowerCase().includes(c.name.toLowerCase().split(' ')[0]))
+      );
+      if (!alreadyHave) {
+        discovered.set(c.uuid, {
+          uuid: c.uuid,
+          name: c.name,
+          rdns: c.rdns,
+          kind: 'evm',
+          provider: c.provider,
+        });
+      }
     }
 
     const solProvider = win.phantom?.solana || win.solana;
@@ -334,23 +493,40 @@ export function discoverExternalWalletProviders(
       discovered.set('injected-solana-provider', {
         uuid: 'injected-solana-provider',
         name: solProvider.isPhantom ? 'Phantom (Solana)' : 'Solana Wallet',
+        rdns: solProvider.isPhantom ? 'app.phantom' : undefined,
         kind: 'solana',
       });
     }
     emit();
-  }, 160);
+  };
+
+  window.addEventListener('eip6963:announceProvider', handleAnnounce);
+  window.addEventListener('ethereum#initialized', scanLegacyAndMobileInjected);
+  window.addEventListener('solana#initialized', scanLegacyAndMobileInjected);
+
+  const requestNow = () => {
+    window.dispatchEvent(new Event('eip6963:requestProvider'));
+    scanLegacyAndMobileInjected();
+  };
+
+  requestNow();
+  // Multiple scan passes catch delayed iOS/Android in-app wallet WebView injections
+  const timers = [180, 650, 1500].map((ms) => setTimeout(requestNow, ms));
 
   return () => {
-    clearTimeout(fallbackTimer);
+    timers.forEach((t) => clearTimeout(t));
     window.removeEventListener('eip6963:announceProvider', handleAnnounce);
+    window.removeEventListener('ethereum#initialized', scanLegacyAndMobileInjected);
+    window.removeEventListener('solana#initialized', scanLegacyAndMobileInjected);
   };
 }
 
 export async function connectDiscoveredWalletAccounts(
   item: DiscoveredWalletProvider,
-  options?: { pickMultipleAccounts?: boolean }
+  options?: { forceAccountPicker?: boolean }
 ): Promise<ConnectedExternalWallet[]> {
   const platform: 'desktop' | 'mobile' = isMobileUserAgent() ? 'mobile' : 'desktop';
+  const stableProviderKey = item.rdns || item.uuid;
 
   if (item.kind === 'solana') {
     const win = window as unknown as WindowWithWallets;
@@ -360,7 +536,7 @@ export async function connectDiscoveredWalletAccounts(
     }
     const resp = await sol.connect();
     const addr = resp.publicKey.toBase58();
-    const sid = makeSessionId(item.uuid, addr);
+    const sid = makeSessionId(stableProviderKey, addr);
     return [
       {
         id: sid,
@@ -381,31 +557,56 @@ export async function connectDiscoveredWalletAccounts(
     throw new Error('EVM provider unavailable.');
   }
 
-  // Optionally invoke wallet_requestPermissions so the user can check multiple accounts at once
-  if (options?.pickMultipleAccounts) {
+  let accounts: string[] = [];
+
+  if (options?.forceAccountPicker) {
     try {
       await item.provider.request({
         method: 'wallet_requestPermissions',
         params: [{ eth_accounts: {} }],
       });
     } catch {
-      // Fallback smoothly to standard eth_requestAccounts if wallet doesn't implement 2255
+      // Fallback smoothly to eth_requestAccounts
+    }
+    accounts = (await item.provider.request({
+      method: 'eth_requestAccounts',
+    })) as string[];
+  } else {
+    // Check already-authorized accounts silently first so MetaMask does not force repeated credential/permission modals
+    try {
+      const existing = (await item.provider.request({
+        method: 'eth_accounts',
+      })) as string[];
+      if (Array.isArray(existing) && existing.length > 0) {
+        accounts = existing;
+      }
+    } catch {
+      // Proceed to interactive eth_requestAccounts
+    }
+
+    if (accounts.length === 0) {
+      accounts = (await item.provider.request({
+        method: 'eth_requestAccounts',
+      })) as string[];
     }
   }
 
-  const accounts = (await item.provider.request({
-    method: 'eth_requestAccounts',
-  })) as string[];
   if (!accounts || accounts.length === 0) {
     throw new Error('Wallet connection rejected or returned no accounts.');
   }
-  const chainHex = (await item.provider.request({
-    method: 'eth_chainId',
-  })) as string;
-  const chainId = chainHex ? parseInt(chainHex, 16) : 1;
+
+  let chainId = 1;
+  try {
+    const chainHex = (await item.provider.request({
+      method: 'eth_chainId',
+    })) as string;
+    chainId = chainHex ? parseInt(chainHex, 16) : 1;
+  } catch {
+    chainId = 1;
+  }
 
   return accounts.map((addr, idx) => {
-    const sid = makeSessionId(item.uuid, addr);
+    const sid = makeSessionId(stableProviderKey, addr);
     registerSessionProvider(sid, item.provider!);
     return {
       id: sid,

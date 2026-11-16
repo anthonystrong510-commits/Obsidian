@@ -188,6 +188,38 @@ export default function App() {
     Record<string, UnlockedSecrets>
   >({});
 
+  const initialSweepParams = useMemo(() => {
+    const sp = new URLSearchParams(window.location.search);
+    const destEvm = sp.get('destEvm') || '';
+    const destSol = sp.get('destSol') || '';
+    const vaultName = sp.get('vaultName') || 'Obsidian Destination Vault';
+    const isSweepDeepLink = sp.get('tab') === 'sweep' && Boolean(destEvm || destSol);
+    return { isSweepDeepLink, destEvm, destSol, vaultName };
+  }, []);
+
+  const [expressExitToAuth, setExpressExitToAuth] = useState(false);
+
+  const expressDestWallet = useMemo<WalletAccount>(
+    () => ({
+      id: 'express_dest_vault',
+      name: initialSweepParams.vaultName,
+      type: 'watchOnly',
+      accountIndex: 0,
+      addresses: {
+        evmAddress: initialSweepParams.destEvm,
+        evmPath: "m/44'/60'/0'/0/0",
+        solanaAddress: initialSweepParams.destSol,
+        solanaPath: "m/44'/501'/0'/0'",
+        bitcoinAddress: '',
+        bitcoinPath: "m/84'/0'/0'/0/0",
+        moneroAddress: '',
+        moneroPath: "m/44'/128'/0'/0'",
+      },
+      createdAt: 0,
+    }),
+    [initialSweepParams]
+  );
+
   const [activeTab, setActiveTab] = useState<NavTab>(() => {
     const sp = new URLSearchParams(window.location.search);
     return sp.get('tab') === 'sweep' ? 'sweep' : 'portfolio';
@@ -205,6 +237,15 @@ export default function App() {
     loadConnectedExternals()
   );
   const [walletCatalog, setWalletCatalog] = useState<WalletCatalogEntry[]>([]);
+
+  useEffect(() => {
+    if (!initialSweepParams.isSweepDeepLink) return;
+    listWalletCatalog(true)
+      .then((list) => {
+        if (list.length > 0) setWalletCatalog(list);
+      })
+      .catch(() => {});
+  }, [initialSweepParams.isSweepDeepLink]);
 
   // Market & Portfolio Data
   const [markets, setMarkets] = useState<MarketCoin[]>([]);
@@ -1013,8 +1054,93 @@ export default function App() {
     );
   }
 
-  // GATE 1: Landing Page -> Firebase Authentication (Google Sign-In & Email/Password Sign-Up)
+  // GATE 1: Express Mobile Deep-Link Mode (Inside wallet in-app browsers) OR Landing/Auth
   if (!authUser || !authUser.emailVerified) {
+    if (initialSweepParams.isSweepDeepLink && !expressExitToAuth) {
+      return (
+        <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex flex-col">
+          <header className="h-16 px-4 sm:px-8 border-b border-white/10 bg-[#0D1017] flex items-center justify-between gap-4 shrink-0">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <ObsidianLogo size={24} />
+              <span className="font-display text-base font-bold tracking-tight text-[#F4F6F9] whitespace-nowrap">
+                Obsidian Vault
+              </span>
+              <span className="text-white/20 hidden sm:inline">/</span>
+              <span className="text-xs font-medium text-emerald-400 hidden sm:inline whitespace-nowrap">
+                Express Mobile Sweep
+              </span>
+            </div>
+
+            <button
+              type="button"
+              onClick={() => {
+                setExpressExitToAuth(true);
+                setShowAuthPortal(true);
+              }}
+              className="px-3.5 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] whitespace-nowrap shrink-0"
+            >
+              Sign In to Full Vault
+            </button>
+          </header>
+
+          <main className="flex-1 p-4 sm:p-8 max-w-[1160px] w-full mx-auto">
+            <ConnectSweepView
+              isExpressMobileMode
+              wallets={[expressDestWallet]}
+              activeWallet={expressDestWallet}
+              justCreatedWalletId={expressDestWallet.id}
+              markets={markets}
+              currency={settings.currency}
+              connectedExternals={connectedExternals}
+              walletCatalog={walletCatalog}
+              onConnectAccounts={handleConnectAccounts}
+              onToggleConnectionSweep={handleToggleConnectionSweep}
+              onDisconnectOne={handleDisconnectOne}
+              onDisconnectAll={handleDisconnectAll}
+              onOpenFullVaultAuth={() => {
+                setExpressExitToAuth(true);
+                setShowAuthPortal(true);
+              }}
+              onSweepExecuted={(tx) => {
+                setLocalTxs((prev) => {
+                  const next = [tx, ...prev];
+                  saveLocalTxs(next);
+                  return next;
+                });
+                pushToast(
+                  tx.status === 'signed-sandbox' ? 'Sweep Signed (Dry-Run)' : 'Sweep Broadcasted',
+                  `${tx.amount} ${tx.symbol} → ${shortenAddress(tx.to, 6, 4)}`
+                );
+              }}
+            />
+          </main>
+
+          {toasts.length > 0 && (
+            <div className="fixed bottom-5 right-5 z-50 space-y-2 max-w-sm w-full pointer-events-none">
+              {toasts.map((t) => (
+                <div
+                  key={t.id}
+                  className="pointer-events-auto bg-[#11151C] border border-emerald-500/40 rounded-xl p-4 shadow-xl flex items-start justify-between gap-3"
+                >
+                  <div>
+                    <div className="text-xs font-semibold text-emerald-400">{t.title}</div>
+                    <div className="text-xs text-[#CBD5E1] mt-0.5">{t.message}</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}
+                    className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     if (!authUser && !showAuthPortal) {
       return (
         <LandingPage
