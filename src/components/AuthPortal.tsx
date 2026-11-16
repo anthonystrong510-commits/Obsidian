@@ -19,6 +19,7 @@ import {
   ShieldCheck,
 } from 'lucide-react';
 import { auth, googleProvider } from '../lib/firebase';
+import { ObsidianLogo } from './ObsidianLogo';
 
 interface AuthPortalProps {
   unverifiedUser: User | null;
@@ -245,9 +246,12 @@ export function AuthPortal({
                     <span>Home</span>
                   </button>
                 )}
-                <span className="font-display text-xl font-bold tracking-tight text-[#F4F6F9]">
-                  Obsidian Vault
-                </span>
+                <div className="flex items-center gap-2.5">
+                  <ObsidianLogo size={28} />
+                  <span className="font-display text-xl font-bold tracking-tight text-[#F4F6F9]">
+                    Obsidian Vault
+                  </span>
+                </div>
               </div>
               <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
                 <button

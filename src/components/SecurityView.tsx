@@ -98,12 +98,6 @@ export function SecurityView({
       return;
     }
 
-    const verifierOk = await verifyVaultPassword(revealPassword);
-    if (!verifierOk) {
-      setRevealError('Incorrect vault password.');
-      return;
-    }
-
     try {
       if (activeWallet.encryptedSecret) {
         const decrypted = await unlockWalletSecrets(activeWallet, revealPassword);
@@ -126,11 +120,16 @@ export function SecurityView({
           setRevealedSecrets(decrypted);
         }
       } else {
+        const verifierOk = await verifyVaultPassword(revealPassword);
+        if (!verifierOk) {
+          setRevealError('Incorrect vault password.');
+          return;
+        }
         setRevealedSecrets(secrets);
       }
       setRevealPassword('');
     } catch {
-      setRevealError('Could not decrypt this wallet with the provided password.');
+      setRevealError('Incorrect password or unable to decrypt this wallet.');
     }
   };
 

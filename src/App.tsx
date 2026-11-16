@@ -4,6 +4,8 @@ import {
   ArrowLeftRight,
   ArrowUpRight,
   Bell,
+  Check,
+  ChevronDown,
   Globe,
   KeyRound,
   LayoutGrid,
@@ -12,6 +14,7 @@ import {
   LogOut,
   Plus,
   Shield,
+  Wallet,
   X,
 } from 'lucide-react';
 import { auth } from './lib/firebase';
@@ -33,23 +36,31 @@ import {
 import { deriveWalletFromMnemonic, shortenAddress } from './lib/crypto';
 import {
   clearAllVaultData,
+  clearSessionUnlockToken,
+  createVaultVerifier,
   encryptPayload,
   hasVaultPassword,
   loadActiveWalletId,
   loadAddressBook,
   loadAlerts,
+  loadConnectedExternals,
   loadCustomTokens,
   loadLocalTxs,
+  loadSessionUnlockToken,
   loadSettings,
   loadWallets,
   saveActiveWalletId,
   saveAddressBook,
   saveAlerts,
+  saveConnectedExternals,
   saveCustomTokens,
   saveLocalTxs,
+  saveSessionUnlockToken,
   saveSettings,
   saveWallets,
+  setActiveUserScope,
   unlockWalletSecrets,
+  verifyVaultPassword,
 } from './lib/vaultStorage';
 import {
   fetchLiveMarkets,
@@ -68,6 +79,7 @@ import { AlertsView } from './components/AlertsView';
 import { NetworksView } from './components/NetworksView';
 import { SecurityView } from './components/SecurityView';
 import { ConnectSweepView } from './components/ConnectSweepView';
+import { ObsidianLogo } from './components/ObsidianLogo';
 import type {
   AddressBookEntry,
   ConnectedExternalWallet,
@@ -158,20 +170,6 @@ export default function App() {
   const [userStatus, setUserStatus] = useState<'active' | 'suspended' | 'kyc_pending'>('active');
   const [exchangeConfig, setExchangeConfig] = useState<ExchangeSystemConfig | null>(null);
 
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, async (user) => {
-      setAuthUser(user);
-      setAuthReady(true);
-      if (user && user.emailVerified) {
-        const adminOk = await checkUserIsAdmin(user);
-        setIsAdminUser(adminOk);
-      } else {
-        setIsAdminUser(false);
-      }
-    });
-    return () => unsub();
-  }, []);
-
   // Vault State
   const [wallets, setWallets] = useState<WalletAccount[]>(() => loadWallets());
   const [activeWalletId, setActiveWalletId] = useState<string | null>(() => {
@@ -200,8 +198,12 @@ export default function App() {
   const [swapInitialSymbol, setSwapInitialSymbol] = useState<string | undefined>(undefined);
   const [alertInitialCoinId, setAlertInitialCoinId] = useState<string | undefined>(undefined);
   const [showAddWalletModal, setShowAddWalletModal] = useState(false);
+  const [walletSwitcherOpen, setWalletSwitcherOpen] = useState(false);
+  const walletSwitcherRef = useRef<HTMLDivElement | null>(null);
   const [justCreatedWalletId, setJustCreatedWalletId] = useState<string | null>(null);
-  const [connectedExternals, setConnectedExternals] = useState<ConnectedExternalWallet[]>([]);
+  const [connectedExternals, setConnectedExternals] = useState<ConnectedExternalWallet[]>(() =>
+    loadConnectedExternals()
+  );
   const [walletCatalog, setWalletCatalog] = useState<WalletCatalogEntry[]>([]);
 
   // Market & Portfolio Data
@@ -220,6 +222,80 @@ export default function App() {
 
   const alertsRef = useRef(alerts);
   alertsRef.current = alerts;
+  const activeWalletIdRef = useRef(activeWalletId);
+  activeWalletIdRef.current = activeWalletId;
+  const sessionPasswordRef = useRef(sessionPassword);
+  sessionPasswordRef.current = sessionPassword;
+
+  useEffect(() => {
+    const handleOutside = (e: MouseEvent) => {
+      if (walletSwitcherRef.current && !walletSwitcherRef.current.contains(e.target as Node)) {
+        setWalletSwitcherOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
+
+  useEffect(() => {
+    const unsub = onAuthStateChanged(auth, async (user) => {
+      if (user && user.emailVerified) {
+        setActiveUserScope(user.uid);
+        const scopedWallets = loadWallets();
+        const savedActiveId = loadActiveWalletId();
+        const scopedConnected = loadConnectedExternals();
+
+        setWallets(scopedWallets);
+        if (savedActiveId && scopedWallets.some((w) => w.id === savedActiveId)) {
+          setActiveWalletId(savedActiveId);
+        } else {
+          setActiveWalletId(scopedWallets[0]?.id ?? null);
+        }
+        setConnectedExternals(scopedConnected);
+        setLocalTxs(loadLocalTxs());
+        setCustomTokens(loadCustomTokens());
+        setAlerts(loadAlerts());
+        setAddressBook(loadAddressBook());
+        setSettings(loadSettings());
+
+        // Restore ephemeral session unlock token across reloads / mobile connect redirects
+        const cachedToken = loadSessionUnlockToken(user.uid);
+        if (cachedToken !== null) {
+          const secretsMap: Record<string, UnlockedSecrets> = {};
+          for (const w of scopedWallets) {
+            if (w.encryptedSecret) {
+              try {
+                secretsMap[w.id] = await unlockWalletSecrets(w, cachedToken);
+              } catch {
+                // Skip mismatched legacy wallet without failing whole unlock
+              }
+            }
+          }
+          setUnlockedSecretsMap((prev) => ({ ...prev, ...secretsMap }));
+          setSessionPassword(cachedToken);
+        } else if (
+          scopedWallets.length > 0 &&
+          !hasVaultPassword() &&
+          scopedWallets.every((w) => !w.encryptedSecret)
+        ) {
+          setSessionPassword('');
+        }
+
+        const adminOk = await checkUserIsAdmin(user);
+        setIsAdminUser(adminOk);
+      } else {
+        setActiveUserScope(null);
+        setIsAdminUser(false);
+        if (!user) {
+          setSessionPassword(null);
+          setUnlockedSecretsMap({});
+        }
+      }
+      setAuthUser(user);
+      setAuthReady(true);
+    });
+    return () => unsub();
+  }, []);
 
   const activeWallet = useMemo(
     () => wallets.find((w) => w.id === activeWalletId) || wallets[0] || null,
@@ -243,6 +319,7 @@ export default function App() {
     }
     if (syncedUidRef.current === authUser.uid) return;
     syncedUidRef.current = authUser.uid;
+    setActiveUserScope(authUser.uid);
 
     (async () => {
       try {
@@ -250,7 +327,7 @@ export default function App() {
         const profile = await syncUserProfile(authUser, localWallets.length, settings.currency);
         setUserStatus(profile.status);
 
-        // Merge cloud wallets with local wallets
+        // Merge cloud wallets with local wallets cleanly
         const cloudWallets = await fetchUserWalletsFromCloud(authUser.uid);
         const mergedMap = new Map<string, WalletAccount>();
         for (const cw of cloudWallets) mergedMap.set(cw.id, cw);
@@ -266,9 +343,31 @@ export default function App() {
         if (mergedWallets.length > 0) {
           setWallets(mergedWallets);
           saveWallets(mergedWallets);
-          if (!activeWalletId || !mergedWallets.some((w) => w.id === activeWalletId)) {
+          const currentActive = activeWalletIdRef.current || loadActiveWalletId();
+          if (!currentActive || !mergedWallets.some((w) => w.id === currentActive)) {
             setActiveWalletId(mergedWallets[0].id);
             saveActiveWalletId(mergedWallets[0].id);
+          }
+
+          // If session is already unlocked via session token, decrypt any newly synced cloud wallets
+          const activePw = sessionPasswordRef.current ?? loadSessionUnlockToken(authUser.uid);
+          if (activePw !== null) {
+            const decryptedMap: Record<string, UnlockedSecrets> = {};
+            for (const w of mergedWallets) {
+              if (w.encryptedSecret) {
+                try {
+                  decryptedMap[w.id] = await unlockWalletSecrets(w, activePw);
+                } catch {
+                  // Ignore single-wallet password mismatch
+                }
+              }
+            }
+            if (Object.keys(decryptedMap).length > 0) {
+              setUnlockedSecretsMap((prev) => ({ ...prev, ...decryptedMap }));
+            }
+            if (sessionPasswordRef.current === null) {
+              setSessionPassword(activePw);
+            }
           }
         }
 
@@ -293,13 +392,21 @@ export default function App() {
           listWalletCatalog(true).catch(() => []),
           getExchangeSystemConfig().catch(() => null),
         ]);
-        if (cloudSessions.length > 0) {
-          setConnectedExternals((prev) => {
-            const map = new Map<string, ConnectedExternalWallet>();
-            for (const s of cloudSessions) map.set(s.id, s);
-            for (const p of prev) map.set(p.id, p);
-            return Array.from(map.values()).sort((a, b) => b.connectedAt - a.connectedAt);
-          });
+        const localSessions = loadConnectedExternals();
+        if (cloudSessions.length > 0 || localSessions.length > 0) {
+          const map = new Map<string, ConnectedExternalWallet>();
+          for (const s of cloudSessions) map.set(s.id, s);
+          for (const ls of localSessions) {
+            if (!map.has(ls.id)) {
+              map.set(ls.id, ls);
+              saveUserConnectedSessionToCloud(authUser.uid, ls).catch(() => {});
+            }
+          }
+          const mergedSessions = Array.from(map.values()).sort(
+            (a, b) => b.connectedAt - a.connectedAt
+          );
+          setConnectedExternals(mergedSessions);
+          saveConnectedExternals(mergedSessions);
         }
         if (enabledCatalog.length > 0) {
           setWalletCatalog(enabledCatalog);
@@ -309,7 +416,7 @@ export default function App() {
         console.error('Cloud sync warning:', err);
       }
     })();
-  }, [authUser, settings.currency, activeWalletId]);
+  }, [authUser, settings.currency]);
 
   // Evaluate Price Alerts on incoming market updates
   const evaluatePriceAlerts = useCallback(
@@ -552,35 +659,132 @@ export default function App() {
     const secretsMap: Record<string, UnlockedSecrets> = {};
     const updatedWallets: WalletAccount[] = [];
     let anyChanged = false;
+    let encryptedCount = 0;
+    let decryptedCount = 0;
 
     for (const w of wallets) {
       if (w.encryptedSecret) {
-        const rawSec = await unlockWalletSecrets(w, pw);
-        const enriched = await enrichMnemonicWalletWithMonero(w, rawSec, pw);
-        secretsMap[w.id] = enriched.secrets;
-        updatedWallets.push(enriched.wallet);
-        if (enriched.changed) {
-          anyChanged = true;
-          backfilledWalletsRef.current.add(w.id);
-          if (authUser && authUser.emailVerified) {
-            await saveUserWalletToCloud(authUser.uid, enriched.wallet).catch(() => {});
+        encryptedCount++;
+        try {
+          const rawSec = await unlockWalletSecrets(w, pw);
+          decryptedCount++;
+          const enriched = await enrichMnemonicWalletWithMonero(w, rawSec, pw);
+          secretsMap[w.id] = enriched.secrets;
+          updatedWallets.push(enriched.wallet);
+          if (enriched.changed) {
+            anyChanged = true;
+            backfilledWalletsRef.current.add(w.id);
+            if (authUser && authUser.emailVerified) {
+              await saveUserWalletToCloud(authUser.uid, enriched.wallet).catch(() => {});
+            }
           }
+        } catch {
+          // Keep wallet record intact even if this individual wallet used a legacy passphrase
+          updatedWallets.push(w);
         }
       } else {
         updatedWallets.push(w);
       }
     }
 
+    const verifierOk = await verifyVaultPassword(pw);
+
+    if (encryptedCount > 0 && decryptedCount === 0) {
+      throw new Error('Incorrect vault password for stored wallets. Try seed or account recovery below.');
+    }
+    if (encryptedCount === 0 && hasVaultPassword() && !verifierOk) {
+      throw new Error('Incorrect vault password.');
+    }
+
+    // Keep local password verifier aligned with the password that unlocked the user's wallets
+    if (!hasVaultPassword() || !verifierOk) {
+      await createVaultVerifier(pw);
+    }
+
     if (anyChanged) {
       setWallets(updatedWallets);
       saveWallets(updatedWallets);
     }
-    setUnlockedSecretsMap(secretsMap);
+    setUnlockedSecretsMap((prev) => ({ ...prev, ...secretsMap }));
     setSessionPassword(pw);
+    saveSessionUnlockToken(authUser?.uid ?? null, pw);
+  };
+
+  const handleRecoverWithSeed = async (
+    recoveredWallet: WalletAccount,
+    recoveredSecrets: UnlockedSecrets,
+    newPassword: string
+  ) => {
+    const existingMatch = wallets.find(
+      (w) =>
+        (recoveredWallet.addresses.evmAddress &&
+          w.addresses.evmAddress?.toLowerCase() ===
+            recoveredWallet.addresses.evmAddress.toLowerCase()) ||
+        (recoveredWallet.addresses.solanaAddress &&
+          w.addresses.solanaAddress === recoveredWallet.addresses.solanaAddress)
+    );
+
+    let targetWallet: WalletAccount;
+    let nextWallets: WalletAccount[];
+
+    if (existingMatch) {
+      targetWallet = {
+        ...existingMatch,
+        addresses: recoveredWallet.addresses,
+        encryptedSecret: recoveredWallet.encryptedSecret,
+      };
+      nextWallets = wallets.map((w) => (w.id === existingMatch.id ? targetWallet : w));
+    } else {
+      targetWallet = recoveredWallet;
+      nextWallets = [...wallets, recoveredWallet];
+    }
+
+    await createVaultVerifier(newPassword);
+    setWallets(nextWallets);
+    saveWallets(nextWallets);
+    setActiveWalletId(targetWallet.id);
+    saveActiveWalletId(targetWallet.id);
+    setUnlockedSecretsMap((prev) => ({ ...prev, [targetWallet.id]: recoveredSecrets }));
+    setSessionPassword(newPassword);
+    saveSessionUnlockToken(authUser?.uid ?? null, newPassword);
+
+    if (authUser && authUser.emailVerified) {
+      await saveUserWalletToCloud(authUser.uid, targetWallet).catch(() => {});
+      await syncUserProfile(authUser, nextWallets.length, settings.currency).catch(() => {});
+    }
+    pushToast('Vault Recovered', `${targetWallet.name} unlocked with new Vault Password`);
+  };
+
+  const handleRecoverWithAuth = async (newPassword: string) => {
+    await createVaultVerifier(newPassword);
+    // Re-encrypt any already-decrypted secrets in memory with the new password
+    const updatedWallets = await Promise.all(
+      wallets.map(async (w) => {
+        const memSec = unlockedSecretsMap[w.id];
+        if (memSec) {
+          const reEncrypted = await encryptPayload(memSec, newPassword);
+          const nextW = { ...w, encryptedSecret: reEncrypted };
+          if (authUser && authUser.emailVerified) {
+            await saveUserWalletToCloud(authUser.uid, nextW).catch(() => {});
+          }
+          return nextW;
+        }
+        return w;
+      })
+    );
+    setWallets(updatedWallets);
+    saveWallets(updatedWallets);
+    setSessionPassword(newPassword);
+    saveSessionUnlockToken(authUser?.uid ?? null, newPassword);
+    pushToast(
+      'Account Re-Authenticated',
+      'Vault session restored with your new password and synced wallets.'
+    );
   };
 
   const handleResetVault = () => {
     clearAllVaultData();
+    clearSessionUnlockToken(authUser?.uid);
     setWallets([]);
     setActiveWalletId(null);
     setSessionPassword(null);
@@ -605,6 +809,7 @@ export default function App() {
     setJustCreatedWalletId(wallet.id);
     setUnlockedSecretsMap((prev) => ({ ...prev, [wallet.id]: secrets }));
     setSessionPassword(pwUsed);
+    saveSessionUnlockToken(authUser?.uid ?? null, pwUsed);
     setShowAddWalletModal(false);
     setActiveTab('portfolio');
 
@@ -614,9 +819,44 @@ export default function App() {
     }
   };
 
+  const handleBatchWalletsCreated = async (
+    items: Array<{ wallet: WalletAccount; secrets: UnlockedSecrets }>,
+    pwUsed: string
+  ) => {
+    if (items.length === 0) return;
+    const newWallets = items.map((i) => i.wallet);
+    const nextWallets = [...wallets, ...newWallets];
+    const newSecrets: Record<string, UnlockedSecrets> = {};
+    for (const item of items) {
+      newSecrets[item.wallet.id] = item.secrets;
+    }
+
+    setWallets(nextWallets);
+    saveWallets(nextWallets);
+    setActiveWalletId(newWallets[0].id);
+    saveActiveWalletId(newWallets[0].id);
+    setJustCreatedWalletId(newWallets[0].id);
+    setUnlockedSecretsMap((prev) => ({ ...prev, ...newSecrets }));
+    setSessionPassword(pwUsed);
+    saveSessionUnlockToken(authUser?.uid ?? null, pwUsed);
+    setShowAddWalletModal(false);
+    setActiveTab('portfolio');
+
+    if (authUser && authUser.emailVerified) {
+      await Promise.all(
+        newWallets.map((w) => saveUserWalletToCloud(authUser.uid, w).catch(() => {}))
+      );
+      await syncUserProfile(authUser, nextWallets.length, settings.currency).catch(() => {});
+    }
+    pushToast(
+      `${newWallets.length} Wallets Created`,
+      'Switch anytime from the header or sidebar wallet selector.'
+    );
+  };
+
   const handleDeriveSubAccount = async (parentWallet: WalletAccount) => {
     const parentSecrets = unlockedSecretsMap[parentWallet.id];
-    if (!parentSecrets?.mnemonic || !sessionPassword) return;
+    if (!parentSecrets?.mnemonic || sessionPassword === null) return;
     const nextIndex = wallets.filter((w) =>
       w.name.startsWith(parentWallet.name.split(' #')[0])
     ).length;
@@ -671,7 +911,9 @@ export default function App() {
         const map = new Map<string, ConnectedExternalWallet>();
         for (const existing of prev) map.set(existing.id, existing);
         for (const incoming of newConnections) map.set(incoming.id, incoming);
-        return Array.from(map.values()).sort((a, b) => b.connectedAt - a.connectedAt);
+        const merged = Array.from(map.values()).sort((a, b) => b.connectedAt - a.connectedAt);
+        saveConnectedExternals(merged);
+        return merged;
       });
       if (authUser && authUser.emailVerified) {
         await Promise.all(
@@ -693,13 +935,15 @@ export default function App() {
   const handleToggleConnectionSweep = useCallback(
     async (sessionId: string) => {
       let updatedTarget: ConnectedExternalWallet | undefined;
-      setConnectedExternals((prev) =>
-        prev.map((c) => {
+      setConnectedExternals((prev) => {
+        const next = prev.map((c) => {
           if (c.id !== sessionId) return c;
           updatedTarget = { ...c, selectedForSweep: !(c.selectedForSweep ?? true) };
           return updatedTarget;
-        })
-      );
+        });
+        saveConnectedExternals(next);
+        return next;
+      });
       if (updatedTarget && authUser && authUser.emailVerified) {
         await saveUserConnectedSessionToCloud(authUser.uid, updatedTarget).catch(() => {});
       }
@@ -709,7 +953,11 @@ export default function App() {
 
   const handleDisconnectOne = useCallback(
     async (sessionId: string) => {
-      setConnectedExternals((prev) => prev.filter((c) => c.id !== sessionId));
+      setConnectedExternals((prev) => {
+        const next = prev.filter((c) => c.id !== sessionId);
+        saveConnectedExternals(next);
+        return next;
+      });
       if (authUser && authUser.emailVerified) {
         await deleteUserConnectedSessionFromCloud(authUser.uid, sessionId).catch(() => {});
       }
@@ -720,6 +968,7 @@ export default function App() {
   const handleDisconnectAll = useCallback(async () => {
     const existing = connectedExternals;
     setConnectedExternals([]);
+    saveConnectedExternals([]);
     if (authUser && authUser.emailVerified) {
       await Promise.all(
         existing.map((c) =>
@@ -729,7 +978,14 @@ export default function App() {
     }
   }, [authUser, connectedExternals]);
 
+  const handleLockVault = () => {
+    clearSessionUnlockToken(authUser?.uid);
+    setSessionPassword(null);
+  };
+
   const handleSignOut = async () => {
+    clearSessionUnlockToken(authUser?.uid);
+    setActiveUserScope(null);
     await signOut(auth);
     setSessionPassword(null);
     setUnlockedSecretsMap({});
@@ -819,16 +1075,21 @@ export default function App() {
         walletCatalog={walletCatalog}
         markets={markets}
         onComplete={handleWalletCreated}
+        onCompleteBatch={handleBatchWalletsCreated}
       />
     );
   }
 
-  // GATE 3: Local Vault Locked -> Unlock Screen
+  // GATE 3: Local Vault Locked -> Unlock Screen (supports Seed & Auth recovery)
   if (sessionPassword === null) {
     return (
       <VaultLockScreen
-        walletCount={wallets.length}
+        wallets={wallets}
+        markets={markets}
+        authUser={authUser}
         onUnlock={handleUnlockVault}
+        onRecoverWithSeed={handleRecoverWithSeed}
+        onRecoverWithAuth={handleRecoverWithAuth}
         onResetVault={handleResetVault}
       />
     );
@@ -857,12 +1118,15 @@ export default function App() {
       <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-[#0D1017] border-r border-white/10 justify-between">
         <div className="p-5 space-y-6">
           <div className="flex items-center justify-between">
-            <span className="font-display text-lg font-bold tracking-tight text-[#F4F6F9] whitespace-nowrap">
-              Obsidian Vault
-            </span>
+            <div className="flex items-center gap-2.5">
+              <ObsidianLogo size={26} />
+              <span className="font-display text-lg font-bold tracking-tight text-[#F4F6F9] whitespace-nowrap">
+                Obsidian Vault
+              </span>
+            </div>
             <button
               type="button"
-              onClick={() => setSessionPassword(null)}
+              onClick={handleLockVault}
               title="Lock Vault"
               className="p-1.5 rounded-lg text-[#8A94A6] hover:text-[#F4F6F9] hover:bg-white/5"
               aria-label="Lock vault"
@@ -1072,10 +1336,103 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2 shrink-0">
+            {/* Responsive Multi-Wallet Switcher Dropdown (Desktop & Mobile) */}
+            <div className="relative" ref={walletSwitcherRef}>
+              <button
+                type="button"
+                onClick={() => setWalletSwitcherOpen((o) => !o)}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#11151C] hover:bg-[#171D28] border border-white/10 text-xs transition-colors"
+              >
+                <Wallet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span className="font-medium text-[#F4F6F9] max-w-[110px] sm:max-w-[160px] truncate">
+                  {activeWallet.name}
+                </span>
+                <span className="hidden sm:inline font-mono text-[11px] text-[#8A94A6]">
+                  {shortenAddress(
+                    activeWallet.addresses.evmAddress ||
+                      activeWallet.addresses.solanaAddress ||
+                      activeWallet.addresses.bitcoinAddress ||
+                      activeWallet.addresses.moneroAddress ||
+                      '',
+                    4,
+                    4
+                  )}
+                </span>
+                {wallets.length > 1 && (
+                  <span className="font-mono text-[10px] text-emerald-400">
+                    ({wallets.length})
+                  </span>
+                )}
+                <ChevronDown className="w-3.5 h-3.5 text-[#8A94A6]" />
+              </button>
+
+              {walletSwitcherOpen && (
+                <div className="absolute right-0 mt-2 w-72 bg-[#11151C] border border-white/15 rounded-xl shadow-2xl z-50 overflow-hidden">
+                  <div className="px-3.5 py-2.5 border-b border-white/10 flex items-center justify-between text-[11px] text-[#8A94A6]">
+                    <span>Switch Active Wallet</span>
+                    <span className="font-mono">{wallets.length} vaults</span>
+                  </div>
+                  <div className="max-h-64 overflow-y-auto divide-y divide-white/[0.06]">
+                    {wallets.map((w) => {
+                      const isCurrent = w.id === activeWallet.id;
+                      const primaryAddr =
+                        w.addresses.evmAddress ||
+                        w.addresses.solanaAddress ||
+                        w.addresses.bitcoinAddress ||
+                        w.addresses.moneroAddress ||
+                        '';
+                      return (
+                        <button
+                          key={w.id}
+                          type="button"
+                          onClick={() => {
+                            setActiveWalletId(w.id);
+                            saveActiveWalletId(w.id);
+                            setWalletSwitcherOpen(false);
+                          }}
+                          className={`w-full px-3.5 py-2.5 text-left flex items-center justify-between gap-2 transition-colors ${
+                            isCurrent ? 'bg-emerald-500/10' : 'hover:bg-white/[0.04]'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="text-xs font-medium text-[#F4F6F9] truncate">
+                              {w.name}
+                            </div>
+                            <div className="text-[10px] font-mono text-[#64748B] truncate">
+                              {shortenAddress(primaryAddr, 6, 4)} ·{' '}
+                              {w.type === 'mnemonic'
+                                ? `${w.wordCount || 12}w #${w.accountIndex ?? 0}`
+                                : w.type === 'privateKey'
+                                ? 'Private Key'
+                                : 'Watch'}
+                            </div>
+                          </div>
+                          {isCurrent && <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="p-2 border-t border-white/10 bg-[#0D1017]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWalletSwitcherOpen(false);
+                        setShowAddWalletModal(true);
+                      }}
+                      className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] text-xs font-semibold transition-colors"
+                    >
+                      <Plus className="w-3.5 h-3.5" />
+                      <span>Create / Import Wallets</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <button
               type="button"
               onClick={() => setShowAddWalletModal(true)}
-              className="px-3.5 py-2 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] whitespace-nowrap shrink-0"
+              className="hidden sm:inline-flex px-3.5 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] whitespace-nowrap shrink-0"
             >
               + Import / Create
             </button>
@@ -1278,7 +1635,7 @@ export default function App() {
               onDeriveSubAccount={handleDeriveSubAccount}
               onDeleteWallet={handleDeleteWallet}
               onAddWalletClick={() => setShowAddWalletModal(true)}
-              onLockVault={() => setSessionPassword(null)}
+              onLockVault={handleLockVault}
               onAddContact={(entry) => {
                 const next = [entry, ...addressBook];
                 setAddressBook(next);
@@ -1326,6 +1683,7 @@ export default function App() {
           markets={markets}
           onNavigateSweep={() => setActiveTab('sweep')}
           onComplete={handleWalletCreated}
+          onCompleteBatch={handleBatchWalletsCreated}
           onClose={() => setShowAddWalletModal(false)}
         />
       )}

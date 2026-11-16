@@ -1,6 +1,7 @@
 import express from 'express';
 import type { Request, Response } from 'express';
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -500,11 +501,17 @@ async function startServer() {
     }
   });
 
+  const httpServer = http.createServer(app);
+
   // Vite dev middleware or static dist serving
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        ws: { server: httpServer },
+        hmr: process.env.DISABLE_HMR === 'true' ? false : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -518,7 +525,7 @@ async function startServer() {
     }
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Obsidian Vault server running on http://0.0.0.0:${PORT}`);
   });
 }

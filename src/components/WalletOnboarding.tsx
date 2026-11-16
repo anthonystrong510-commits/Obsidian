@@ -60,6 +60,10 @@ interface WalletOnboardingProps {
     secrets: UnlockedSecrets,
     passwordUsed: string
   ) => void;
+  onCompleteBatch?: (
+    items: Array<{ wallet: WalletAccount; secrets: UnlockedSecrets }>,
+    passwordUsed: string
+  ) => void;
   onClose?: () => void;
 }
 
@@ -70,12 +74,14 @@ export function WalletOnboarding({
   markets,
   onNavigateSweep,
   onComplete,
+  onCompleteBatch,
   onClose,
 }: WalletOnboardingProps) {
   const [tab, setTab] = useState<OnboardingTab>('create');
 
   // Create Wallet State
   const [createWordCount, setCreateWordCount] = useState<12 | 18 | 24>(12);
+  const [createWalletCount, setCreateWalletCount] = useState<1 | 2 | 3 | 5>(1);
   const [generatedWords, setGeneratedWords] = useState<string[]>(() =>
     generateMnemonicWords(12)
   );
@@ -106,7 +112,14 @@ export function WalletOnboarding({
   const [watchResolving, setWatchResolving] = useState(false);
 
   // Vault Password State
-  const needsNewPassword = !hasVaultPassword() && !existingPassword;
+  const vaultHasPassword = hasVaultPassword();
+  const [setNewPasswordOnImport, setSetNewPasswordOnImport] = useState<boolean>(
+    () => !vaultHasPassword || (mode === 'fullPage' && !existingPassword)
+  );
+  const needsNewPassword =
+    !vaultHasPassword ||
+    (mode === 'fullPage' && !existingPassword) ||
+    (tab === 'import-seed' && setNewPasswordOnImport);
   const [password, setPassword] = useState(existingPassword || '');
   const [confirmPassword, setConfirmPassword] = useState(existingPassword || '');
   const [error, setError] = useState('');
@@ -295,12 +308,13 @@ export function WalletOnboarding({
   }, [focusedWordIndex, importWords]);
 
   const validateAndPreparePassword = async (): Promise<string | null> => {
-    const activePw = existingPassword || password;
+    const creatingPassword = needsNewPassword;
+    const activePw = creatingPassword ? password : existingPassword || password;
     if (!activePw || activePw.length < 6) {
       setError('Vault password must be at least 6 characters.');
       return null;
     }
-    if (needsNewPassword) {
+    if (creatingPassword) {
       if (password !== confirmPassword) {
         setError('Passwords do not match.');
         return null;
@@ -330,23 +344,36 @@ export function WalletOnboarding({
         return;
       }
       const phrase = generatedWords.join(' ');
-      const derived = deriveWalletFromMnemonic(phrase, {
-        preset: 'standard',
-        accountIndex: 0,
-      });
-      const encryptedSecret = await encryptPayload(derived.secrets, pw);
-      const wallet: WalletAccount = {
-        id: crypto.randomUUID(),
-        name: createWalletName.trim() || 'Main Multi-Chain Vault',
-        type: 'mnemonic',
-        wordCount: createWordCount,
-        preset: 'standard',
-        accountIndex: 0,
-        addresses: derived.addresses,
-        encryptedSecret,
-        createdAt: Date.now(),
-      };
-      onComplete(wallet, derived.secrets, pw);
+      const baseName = createWalletName.trim() || 'Main Multi-Chain Vault';
+      const createdItems: Array<{ wallet: WalletAccount; secrets: UnlockedSecrets }> = [];
+
+      for (let i = 0; i < createWalletCount; i++) {
+        const derived = deriveWalletFromMnemonic(phrase, {
+          preset: 'standard',
+          accountIndex: i,
+        });
+        const encryptedSecret = await encryptPayload(derived.secrets, pw);
+        const wallet: WalletAccount = {
+          id: crypto.randomUUID(),
+          name: createWalletCount === 1 ? baseName : `${baseName} #${i + 1}`,
+          type: 'mnemonic',
+          wordCount: createWordCount,
+          preset: 'standard',
+          accountIndex: i,
+          addresses: derived.addresses,
+          encryptedSecret,
+          createdAt: Date.now() + i,
+        };
+        createdItems.push({ wallet, secrets: derived.secrets });
+      }
+
+      if (createdItems.length > 1 && onCompleteBatch) {
+        onCompleteBatch(createdItems, pw);
+      } else {
+        for (const item of createdItems) {
+          onComplete(item.wallet, item.secrets, pw);
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create vault.');
     } finally {
@@ -600,7 +627,36 @@ export function WalletOnboarding({
                     className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
                   />
                 </div>
-                <div className="flex items-end justify-end gap-2">
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1.5">
+                    Number of Wallets to Create
+                  </label>
+                  <div className="grid grid-cols-4 gap-1.5 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
+                    {([1, 2, 3, 5] as const).map((cnt) => (
+                      <button
+                        key={cnt}
+                        type="button"
+                        onClick={() => setCreateWalletCount(cnt)}
+                        className={`py-1.5 rounded text-xs font-mono transition-colors whitespace-nowrap ${
+                          createWalletCount === cnt
+                            ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                            : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                        }`}
+                      >
+                        {cnt} {cnt === 1 ? 'Wallet' : 'Wallets'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] text-[#8A94A6]">
+                  {createWalletCount > 1
+                    ? `Batch creation derives ${createWalletCount} independent BIP-44 accounts (#1–#${createWalletCount}) ready for wallet switching.`
+                    : 'Derives primary multi-chain HD account (#0) across EVM, Solana, Bitcoin, and Monero.'}
+                </span>
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
                     onClick={() => setRevealCreateWords((v) => !v)}
@@ -930,6 +986,87 @@ export function WalletOnboarding({
                   </div>
                 )}
               </div>
+
+              {/* Assets-First Preview Inside Import Flow (displayed BEFORE password creation) */}
+              {importPreviewAddresses && (
+                <div className="p-4 rounded-xl bg-[#090B0F] border border-emerald-500/30 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-emerald-400">
+                        Detected Assets & Multi-Chain Addresses
+                      </div>
+                      <div className="text-[11px] text-[#8A94A6]">
+                        Review your on-chain holdings first, then set your Vault Password below to encrypt and finish importing.
+                      </div>
+                    </div>
+                    <div className="text-right">
+                      <div className="text-[10px] text-[#64748B]">Scanned Total</div>
+                      <div className="font-mono text-sm font-semibold text-[#F4F6F9] tabular-nums">
+                        {scanningPreview
+                          ? 'Scanning...'
+                          : formatFiat(previewHoldings.reduce((acc, h) => acc + h.valueUsd, 0))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono">
+                    {importPreviewAddresses.evmAddress && (
+                      <div className="px-2.5 py-1.5 rounded bg-[#11151C] border border-white/10 flex items-center justify-between">
+                        <span className="text-[#8A94A6]">EVM</span>
+                        <span className="text-[#F4F6F9]">
+                          {shortenAddress(importPreviewAddresses.evmAddress, 8, 6)}
+                        </span>
+                      </div>
+                    )}
+                    {importPreviewAddresses.solanaAddress && (
+                      <div className="px-2.5 py-1.5 rounded bg-[#11151C] border border-white/10 flex items-center justify-between">
+                        <span className="text-[#8A94A6]">SOL</span>
+                        <span className="text-emerald-400">
+                          {shortenAddress(importPreviewAddresses.solanaAddress, 8, 6)}
+                        </span>
+                      </div>
+                    )}
+                    {importPreviewAddresses.bitcoinAddress && (
+                      <div className="px-2.5 py-1.5 rounded bg-[#11151C] border border-white/10 flex items-center justify-between">
+                        <span className="text-[#8A94A6]">BTC</span>
+                        <span className="text-amber-400">
+                          {shortenAddress(importPreviewAddresses.bitcoinAddress, 8, 6)}
+                        </span>
+                      </div>
+                    )}
+                    {importPreviewAddresses.moneroAddress && (
+                      <div className="px-2.5 py-1.5 rounded bg-[#11151C] border border-white/10 flex items-center justify-between">
+                        <span className="text-[#8A94A6]">XMR</span>
+                        <span className="text-[#FF6600]">
+                          {shortenAddress(importPreviewAddresses.moneroAddress, 8, 6)}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {!scanningPreview && previewHoldings.length > 0 ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                      {previewHoldings.map((h) => (
+                        <div
+                          key={`inline-${h.networkId}-${h.symbol}`}
+                          className="flex items-center justify-between px-3 py-2 rounded-lg bg-[#11151C] border border-white/10 text-xs"
+                        >
+                          <span className="font-mono text-[#F4F6F9]">
+                            {formatCryptoAmount(h.balance)} {h.symbol}
+                          </span>
+                          <span className="font-mono text-emerald-400 tabular-nums">
+                            {formatFiat(h.valueUsd)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : !scanningPreview ? (
+                    <div className="text-[11px] text-[#64748B]">
+                      All 11 networks scanned · 0 funded balances found so far. You can still import and set your password below.
+                    </div>
+                  ) : null}
+                </div>
+              )}
             </div>
           )}
 
@@ -1061,6 +1198,28 @@ export function WalletOnboarding({
 
           {/* Vault Password Section */}
           <div className="pt-4 border-t border-white/10 space-y-3">
+            {tab === 'import-seed' && existingPassword && (
+              <label className="flex items-center gap-2 text-xs text-[#CBD5E1] cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={setNewPasswordOnImport}
+                  onChange={(e) => {
+                    const checked = e.target.checked;
+                    setSetNewPasswordOnImport(checked);
+                    if (checked) {
+                      setPassword('');
+                      setConfirmPassword('');
+                    } else {
+                      setPassword(existingPassword);
+                      setConfirmPassword(existingPassword);
+                    }
+                  }}
+                  className="rounded border-white/20 bg-[#090B0F] text-emerald-500 focus:ring-emerald-500"
+                />
+                <span>Create a new Vault Password for this seed import</span>
+              </label>
+            )}
+
             {needsNewPassword ? (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
@@ -1118,7 +1277,13 @@ export function WalletOnboarding({
                   className="flex items-center gap-2 px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-sm transition-colors whitespace-nowrap"
                 >
                   <Plus className="w-4 h-4" />
-                  <span>{submitting ? 'Encrypting Vault...' : 'Create & Open Vault'}</span>
+                  <span>
+                    {submitting
+                      ? 'Encrypting Vault...'
+                      : createWalletCount > 1
+                      ? `Create ${createWalletCount} Wallets & Open`
+                      : 'Create & Open Vault'}
+                  </span>
                 </button>
               )}
               {tab === 'import-seed' && (
