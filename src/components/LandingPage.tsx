@@ -17,7 +17,7 @@ import type { MarketCoin } from '../types/wallet';
 
 interface LandingPageProps {
   markets: MarketCoin[];
-  onOpenAuth: (mode: 'signin' | 'signup') => void;
+  onOpenAuth: (mode: 'signin' | 'signup' | 'wallet') => void;
 }
 
 type EcosystemFilter = 'all' | 'evm' | 'non-evm';
@@ -39,7 +39,7 @@ export function LandingPage({ markets, onOpenAuth }: LandingPageProps) {
     <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex flex-col">
       {/* Strict 3-Zone Top Navigation Bar */}
       <header className="sticky top-0 z-30 bg-[#090B0F]/92 backdrop-blur-md border-b border-white/10">
-        <div className="max-w-[1280px] mx-auto px-6 h-16 flex items-center justify-between gap-8">
+        <div className="max-w-[1280px] mx-auto px-4 sm:px-6 h-14 sm:h-16 flex items-center justify-between gap-4 sm:gap-8">
           <a
             href="#top"
             className="flex items-center gap-2.5 font-display text-lg font-bold tracking-tight text-[#F4F6F9] whitespace-nowrap shrink-0"
@@ -89,37 +89,45 @@ export function LandingPage({ markets, onOpenAuth }: LandingPageProps) {
 
       <main id="top" className="flex-1">
         {/* Hero Split Section */}
-        <section className="max-w-[1280px] mx-auto px-6 pt-12 pb-12 lg:pt-16 lg:pb-16 space-y-10">
+        <section className="max-w-[1280px] mx-auto px-4 sm:px-6 pt-8 pb-10 sm:pt-12 sm:pb-12 lg:pt-16 lg:pb-16 space-y-8 sm:space-y-10">
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 lg:gap-12 items-stretch">
-            <div className="lg:col-span-6 flex flex-col justify-between space-y-8 py-1">
-              <div className="space-y-5">
+            <div className="lg:col-span-6 flex flex-col justify-between space-y-6 sm:space-y-8 py-1">
+              <div className="space-y-4 sm:space-y-5">
                 <p className="text-xs font-mono text-emerald-400 tracking-wide">
                   Self-Custody Multi-Chain Web3 Wallet
                 </p>
-                <h1 className="font-display font-bold tracking-tight text-[#F4F6F9] text-balance leading-[1.06] text-[clamp(2.25rem,4vw,3.75rem)]">
+                <h1 className="font-display font-bold tracking-tight text-[#F4F6F9] text-balance leading-[1.08] text-[clamp(2rem,4vw,3.75rem)]">
                   One cryptographic vault for every network you hold.
                 </h1>
-                <p className="text-base text-[#94A3B8] leading-relaxed max-w-[60ch]">
+                <p className="text-sm sm:text-base text-[#94A3B8] leading-relaxed max-w-[60ch]">
                   Create batch HD wallets or import 12, 18, and 24-word recovery phrases with live on-chain balance scanning before setup. Send, receive, swap, sweep mobile or browser wallets, and manage Monero (XMR) keys behind local AES-256-GCM encryption.
                 </p>
               </div>
 
               <div className="space-y-4">
-                <div className="flex flex-wrap items-center gap-4">
+                <div className="flex flex-wrap items-center gap-3 sm:gap-4">
                   <button
                     type="button"
                     onClick={() => onOpenAuth('signup')}
-                    className="inline-flex items-center gap-2 px-6 py-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-sm transition-colors whitespace-nowrap"
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-6 py-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-sm transition-colors whitespace-nowrap"
                   >
                     <span>Create Vault Account</span>
                     <ArrowRight className="w-4 h-4" />
                   </button>
                   <button
                     type="button"
-                    onClick={() => onOpenAuth('signin')}
-                    className="px-4 py-3 text-sm font-medium text-[#CBD5E1] hover:text-[#F4F6F9] underline-offset-4 hover:underline transition-colors whitespace-nowrap"
+                    onClick={() => onOpenAuth('wallet')}
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-5 py-3 rounded-lg bg-[#11151C] hover:bg-[#171D28] border border-white/15 text-[#F4F6F9] font-medium text-sm transition-colors whitespace-nowrap"
                   >
-                    Sign in to existing vault
+                    <Link2 className="w-4 h-4 text-emerald-400" />
+                    <span>Connect Wallet</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onOpenAuth('signin')}
+                    className="w-full sm:w-auto px-3 py-3 text-sm font-medium text-[#CBD5E1] hover:text-[#F4F6F9] underline-offset-4 hover:underline transition-colors whitespace-nowrap text-center"
+                  >
+                    Sign in
                   </button>
                 </div>
                 <p className="text-xs text-[#64748B]">
@@ -129,7 +137,7 @@ export function LandingPage({ markets, onOpenAuth }: LandingPageProps) {
             </div>
 
             <div className="lg:col-span-6">
-              <div className="relative h-72 sm:h-88 lg:h-full min-h-[340px] rounded-xl overflow-hidden border border-white/10 bg-[#11151C]">
+              <div className="relative h-64 sm:h-88 lg:h-full min-h-[240px] sm:min-h-[340px] rounded-xl overflow-hidden border border-white/10 bg-[#11151C]">
                 {!heroImgFailed ? (
                   <img
                     src="/src/assets/images/landing_hero_vault_1794858384339.jpg"

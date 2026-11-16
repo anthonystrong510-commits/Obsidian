@@ -6,6 +6,7 @@ import type {
   TokenConfig,
   UnlockedSecrets,
   WalletAccount,
+  WalletAuthSession,
   WalletTransaction,
 } from '../types/wallet';
 
@@ -35,8 +36,8 @@ function readScopedRaw(baseKey: string): string | null {
   const sKey = scopedKey(baseKey);
   const val = localStorage.getItem(sKey);
   if (val !== null) return val;
-  if (currentUserScope) {
-    // One-time seamless fallback for legacy unscoped single-user data
+  if (currentUserScope && !currentUserScope.startsWith('walletauth_')) {
+    // One-time seamless fallback for legacy unscoped single-user data (never cross-contaminate walletauth scopes)
     return localStorage.getItem(baseKey);
   }
   return null;
@@ -331,3 +332,30 @@ export function clearAllVaultData(): void {
   Object.values(LEGACY_KEYS).forEach((k) => removeScopedRaw(k));
   clearSessionUnlockToken(currentUserScope);
 }
+
+const WALLET_AUTH_SESSION_KEY = 'obsidian_wallet_auth_session_v1';
+
+export function loadWalletAuthSession(): WalletAuthSession | null {
+  try {
+    const raw = localStorage.getItem(WALLET_AUTH_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as WalletAuthSession;
+    if (!parsed?.id || !parsed?.address || !parsed?.kind) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function saveWalletAuthSession(session: WalletAuthSession | null): void {
+  if (!session) {
+    localStorage.removeItem(WALLET_AUTH_SESSION_KEY);
+    return;
+  }
+  localStorage.setItem(WALLET_AUTH_SESSION_KEY, JSON.stringify(session));
+}
+
+export function clearWalletAuthSession(): void {
+  localStorage.removeItem(WALLET_AUTH_SESSION_KEY);
+}
+

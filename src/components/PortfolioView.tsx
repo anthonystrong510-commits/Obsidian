@@ -192,25 +192,25 @@ export function PortfolioView({
   return (
     <div className="space-y-8">
       {/* Top Hero Row: Balance Summary + Historical Chart */}
-      <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-stretch">
-        <div className="xl:col-span-5 bg-[#11151C] border border-white/10 rounded-xl p-6 flex flex-col justify-between gap-6">
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 sm:gap-6 items-stretch">
+        <div className="xl:col-span-5 bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-6 flex flex-col justify-between gap-5 sm:gap-6 min-w-0">
           <div className="space-y-2">
             <div className="flex items-center justify-between gap-2 text-xs text-[#8A94A6]">
-              <span>
+              <span className="truncate">
                 {wallet.name} · {wallet.type === 'watchOnly' ? 'Watch-Only' : `${wallet.wordCount || 'Key'} Vault`}
               </span>
               <button
                 type="button"
                 onClick={onRefresh}
                 disabled={loadingPortfolio}
-                className="inline-flex items-center gap-1.5 text-xs text-[#8A94A6] hover:text-[#F4F6F9] transition-colors"
+                className="inline-flex items-center gap-1.5 text-xs text-[#8A94A6] hover:text-[#F4F6F9] transition-colors shrink-0 whitespace-nowrap"
               >
                 <RefreshCw className={`w-3.5 h-3.5 ${loadingPortfolio ? 'animate-spin' : ''}`} />
-                <span>{loadingPortfolio ? 'Syncing RPC...' : 'Sync Chains'}</span>
+                <span>{loadingPortfolio ? 'Syncing...' : 'Sync Chains'}</span>
               </button>
             </div>
 
-            <div className="text-4xl font-display font-bold tracking-tight text-[#F4F6F9] tabular-nums">
+            <div className="text-3xl sm:text-4xl font-display font-bold tracking-tight text-[#F4F6F9] tabular-nums break-words">
               {formatFiat(totalUsd, currency)}
             </div>
 
@@ -499,7 +499,7 @@ export function PortfolioView({
                   ))}
                 </select>
               </div>
-              <div className="flex-1 min-w-[240px]">
+              <div className="w-full sm:flex-1 sm:min-w-[240px]">
                 <label className="block text-[11px] text-[#8A94A6] mb-1">
                   ERC-20 Contract Address
                 </label>
@@ -508,7 +508,7 @@ export function PortfolioView({
                   value={customAddress}
                   onChange={(e) => setCustomAddress(e.target.value)}
                   placeholder="0x..."
-                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-1.5 font-mono text-xs text-[#F4F6F9]"
+                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
                 />
               </div>
               <button
@@ -648,12 +648,12 @@ export function PortfolioView({
               return (
                 <div
                   key={`${tx.hash}-${tx.timestamp}`}
-                  className="px-5 py-3 flex flex-wrap items-center justify-between gap-3 text-xs hover:bg-white/[0.02]"
+                  className="px-4 sm:px-5 py-3 flex flex-wrap items-center justify-between gap-3 text-xs hover:bg-white/[0.02]"
                 >
-                  <div className="flex items-center gap-3 min-w-0">
+                  <div className="flex items-center gap-3 min-w-0 flex-1">
                     <NetworkIcon networkId={tx.networkId} size={26} />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                         <span className="font-medium capitalize text-[#F4F6F9]">
                           {tx.type} {tx.symbol}
                         </span>
@@ -672,7 +672,7 @@ export function PortfolioView({
                           {tx.status === 'signed-sandbox' ? 'Signed (Sandbox)' : tx.status}
                         </span>
                       </div>
-                      <div className="font-mono text-[11px] text-[#64748B] truncate max-w-md mt-0.5">
+                      <div className="font-mono text-[11px] text-[#64748B] truncate mt-0.5">
                         {tx.hash}
                       </div>
                     </div>

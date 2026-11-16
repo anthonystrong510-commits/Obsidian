@@ -525,25 +525,38 @@ export function WalletOnboarding({
   const content = (
     <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden w-full max-w-5xl mx-auto">
       {/* Header */}
-      <div className="px-6 py-5 border-b border-white/10 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-            <Wallet className="w-4 h-4" />
+      <div className="px-4 sm:px-6 py-4 sm:py-5 border-b border-white/10 flex flex-col sm:flex-row sm:flex-wrap sm:items-center justify-between gap-3 sm:gap-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400 shrink-0">
+              <Wallet className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <h2 className="text-base sm:text-lg font-semibold text-[#F4F6F9] truncate">
+                {mode === 'fullPage' ? 'Initialize Obsidian Vault' : 'Add or Import Wallet'}
+              </h2>
+              <p className="text-xs text-[#8A94A6] truncate">
+                <span>Non-custodial multi-chain derivation</span>
+                <span className="mx-1.5 text-white/20">·</span>
+                <span>EVM, Solana, Bitcoin & Monero</span>
+              </p>
+            </div>
           </div>
-          <div>
-            <h2 className="text-lg font-semibold text-[#F4F6F9]">
-              {mode === 'fullPage' ? 'Initialize Obsidian Vault' : 'Add or Import Wallet'}
-            </h2>
-            <p className="text-xs text-[#8A94A6]">
-              <span>Non-custodial multi-chain derivation</span>
-              <span className="mx-1.5 text-white/20">·</span>
-              <span>EVM, Solana, Bitcoin & Monero</span>
-            </p>
-          </div>
+
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="sm:hidden p-2 rounded-lg text-[#8A94A6] hover:text-[#F4F6F9] hover:bg-white/5 shrink-0"
+              aria-label="Close modal"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
         </div>
 
-        <div className="flex items-center gap-2">
-          <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg overflow-x-auto">
+        <div className="flex items-center gap-2 min-w-0 max-w-full">
+          <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg overflow-x-auto max-w-full">
             {(
               [
                 { id: 'create', label: 'Create New' },
@@ -574,7 +587,7 @@ export function WalletOnboarding({
             <button
               type="button"
               onClick={onClose}
-              className="p-2 rounded-lg text-[#8A94A6] hover:text-[#F4F6F9] hover:bg-white/5"
+              className="hidden sm:inline-flex p-2 rounded-lg text-[#8A94A6] hover:text-[#F4F6F9] hover:bg-white/5 shrink-0"
               aria-label="Close modal"
             >
               <X className="w-4 h-4" />
@@ -586,7 +599,7 @@ export function WalletOnboarding({
       {/* Body */}
       <div className="grid grid-cols-1 lg:grid-cols-12 items-stretch">
         {/* Left / Main Interactive Panel */}
-        <div className="lg:col-span-8 p-6 space-y-6">
+        <div className="lg:col-span-8 p-4 sm:p-6 space-y-6 min-w-0">
           {tab === 'create' && (
             <div className="space-y-5">
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1480,14 +1493,14 @@ export function WalletOnboarding({
 
   if (mode === 'modal') {
     return (
-      <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-        <div className="w-full max-w-5xl my-8">{content}</div>
+      <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-start sm:items-center justify-center p-3 sm:p-4 overflow-y-auto">
+        <div className="w-full max-w-5xl my-2 sm:my-8">{content}</div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex items-center justify-center p-4 sm:p-8">
+    <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex items-center justify-center p-3 sm:p-8">
       {content}
     </div>
   );

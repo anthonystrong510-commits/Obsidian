@@ -262,3 +262,16 @@ export interface WalletCatalogEntry {
   updatedAt: number;
 }
 
+export interface WalletAuthSession {
+  id: string;
+  address: string;
+  kind: 'evm' | 'solana';
+  walletName: string;
+  providerUuid?: string;
+  rdns?: string;
+  icon?: string;
+  chainId?: number;
+  platform: 'desktop' | 'mobile';
+  authSignature?: string;
+  pairedAt: number;
+}

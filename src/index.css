@@ -13,6 +13,40 @@
     background-color: #090b0f;
     color: #f4f6f9;
     color-scheme: dark;
+    overflow-x: clip;
+    max-width: 100%;
+    overscroll-behavior-x: none;
+    touch-action: manipulation;
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body,
+  #root {
+    overflow-x: clip;
+    max-width: 100%;
+    min-height: 100dvh;
+    touch-action: manipulation;
+  }
+
+  button,
+  a,
+  label,
+  [role="button"] {
+    touch-action: manipulation;
+  }
+
+  /* Prevent iOS Safari / Android mobile browsers from zooming in on <16px form fields */
+  @media (max-width: 767px) {
+    input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+    select,
+    textarea {
+      font-size: 16px !important;
+    }
+  }
+
+  .pb-safe {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
 
   h1, h2, h3, .font-display {

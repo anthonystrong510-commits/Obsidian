@@ -177,7 +177,7 @@ export function SecurityView({
     <div className="space-y-8">
       {/* Stored Wallets & HD Derivation */}
       <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
-        <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+        <div className="px-4 sm:px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-semibold text-[#F4F6F9]">
               Stored Wallets & HD Sub-Accounts
@@ -186,7 +186,7 @@ export function SecurityView({
               Switch between vaults, derive additional BIP-44 accounts, or import another seed phrase
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {activeWallet.type === 'mnemonic' && (
               <button
                 type="button"
@@ -222,7 +222,7 @@ export function SecurityView({
             return (
               <div
                 key={w.id}
-                className="px-6 py-4 flex flex-wrap items-center justify-between gap-4 hover:bg-white/[0.02]"
+                className="px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4 hover:bg-white/[0.02]"
               >
                 <div className="space-y-1">
                   <div className="flex items-center gap-2.5">
@@ -286,12 +286,12 @@ export function SecurityView({
       </div>
 
       {/* Private Keys & Recovery Phrase Inspector */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-        <div className="lg:col-span-8 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-5">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6">
+        <div className="lg:col-span-8 bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-6 space-y-5 min-w-0">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <Shield className="w-4 h-4 text-emerald-400" />
-              <h3 className="text-sm font-semibold text-[#F4F6F9]">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <Shield className="w-4 h-4 text-emerald-400 shrink-0" />
+              <h3 className="text-sm font-semibold text-[#F4F6F9] truncate">
                 Private Keys & Recovery Phrase Inspector ({activeWallet.name})
               </h3>
             </div>
@@ -326,12 +326,12 @@ export function SecurityView({
                     if (e.key === 'Enter') handleRevealKeys();
                   }}
                   placeholder="Enter Vault Password"
-                  className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9] w-64 focus:outline-none focus:border-emerald-500/60"
+                  className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9] w-full sm:w-64 focus:outline-none focus:border-emerald-500/60"
                 />
                 <button
                   type="button"
                   onClick={handleRevealKeys}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-xs font-semibold text-[#090B0F]"
+                  className="w-full sm:w-auto inline-flex items-center justify-center gap-1.5 px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-xs font-semibold text-[#090B0F]"
                 >
                   <Eye className="w-3.5 h-3.5" />
                   <span>Unlock & View Private Keys</span>

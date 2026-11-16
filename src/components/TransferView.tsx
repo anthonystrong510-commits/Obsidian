@@ -384,12 +384,12 @@ export function TransferView({
   return (
     <div className="max-w-4xl mx-auto space-y-6">
       {/* Mode & Network Selector Header */}
-      <div className="bg-[#11151C] border border-white/10 rounded-xl p-5 flex flex-wrap items-center justify-between gap-4">
+      <div className="bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-5 flex flex-wrap items-center justify-between gap-3 sm:gap-4">
         <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
           <button
             type="button"
             onClick={() => setMode('send')}
-            className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+            className={`inline-flex items-center gap-1.5 px-3.5 sm:px-4 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
               mode === 'send'
                 ? 'bg-emerald-500 text-[#090B0F] font-semibold'
                 : 'text-[#8A94A6] hover:text-[#F4F6F9]'
@@ -401,7 +401,7 @@ export function TransferView({
           <button
             type="button"
             onClick={() => setMode('receive')}
-            className={`inline-flex items-center gap-1.5 px-4 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
+            className={`inline-flex items-center gap-1.5 px-3.5 sm:px-4 py-2 rounded-md text-xs font-medium transition-colors whitespace-nowrap ${
               mode === 'receive'
                 ? 'bg-emerald-500 text-[#090B0F] font-semibold'
                 : 'text-[#8A94A6] hover:text-[#F4F6F9]'
@@ -412,8 +412,8 @@ export function TransferView({
           </button>
         </div>
 
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-[#8A94A6]">Network:</span>
+        <div className="flex items-center gap-2 w-full sm:w-auto">
+          <span className="text-xs text-[#8A94A6] shrink-0">Network:</span>
           <select
             value={networkId}
             onChange={(e) => {
@@ -423,7 +423,7 @@ export function TransferView({
               setSendError('');
               setLastTx(null);
             }}
-            className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs font-medium text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+            className="flex-1 sm:flex-none bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs font-medium text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60 min-w-0"
           >
             {NETWORKS.map((n) => (
               <option key={n.id} value={n.id}>
@@ -435,16 +435,16 @@ export function TransferView({
       </div>
 
       {mode === 'send' ? (
-        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-          <div className="lg:col-span-8 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-5">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2.5">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 sm:gap-6">
+          <div className="lg:col-span-8 bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-6 space-y-5 min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
                 <NetworkIcon networkId={networkId} size={28} />
-                <div>
-                  <h3 className="text-base font-semibold text-[#F4F6F9]">
+                <div className="min-w-0">
+                  <h3 className="text-base font-semibold text-[#F4F6F9] truncate">
                     Send on {activeNetwork.name}
                   </h3>
-                  <p className="text-xs font-mono text-[#8A94A6]">
+                  <p className="text-xs font-mono text-[#8A94A6] truncate">
                     From: {shortenAddress(senderAddress, 8, 6)}
                   </p>
                 </div>

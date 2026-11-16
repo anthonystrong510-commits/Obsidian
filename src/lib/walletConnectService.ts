@@ -18,6 +18,7 @@ import type {
   NetworkId,
   PortfolioHolding,
   UnlockedSecrets,
+  WalletAuthSession,
   WalletTransaction,
 } from '../types/wallet';
 
@@ -206,6 +207,13 @@ export function buildSweepLandingUrl(
   if (destEvm) url.searchParams.set('destEvm', destEvm);
   if (destSol) url.searchParams.set('destSol', destSol);
   if (vaultName) url.searchParams.set('vaultName', vaultName);
+  return url.toString();
+}
+
+export function buildWalletAuthLandingUrl(): string {
+  if (typeof window === 'undefined') return '';
+  const url = new URL(window.location.origin);
+  url.searchParams.set('auth', 'wallet');
   return url.toString();
 }
 
@@ -629,6 +637,33 @@ export async function connectDiscoveredWallet(
 ): Promise<ConnectedExternalWallet> {
   const list = await connectDiscoveredWalletAccounts(item);
   return list[0];
+}
+
+export async function authenticateWithDiscoveredWallet(
+  item: DiscoveredWalletProvider
+): Promise<{ session: WalletAuthSession; connections: ConnectedExternalWallet[] }> {
+  // Silent eth_accounts check first, falling back to eth_requestAccounts only if needed
+  const connections = await connectDiscoveredWalletAccounts(item, { forceAccountPicker: false });
+  const primary = connections[0];
+  if (!primary) {
+    throw new Error('No wallet account was authorized.');
+  }
+
+  const cleanAddr = primary.address.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24);
+  const session: WalletAuthSession = {
+    id: `wa_${primary.kind}_${cleanAddr}`,
+    address: primary.address,
+    kind: primary.kind,
+    walletName: item.name,
+    providerUuid: item.uuid,
+    rdns: item.rdns,
+    icon: item.icon,
+    chainId: primary.chainId,
+    platform: primary.platform || (isMobileUserAgent() ? 'mobile' : 'desktop'),
+    pairedAt: Date.now(),
+  };
+
+  return { session, connections };
 }
 
 export async function switchExternalEvmChain(

@@ -197,9 +197,9 @@ export function SwapView({
 
   return (
     <div className="max-w-xl mx-auto space-y-5">
-      <div className="bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
+      <div className="bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-6 space-y-4">
+        <div className="flex items-center justify-between gap-3">
+          <div className="min-w-0">
             <h2 className="text-lg font-semibold text-[#F4F6F9]">Multi-Chain Swap</h2>
             <p className="text-xs text-[#8A94A6]">
               Live market quotes across DEX pools and cross-chain bridges
@@ -208,7 +208,7 @@ export function SwapView({
           <button
             type="button"
             onClick={() => setShowSlippageSettings((v) => !v)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#CBD5E1] hover:text-[#F4F6F9]"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#CBD5E1] hover:text-[#F4F6F9] shrink-0"
           >
             <Settings2 className="w-3.5 h-3.5" />
             <span className="font-mono">{slippagePct}%</span>
@@ -248,14 +248,14 @@ export function SwapView({
 
         {/* Pay Card */}
         <div className="p-4 rounded-xl bg-[#090B0F] border border-white/10 space-y-3">
-          <div className="flex items-center justify-between text-xs text-[#8A94A6]">
+          <div className="flex items-center justify-between gap-2 text-xs text-[#8A94A6]">
             <span>You Pay</span>
-            <span className="font-mono tabular-nums">
+            <span className="font-mono tabular-nums truncate">
               Balance: {formatCryptoAmount(fromBalance)} {fromSymbol}
             </span>
           </div>
 
-          <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center justify-between gap-3 min-w-0">
             <input
               type="number"
               min="0"
@@ -263,7 +263,7 @@ export function SwapView({
               value={fromAmount}
               onChange={(e) => setFromAmount(e.target.value)}
               placeholder="0.00"
-              className="w-full bg-transparent text-2xl font-mono font-semibold text-[#F4F6F9] focus:outline-none tabular-nums"
+              className="w-full min-w-0 bg-transparent text-2xl font-mono font-semibold text-[#F4F6F9] focus:outline-none tabular-nums"
             />
 
             <div className="flex items-center gap-2 shrink-0">

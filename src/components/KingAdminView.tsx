@@ -714,16 +714,17 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       </aside>
 
       {/* Main Workspace Column */}
-      <div className="flex-1 flex flex-col min-w-0">
+      <div className="flex-1 flex flex-col min-w-0 max-w-full overflow-x-clip">
         {/* Clean Contextual Top Bar */}
-        <header className="h-16 px-6 border-b border-white/10 bg-[#0D1017] flex items-center justify-between gap-6 shrink-0">
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="lg:hidden font-display font-bold text-base text-[#F4F6F9] whitespace-nowrap">
+        <header className="h-14 sm:h-16 px-4 sm:px-6 border-b border-white/10 bg-[#0D1017] flex items-center justify-between gap-3 sm:gap-6 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            <span className="lg:hidden font-display font-bold text-sm sm:text-base text-[#F4F6F9] whitespace-nowrap">
               KingAdmin
             </span>
             <span className="lg:hidden text-white/20">/</span>
-            <h1 className="text-sm font-medium text-[#CBD5E1] truncate">
-              KingAdmin / {activeAdminSectionLabel}
+            <h1 className="text-xs sm:text-sm font-medium text-[#CBD5E1] truncate">
+              <span className="hidden lg:inline">KingAdmin / </span>
+              {activeAdminSectionLabel}
             </h1>
           </div>
 
@@ -764,7 +765,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           ))}
         </div>
 
-        <main className="flex-1 p-6 sm:p-8 max-w-[1360px] w-full mx-auto space-y-6">
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1360px] w-full mx-auto space-y-6 min-w-0">
         {dataError && (
           <div className="p-3.5 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">
             {dataError}

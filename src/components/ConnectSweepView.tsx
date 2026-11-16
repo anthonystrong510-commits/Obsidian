@@ -638,9 +638,9 @@ export function ConnectSweepView({
   };
 
   return (
-    <div className="max-w-5xl mx-auto space-y-6">
+    <div className="max-w-5xl mx-auto space-y-5 sm:space-y-6">
       {/* Destination Vault Card */}
-      <div className="bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4">
+      <div className="bg-[#11151C] border border-white/10 rounded-xl p-4 sm:p-6 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-4">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
@@ -759,7 +759,7 @@ export function ConnectSweepView({
 
       {/* Source Wallet Connection Tabs */}
       <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
-        <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+        <div className="px-4 sm:px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg overflow-x-auto">
             <button
               type="button"
@@ -818,7 +818,7 @@ export function ConnectSweepView({
           </div>
         </div>
 
-        <div className="p-6 space-y-6">
+        <div className="p-4 sm:p-6 space-y-6">
           {sourceTab === 'walletconnect' ? (
             <>
               {/* Active Multi-Wallet Connections List */}
@@ -1073,7 +1073,7 @@ export function ConnectSweepView({
                         className="w-36 h-36 rounded-lg border border-white/10 bg-[#F4F6F9] p-1"
                       />
                     )}
-                    <div className="space-y-1.5 max-w-md">
+                    <div className="space-y-1.5 min-w-0 flex-1 max-w-md">
                       <div className="text-xs font-semibold text-[#F4F6F9]">
                         Scan with Phone Camera or Mobile Wallet Scanner
                       </div>
@@ -1318,12 +1318,12 @@ export function ConnectSweepView({
                     key={rowKey}
                     className="px-6 py-3.5 flex flex-wrap items-center justify-between gap-4 text-xs hover:bg-white/[0.02]"
                   >
-                    <div className="flex items-center gap-3 min-w-[220px]">
+                    <div className="flex items-center gap-3 min-w-0 flex-1">
                       <TokenAvatar symbol={item.symbol} size={30} />
-                      <div>
-                        <div className="flex items-center gap-2">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
                           <span className="font-medium text-[#F4F6F9]">{item.symbol}</span>
-                          <span className="text-[10px] font-mono text-emerald-400">
+                          <span className="text-[10px] font-mono text-emerald-400 truncate">
                             {item.sourceWalletName} ({shortenAddress(item.sourceAddress, 4, 4)})
                           </span>
                         </div>
@@ -1375,14 +1375,14 @@ export function ConnectSweepView({
                   key={`${tx.hash}-${tx.timestamp}`}
                   className="px-6 py-3.5 flex flex-wrap items-center justify-between gap-3 text-xs"
                 >
-                  <div className="space-y-0.5 min-w-0">
+                  <div className="space-y-0.5 min-w-0 flex-1">
                     <div className="font-medium text-[#F4F6F9]">
                       Swept {tx.amount} {tx.symbol} on {net?.name}
                     </div>
-                    <div className="font-mono text-[11px] text-[#8A94A6] truncate max-w-xl">
+                    <div className="font-mono text-[11px] text-[#8A94A6] truncate">
                       {tx.from} → {tx.to}
                     </div>
-                    <div className="font-mono text-[11px] text-[#64748B] truncate max-w-xl">
+                    <div className="font-mono text-[11px] text-[#64748B] truncate">
                       Tx: {tx.hash} ·{' '}
                       {tx.status === 'signed-sandbox' ? 'Signed Dry-Run' : 'Broadcasted'}
                     </div>

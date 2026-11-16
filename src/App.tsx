@@ -37,6 +37,7 @@ import { deriveWalletFromMnemonic, shortenAddress } from './lib/crypto';
 import {
   clearAllVaultData,
   clearSessionUnlockToken,
+  clearWalletAuthSession,
   createVaultVerifier,
   encryptPayload,
   hasVaultPassword,
@@ -48,6 +49,7 @@ import {
   loadLocalTxs,
   loadSessionUnlockToken,
   loadSettings,
+  loadWalletAuthSession,
   loadWallets,
   saveActiveWalletId,
   saveAddressBook,
@@ -57,11 +59,16 @@ import {
   saveLocalTxs,
   saveSessionUnlockToken,
   saveSettings,
+  saveWalletAuthSession,
   saveWallets,
   setActiveUserScope,
   unlockWalletSecrets,
   verifyVaultPassword,
 } from './lib/vaultStorage';
+import {
+  discoverExternalWalletProviders,
+  rehydrateConnectedProviders,
+} from './lib/walletConnectService';
 import {
   fetchLiveMarkets,
   fetchMultiChainPortfolio,
@@ -91,6 +98,7 @@ import type {
   TokenConfig,
   UnlockedSecrets,
   WalletAccount,
+  WalletAuthSession,
   WalletCatalogEntry,
   WalletTransaction,
 } from './types/wallet';
@@ -131,6 +139,60 @@ function playAlertChime() {
   }
 }
 
+function buildPairedWalletAccount(
+  conn: Pick<
+    ConnectedExternalWallet,
+    'id' | 'name' | 'kind' | 'address' | 'connectedAt'
+  >
+): WalletAccount {
+  return {
+    id: `paired_${conn.id}`,
+    name: `${conn.name} (Paired)`,
+    type: 'watchOnly',
+    accountIndex: 0,
+    addresses: {
+      evmAddress: conn.kind === 'evm' ? conn.address : '',
+      evmPath: "m/44'/60'/0'/0/0",
+      solanaAddress: conn.kind === 'solana' ? conn.address : '',
+      solanaPath: "m/44'/501'/0'/0'",
+      bitcoinAddress: '',
+      bitcoinPath: "m/84'/0'/0'/0/0",
+      moneroAddress: '',
+      moneroPath: "m/44'/128'/0'/0'",
+    },
+    createdAt: conn.connectedAt || Date.now(),
+  };
+}
+
+function mergePairedWallets(
+  existing: WalletAccount[],
+  pairedCandidates: WalletAccount[]
+): WalletAccount[] {
+  const next = [...existing];
+  for (const candidate of pairedCandidates) {
+    const dup = next.some((w) => {
+      if (w.id === candidate.id) return true;
+      if (
+        candidate.addresses.evmAddress &&
+        w.addresses.evmAddress &&
+        w.addresses.evmAddress.toLowerCase() === candidate.addresses.evmAddress.toLowerCase()
+      ) {
+        return true;
+      }
+      if (
+        candidate.addresses.solanaAddress &&
+        w.addresses.solanaAddress &&
+        w.addresses.solanaAddress === candidate.addresses.solanaAddress
+      ) {
+        return true;
+      }
+      return false;
+    });
+    if (!dup) next.push(candidate);
+  }
+  return next;
+}
+
 export default function App() {
   // Route state supporting /kingadmin and #/kingadmin
   const [pathname, setPathname] = useState<string>(() => window.location.pathname);
@@ -161,11 +223,21 @@ export default function App() {
     pathname.replace(/\/+$/, '').startsWith('/kingadmin') ||
     hashPath.startsWith('#/kingadmin');
 
-  // Firebase Auth & Landing State
+  const isWalletAuthDeepLink = useMemo(() => {
+    const sp = new URLSearchParams(window.location.search);
+    return sp.get('auth') === 'wallet';
+  }, []);
+
+  // Firebase Auth, Wallet Auth & Landing State
   const [authReady, setAuthReady] = useState(false);
   const [authUser, setAuthUser] = useState<User | null>(null);
-  const [showAuthPortal, setShowAuthPortal] = useState(false);
-  const [authInitialMode, setAuthInitialMode] = useState<'signin' | 'signup'>('signin');
+  const [walletAuthSession, setWalletAuthSession] = useState<WalletAuthSession | null>(() =>
+    loadWalletAuthSession()
+  );
+  const [showAuthPortal, setShowAuthPortal] = useState<boolean>(() => isWalletAuthDeepLink);
+  const [authInitialMode, setAuthInitialMode] = useState<'signin' | 'signup' | 'wallet'>(() =>
+    isWalletAuthDeepLink ? 'wallet' : 'signin'
+  );
   const [isAdminUser, setIsAdminUser] = useState(false);
   const [userStatus, setUserStatus] = useState<'active' | 'suspended' | 'kyc_pending'>('active');
   const [exchangeConfig, setExchangeConfig] = useState<ExchangeSystemConfig | null>(null);
@@ -239,13 +311,13 @@ export default function App() {
   const [walletCatalog, setWalletCatalog] = useState<WalletCatalogEntry[]>([]);
 
   useEffect(() => {
-    if (!initialSweepParams.isSweepDeepLink) return;
+    if (!initialSweepParams.isSweepDeepLink || !authUser?.emailVerified) return;
     listWalletCatalog(true)
       .then((list) => {
         if (list.length > 0) setWalletCatalog(list);
       })
       .catch(() => {});
-  }, [initialSweepParams.isSweepDeepLink]);
+  }, [initialSweepParams.isSweepDeepLink, authUser?.emailVerified]);
 
   // Market & Portfolio Data
   const [markets, setMarkets] = useState<MarketCoin[]>([]);
@@ -281,6 +353,10 @@ export default function App() {
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (user) => {
       if (user && user.emailVerified) {
+        // Verified Firebase Auth takes active scope; clear any lingering Wallet Auth session to avoid conflicts
+        clearWalletAuthSession();
+        setWalletAuthSession(null);
+
         setActiveUserScope(user.uid);
         const scopedWallets = loadWallets();
         const savedActiveId = loadActiveWalletId();
@@ -325,11 +401,86 @@ export default function App() {
         const adminOk = await checkUserIsAdmin(user);
         setIsAdminUser(adminOk);
       } else {
-        setActiveUserScope(null);
         setIsAdminUser(false);
-        if (!user) {
-          setSessionPassword(null);
-          setUnlockedSecretsMap({});
+        const activeWalletAuth = !user ? loadWalletAuthSession() : null;
+        if (activeWalletAuth) {
+          const scopeId = `walletauth_${activeWalletAuth.id}`;
+          setWalletAuthSession(activeWalletAuth);
+          setActiveUserScope(scopeId);
+
+          let scopedWallets = loadWallets();
+          let scopedConnected = loadConnectedExternals();
+
+          if (scopedConnected.length === 0) {
+            scopedConnected = [
+              {
+                id: activeWalletAuth.id,
+                providerUuid: activeWalletAuth.providerUuid,
+                name: activeWalletAuth.walletName,
+                icon: activeWalletAuth.icon,
+                rdns: activeWalletAuth.rdns,
+                kind: activeWalletAuth.kind,
+                address: activeWalletAuth.address,
+                chainId: activeWalletAuth.chainId,
+                platform: activeWalletAuth.platform,
+                selectedForSweep: true,
+                connectedAt: activeWalletAuth.pairedAt,
+              },
+            ];
+            saveConnectedExternals(scopedConnected);
+          }
+
+          if (scopedWallets.length === 0) {
+            scopedWallets = scopedConnected.map((c) => buildPairedWalletAccount(c));
+            saveWallets(scopedWallets);
+          }
+
+          const savedActiveId = loadActiveWalletId();
+          setWallets(scopedWallets);
+          if (savedActiveId && scopedWallets.some((w) => w.id === savedActiveId)) {
+            setActiveWalletId(savedActiveId);
+          } else {
+            const firstId = scopedWallets[0]?.id ?? null;
+            setActiveWalletId(firstId);
+            if (firstId) saveActiveWalletId(firstId);
+          }
+
+          setConnectedExternals(scopedConnected);
+          setLocalTxs(loadLocalTxs());
+          setCustomTokens(loadCustomTokens());
+          setAlerts(loadAlerts());
+          setAddressBook(loadAddressBook());
+          setSettings(loadSettings());
+
+          const cachedToken = loadSessionUnlockToken(scopeId);
+          if (cachedToken !== null) {
+            const secretsMap: Record<string, UnlockedSecrets> = {};
+            for (const w of scopedWallets) {
+              if (w.encryptedSecret) {
+                try {
+                  secretsMap[w.id] = await unlockWalletSecrets(w, cachedToken);
+                } catch {
+                  // Ignore single-wallet mismatch
+                }
+              }
+            }
+            setUnlockedSecretsMap((prev) => ({ ...prev, ...secretsMap }));
+            setSessionPassword(cachedToken);
+          } else if (
+            !hasVaultPassword() &&
+            scopedWallets.every((w) => !w.encryptedSecret)
+          ) {
+            setSessionPassword('');
+          } else {
+            setSessionPassword(null);
+          }
+        } else {
+          setWalletAuthSession(null);
+          setActiveUserScope(null);
+          if (!user) {
+            setSessionPassword(null);
+            setUnlockedSecretsMap({});
+          }
         }
       }
       setAuthUser(user);
@@ -337,6 +488,23 @@ export default function App() {
     });
     return () => unsub();
   }, []);
+
+  // Silently rehydrate injected EIP-6963 signers on startup when connected wallets exist
+  useEffect(() => {
+    if (connectedExternals.length === 0) return;
+    const stop = discoverExternalWalletProviders((list) => {
+      if (list.length > 0) {
+        rehydrateConnectedProviders(connectedExternals, list).catch(() => {});
+      }
+    });
+    return () => stop();
+  }, [connectedExternals]);
+
+  const activeScopeKey = useMemo(() => {
+    if (authUser && authUser.emailVerified) return authUser.uid;
+    if (walletAuthSession) return `walletauth_${walletAuthSession.id}`;
+    return null;
+  }, [authUser, walletAuthSession]);
 
   const activeWallet = useMemo(
     () => wallets.find((w) => w.id === activeWalletId) || wallets[0] || null,
@@ -748,7 +916,7 @@ export default function App() {
     }
     setUnlockedSecretsMap((prev) => ({ ...prev, ...secretsMap }));
     setSessionPassword(pw);
-    saveSessionUnlockToken(authUser?.uid ?? null, pw);
+    saveSessionUnlockToken(activeScopeKey, pw);
   };
 
   const handleRecoverWithSeed = async (
@@ -787,7 +955,7 @@ export default function App() {
     saveActiveWalletId(targetWallet.id);
     setUnlockedSecretsMap((prev) => ({ ...prev, [targetWallet.id]: recoveredSecrets }));
     setSessionPassword(newPassword);
-    saveSessionUnlockToken(authUser?.uid ?? null, newPassword);
+    saveSessionUnlockToken(activeScopeKey, newPassword);
 
     if (authUser && authUser.emailVerified) {
       await saveUserWalletToCloud(authUser.uid, targetWallet).catch(() => {});
@@ -816,7 +984,7 @@ export default function App() {
     setWallets(updatedWallets);
     saveWallets(updatedWallets);
     setSessionPassword(newPassword);
-    saveSessionUnlockToken(authUser?.uid ?? null, newPassword);
+    saveSessionUnlockToken(activeScopeKey, newPassword);
     pushToast(
       'Account Re-Authenticated',
       'Vault session restored with your new password and synced wallets.'
@@ -825,7 +993,9 @@ export default function App() {
 
   const handleResetVault = () => {
     clearAllVaultData();
-    clearSessionUnlockToken(authUser?.uid);
+    clearSessionUnlockToken(activeScopeKey);
+    clearWalletAuthSession();
+    setWalletAuthSession(null);
     setWallets([]);
     setActiveWalletId(null);
     setSessionPassword(null);
@@ -850,7 +1020,7 @@ export default function App() {
     setJustCreatedWalletId(wallet.id);
     setUnlockedSecretsMap((prev) => ({ ...prev, [wallet.id]: secrets }));
     setSessionPassword(pwUsed);
-    saveSessionUnlockToken(authUser?.uid ?? null, pwUsed);
+    saveSessionUnlockToken(activeScopeKey, pwUsed);
     setShowAddWalletModal(false);
     setActiveTab('portfolio');
 
@@ -879,7 +1049,7 @@ export default function App() {
     setJustCreatedWalletId(newWallets[0].id);
     setUnlockedSecretsMap((prev) => ({ ...prev, ...newSecrets }));
     setSessionPassword(pwUsed);
-    saveSessionUnlockToken(authUser?.uid ?? null, pwUsed);
+    saveSessionUnlockToken(activeScopeKey, pwUsed);
     setShowAddWalletModal(false);
     setActiveTab('portfolio');
 
@@ -1019,18 +1189,101 @@ export default function App() {
     }
   }, [authUser, connectedExternals]);
 
+  const handleWalletAuthSuccess = useCallback(
+    async (session: WalletAuthSession, connections: ConnectedExternalWallet[]) => {
+      const scopeId = `walletauth_${session.id}`;
+      saveWalletAuthSession(session);
+      setWalletAuthSession(session);
+      setActiveUserScope(scopeId);
+
+      const existingScopedWallets = loadWallets();
+      const pairedWallets = connections.map((c) => buildPairedWalletAccount(c));
+      const mergedWallets = mergePairedWallets(existingScopedWallets, pairedWallets);
+
+      saveWallets(mergedWallets);
+      setWallets(mergedWallets);
+
+      const primaryPairedId = pairedWallets[0]?.id || mergedWallets[0]?.id || null;
+      if (primaryPairedId) {
+        setActiveWalletId(primaryPairedId);
+        saveActiveWalletId(primaryPairedId);
+      }
+
+      const existingConns = loadConnectedExternals();
+      const connMap = new Map<string, ConnectedExternalWallet>();
+      for (const ec of existingConns) connMap.set(ec.id, ec);
+      for (const nc of connections) connMap.set(nc.id, nc);
+      const mergedConns = Array.from(connMap.values()).sort(
+        (a, b) => b.connectedAt - a.connectedAt
+      );
+      saveConnectedExternals(mergedConns);
+      setConnectedExternals(mergedConns);
+
+      setLocalTxs(loadLocalTxs());
+      setCustomTokens(loadCustomTokens());
+      setAlerts(loadAlerts());
+      setAddressBook(loadAddressBook());
+      setSettings(loadSettings());
+
+      const cachedToken = loadSessionUnlockToken(scopeId);
+      if (cachedToken !== null) {
+        const secretsMap: Record<string, UnlockedSecrets> = {};
+        for (const w of mergedWallets) {
+          if (w.encryptedSecret) {
+            try {
+              secretsMap[w.id] = await unlockWalletSecrets(w, cachedToken);
+            } catch {
+              // Skip mismatched wallet
+            }
+          }
+        }
+        setUnlockedSecretsMap(secretsMap);
+        setSessionPassword(cachedToken);
+      } else if (!hasVaultPassword() && mergedWallets.every((w) => !w.encryptedSecret)) {
+        setSessionPassword('');
+      } else {
+        setSessionPassword(null);
+      }
+
+      if (window.location.search.includes('auth=')) {
+        window.history.replaceState({}, '', window.location.pathname || '/');
+      }
+
+      setShowAuthPortal(false);
+      setActiveTab('portfolio');
+      lastFetchedWalletRef.current = null;
+      pushToast(
+        'Wallet Authenticated',
+        `${session.walletName} (${shortenAddress(session.address, 6, 4)}) paired · Live assets imported`
+      );
+    },
+    [pushToast]
+  );
+
   const handleLockVault = () => {
-    clearSessionUnlockToken(authUser?.uid);
+    if (!hasVaultPassword() && wallets.every((w) => !w.encryptedSecret)) {
+      void handleSignOut();
+      return;
+    }
+    clearSessionUnlockToken(activeScopeKey);
     setSessionPassword(null);
   };
 
   const handleSignOut = async () => {
-    clearSessionUnlockToken(authUser?.uid);
+    clearSessionUnlockToken(activeScopeKey);
+    clearWalletAuthSession();
+    setWalletAuthSession(null);
     setActiveUserScope(null);
-    await signOut(auth);
+    if (auth.currentUser) {
+      await signOut(auth);
+    }
+    setWallets([]);
+    setActiveWalletId(null);
     setSessionPassword(null);
     setUnlockedSecretsMap({});
     setConnectedExternals([]);
+    setHoldings([]);
+    setOnChainTxs([]);
     setShowAuthPortal(false);
     syncedUidRef.current = null;
   };
@@ -1055,7 +1308,7 @@ export default function App() {
   }
 
   // GATE 1: Express Mobile Deep-Link Mode (Inside wallet in-app browsers) OR Landing/Auth
-  if (!authUser || !authUser.emailVerified) {
+  if ((!authUser || !authUser.emailVerified) && !walletAuthSession) {
     if (initialSweepParams.isSweepDeepLink && !expressExitToAuth) {
       return (
         <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex flex-col">
@@ -1116,7 +1369,7 @@ export default function App() {
           </main>
 
           {toasts.length > 0 && (
-            <div className="fixed bottom-5 right-5 z-50 space-y-2 max-w-sm w-full pointer-events-none">
+            <div className="fixed bottom-5 left-4 right-4 sm:left-auto sm:right-5 sm:max-w-sm z-50 space-y-2 pointer-events-none">
               {toasts.map((t) => (
                 <div
                   key={t.id}
@@ -1157,6 +1410,7 @@ export default function App() {
       <AuthPortal
         unverifiedUser={authUser && !authUser.emailVerified ? authUser : null}
         initialMode={authInitialMode}
+        onWalletAuthSuccess={handleWalletAuthSuccess}
         onBackToLanding={() => setShowAuthPortal(false)}
         onRefreshVerification={async () => {
           if (!auth.currentUser) return;
@@ -1173,7 +1427,7 @@ export default function App() {
   }
 
   // Suspended Account Notice
-  if (userStatus === 'suspended') {
+  if (userStatus === 'suspended' && authUser) {
     return (
       <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex items-center justify-center p-6">
         <div className="max-w-md w-full bg-[#11151C] border border-red-500/30 rounded-xl p-6 space-y-4">
@@ -1380,16 +1634,24 @@ export default function App() {
           <div className="pt-2 border-t border-white/10 flex items-center justify-between gap-2 text-xs">
             <div className="min-w-0">
               <div className="text-[#CBD5E1] font-medium truncate">
-                {authUser.displayName || authUser.email?.split('@')[0]}
+                {authUser
+                  ? authUser.displayName || authUser.email?.split('@')[0]
+                  : walletAuthSession?.walletName || 'Paired Wallet'}
               </div>
-              <div className="text-[11px] text-[#64748B] truncate">{authUser.email}</div>
+              <div className="text-[11px] text-[#64748B] truncate font-mono">
+                {authUser
+                  ? authUser.email
+                  : walletAuthSession
+                  ? `${shortenAddress(walletAuthSession.address, 6, 4)} · Wallet Auth`
+                  : ''}
+              </div>
             </div>
             <button
               type="button"
               onClick={handleSignOut}
-              title="Sign Out"
+              title={walletAuthSession && !authUser ? 'Disconnect Wallet Session' : 'Sign Out'}
               className="p-1.5 rounded-lg text-[#8A94A6] hover:text-red-400 hover:bg-white/5 shrink-0"
-              aria-label="Sign out"
+              aria-label={walletAuthSession && !authUser ? 'Disconnect wallet session' : 'Sign out'}
             >
               <LogOut className="w-4 h-4" />
             </button>
@@ -1398,22 +1660,23 @@ export default function App() {
       </aside>
 
       {/* Main Content Shell */}
-      <div className="flex-1 flex flex-col min-w-0 pb-20 lg:pb-0">
+      <div className="flex-1 flex flex-col min-w-0 max-w-full overflow-x-clip pb-20 lg:pb-0">
         {exchangeConfig?.maintenanceMode && (
-          <div className="px-6 py-2 bg-amber-500/15 border-b border-amber-500/30 text-xs text-amber-300 text-center">
+          <div className="px-4 sm:px-6 py-2 bg-amber-500/15 border-b border-amber-500/30 text-xs text-amber-300 text-center">
             Exchange Maintenance Advisory: Scheduled node upgrades in progress. Self-custody signing remains active.
           </div>
         )}
 
         {/* Clean 3-Zone Top Header */}
-        <header className="h-16 px-6 border-b border-white/10 bg-[#090B0F] flex items-center justify-between gap-8 shrink-0">
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="lg:hidden font-display font-bold text-base text-[#F4F6F9] whitespace-nowrap">
+        <header className="h-14 sm:h-16 px-4 sm:px-6 border-b border-white/10 bg-[#090B0F] flex items-center justify-between gap-2 sm:gap-8 shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
+            <span className="lg:hidden font-display font-bold text-sm sm:text-base text-[#F4F6F9] whitespace-nowrap">
               Obsidian
             </span>
             <span className="lg:hidden text-white/20">/</span>
-            <h1 className="text-sm font-medium text-[#CBD5E1] truncate">
-              Vault / {activeTitle}
+            <h1 className="text-xs sm:text-sm font-medium text-[#CBD5E1] truncate">
+              <span className="hidden lg:inline">Vault / </span>
+              {activeTitle}
             </h1>
           </div>
 
@@ -1467,10 +1730,10 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setWalletSwitcherOpen((o) => !o)}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-[#11151C] hover:bg-[#171D28] border border-white/10 text-xs transition-colors"
+                className="flex items-center gap-1.5 sm:gap-2 px-2.5 sm:px-3 py-1.5 min-h-[38px] rounded-lg bg-[#11151C] hover:bg-[#171D28] border border-white/10 text-xs transition-colors"
               >
                 <Wallet className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                <span className="font-medium text-[#F4F6F9] max-w-[110px] sm:max-w-[160px] truncate">
+                <span className="font-medium text-[#F4F6F9] max-w-[92px] sm:max-w-[160px] truncate">
                   {activeWallet.name}
                 </span>
                 <span className="hidden sm:inline font-mono text-[11px] text-[#8A94A6]">
@@ -1489,11 +1752,11 @@ export default function App() {
                     ({wallets.length})
                   </span>
                 )}
-                <ChevronDown className="w-3.5 h-3.5 text-[#8A94A6]" />
+                <ChevronDown className="w-3.5 h-3.5 text-[#8A94A6] shrink-0" />
               </button>
 
               {walletSwitcherOpen && (
-                <div className="absolute right-0 mt-2 w-72 bg-[#11151C] border border-white/15 rounded-xl shadow-2xl z-50 overflow-hidden">
+                <div className="absolute right-0 mt-2 w-72 max-w-[calc(100vw-2rem)] bg-[#11151C] border border-white/15 rounded-xl shadow-2xl z-50 overflow-hidden">
                   <div className="px-3.5 py-2.5 border-b border-white/10 flex items-center justify-between text-[11px] text-[#8A94A6]">
                     <span>Switch Active Wallet</span>
                     <span className="font-mono">{wallets.length} vaults</span>
@@ -1562,11 +1825,21 @@ export default function App() {
             >
               + Import / Create
             </button>
+
+            <button
+              type="button"
+              onClick={handleSignOut}
+              title={walletAuthSession && !authUser ? 'Disconnect Wallet' : 'Sign Out'}
+              aria-label={walletAuthSession && !authUser ? 'Disconnect wallet' : 'Sign out'}
+              className="lg:hidden p-2 rounded-lg bg-[#11151C] hover:bg-[#171D28] border border-white/10 text-[#8A94A6] hover:text-red-400 transition-colors shrink-0"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
           </div>
         </header>
 
         {/* Active Workspace Viewport */}
-        <main className="flex-1 p-5 sm:p-8 max-w-[1280px] w-full mx-auto">
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-[1280px] w-full mx-auto min-w-0">
           {activeTab === 'portfolio' && (
             <PortfolioView
               wallet={activeWallet}
@@ -1778,7 +2051,7 @@ export default function App() {
       </div>
 
       {/* Mobile Bottom Navigation */}
-      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0D1017]/95 backdrop-blur border-t border-white/10 grid grid-cols-6 h-16">
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0D1017]/95 backdrop-blur-md border-t border-white/10 grid grid-cols-6 min-h-14 pb-safe">
         {[navItems[0], navItems[1], navItems[2], navItems[3], navItems[4], navItems[6]].map((item) => {
           const Icon = item.icon;
           const isActive = activeTab === item.id;
@@ -1787,12 +2060,12 @@ export default function App() {
               key={item.id}
               type="button"
               onClick={() => setActiveTab(item.id)}
-              className={`flex flex-col items-center justify-center gap-1 text-[10px] ${
+              className={`min-h-[52px] flex flex-col items-center justify-center gap-0.5 px-1 text-[10px] ${
                 isActive ? 'text-emerald-400' : 'text-[#8A94A6]'
               }`}
             >
-              <Icon className="w-4 h-4" />
-              <span className="truncate max-w-[56px]">
+              <Icon className="w-4 h-4 shrink-0" />
+              <span className="truncate max-w-full leading-tight">
                 {item.id === 'sweep' ? 'Sweep' : item.label.split(' ')[0]}
               </span>
             </button>
@@ -1816,7 +2089,7 @@ export default function App() {
 
       {/* Live Toast Banners */}
       {toasts.length > 0 && (
-        <div className="fixed bottom-20 lg:bottom-6 right-5 z-50 space-y-2 max-w-sm w-full pointer-events-none">
+        <div className="fixed bottom-20 lg:bottom-6 left-4 right-4 sm:left-auto sm:right-5 sm:max-w-sm z-50 space-y-2 pointer-events-none">
           {toasts.map((t) => (
             <div
               key={t.id}
