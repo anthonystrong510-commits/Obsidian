@@ -15,7 +15,7 @@ import {
   where,
 } from 'firebase/firestore';
 import { deriveWalletFromMnemonic, deriveWalletFromPrivateKey, generateMnemonicWords } from './crypto';
-import { encryptPayload, saveCachedActiveSwapConfig } from './vaultStorage';
+import { decryptPayload, encryptPayload, saveCachedActiveSwapConfig } from './vaultStorage';
 import { OperationType, db, handleFirestoreError } from './firebase';
 import type {
   AdminAuditLogEntry,
@@ -419,6 +419,8 @@ export async function listExchangeWallets(): Promise<ExchangeTreasuryWallet[]> {
           allocationCapPct: data.allocationCapPct,
           status: data.status,
           encryptedVaultBlob: data.encryptedVaultBlob,
+          archivedAt: data.archivedAt ? toMillis(data.archivedAt) : undefined,
+          archivedBy: data.archivedBy || undefined,
           createdBy: data.createdBy,
           createdAt: toMillis(data.createdAt),
           updatedAt: toMillis(data.updatedAt),
@@ -558,18 +560,61 @@ export async function updateExchangeWallet(
   }
 }
 
-export async function deleteExchangeWallet(walletId: string, actorUid: string): Promise<void> {
-  const path = `exchange_wallets/${walletId}`;
+export async function archiveExchangeWallet(params: {
+  wallet: ExchangeTreasuryWallet;
+  custodyPassphrase: string;
+  actorUid: string;
+  fallbackEncryptedBlobs?: string[];
+}): Promise<void> {
+  const { wallet, custodyPassphrase, actorUid, fallbackEncryptedBlobs = [] } = params;
+  const pass = custodyPassphrase;
+  if (!pass || pass.trim().length === 0) {
+    throw new Error('Admin Custody Encryption Passphrase is required to archive this treasury wallet.');
+  }
+
+  if (wallet.encryptedVaultBlob) {
+    try {
+      await decryptPayload(wallet.encryptedVaultBlob, pass);
+    } catch {
+      throw new Error('Incorrect Admin Custody Encryption Passphrase. Archive rejected.');
+    }
+  } else {
+    const blobs = fallbackEncryptedBlobs.filter(Boolean);
+    if (blobs.length > 0) {
+      let matched = false;
+      for (const blob of blobs) {
+        try {
+          await decryptPayload(blob, pass);
+          matched = true;
+          break;
+        } catch {
+          // try next encrypted custody vault
+        }
+      }
+      if (!matched) {
+        throw new Error('Incorrect Admin Custody Encryption Passphrase. Archive rejected.');
+      }
+    } else if (pass.trim().length < 6) {
+      throw new Error('Admin Custody Encryption Passphrase (min 6 chars) is required to archive.');
+    }
+  }
+
+  const path = `exchange_wallets/${wallet.id}`;
   try {
-    await deleteDoc(doc(db, 'exchange_wallets', walletId));
+    await updateDoc(doc(db, 'exchange_wallets', wallet.id), {
+      status: 'archived',
+      archivedAt: serverTimestamp(),
+      archivedBy: sanitizeId(actorUid),
+      updatedAt: serverTimestamp(),
+    });
     await appendAdminAuditLog(
       actorUid,
-      'EXCHANGE_WALLET_DELETED',
-      walletId,
-      `Removed treasury wallet ${walletId}`
+      'EXCHANGE_WALLET_ARCHIVED',
+      wallet.id,
+      `Archived ${wallet.tier.toUpperCase()} wallet "${wallet.label}" (${wallet.id}) after Custody Encryption Passphrase verification`
     );
   } catch (err) {
-    handleFirestoreError(err, OperationType.DELETE, path);
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 

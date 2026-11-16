@@ -9,6 +9,7 @@ import {
 } from 'firebase/auth';
 import {
   Activity,
+  Archive,
   ArrowLeft,
   ArrowLeftRight,
   Banknote,
@@ -42,8 +43,8 @@ import {
   addExistingExchangeWallet,
   adminDisburseClaimInCloud,
   adminProvisionWalletForUser,
+  archiveExchangeWallet,
   checkUserIsAdmin,
-  deleteExchangeWallet,
   deleteWalletCatalogEntry,
   generateAndSaveExchangeWallet,
   getExchangeSystemConfig,
@@ -146,6 +147,14 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   const [attachPassInput, setAttachPassInput] = useState('');
   const [attachSaving, setAttachSaving] = useState(false);
 
+  // Archive-Only Controls (Cold / Pool / Hot cannot be deleted, only archived with Custody Passphrase)
+  const [walletArchiveFilter, setWalletArchiveFilter] = useState<'active' | 'archived' | 'all'>('active');
+  const [archiveOpenMap, setArchiveOpenMap] = useState<Record<string, boolean>>({});
+  const [archivePassInputs, setArchivePassInputs] = useState<Record<string, string>>({});
+  const [showArchivePassMap, setShowArchivePassMap] = useState<Record<string, boolean>>({});
+  const [archiveErrors, setArchiveErrors] = useState<Record<string, string>>({});
+  const [archivingWalletId, setArchivingWalletId] = useState<string | null>(null);
+
   // Active Swap Wallet & Claim Disbursements
   const [claims, setClaims] = useState<ClaimRequestRecord[]>(() => loadClaimLedger());
   const [claimStatusFilter, setClaimStatusFilter] = useState<'all' | 'requested' | 'claimable' | 'disbursed' | 'rejected'>('all');
@@ -243,11 +252,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       saveClaimLedger(mergedClaims);
 
       setDisburseSourceWalletId((prev) => {
-        if (prev && wList.some((w) => w.id === prev)) return prev;
-        if (cfg.activeSwapWalletId && wList.some((w) => w.id === cfg.activeSwapWalletId)) {
+        const eligible = wList.filter((w) => w.status !== 'archived');
+        if (prev && eligible.some((w) => w.id === prev)) return prev;
+        if (cfg.activeSwapWalletId && eligible.some((w) => w.id === cfg.activeSwapWalletId)) {
           return cfg.activeSwapWalletId;
         }
-        return wList.find((w) => w.tier === 'hot' || w.tier === 'pool')?.id || wList[0]?.id || '';
+        return eligible.find((w) => w.tier === 'hot' || w.tier === 'pool')?.id || eligible[0]?.id || '';
       });
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to load admin records.');
@@ -592,8 +602,63 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     }
   };
 
-  const handleSetActiveSwapWallet = async (wallet: ExchangeTreasuryWallet) => {
+  const handleArchiveExchangeWallet = async (wallet: ExchangeTreasuryWallet) => {
     if (!currentUser) return;
+    const pass = archivePassInputs[wallet.id] ?? '';
+    setArchiveErrors((prev) => ({ ...prev, [wallet.id]: '' }));
+    if (!pass) {
+      setArchiveErrors((prev) => ({
+        ...prev,
+        [wallet.id]: 'Enter your Admin Custody Encryption Passphrase to archive this wallet.',
+      }));
+      return;
+    }
+
+    setArchivingWalletId(wallet.id);
+    setDataError('');
+    try {
+      const fallbackBlobs = exchangeWallets
+        .map((w) => w.encryptedVaultBlob)
+        .filter((b): b is string => Boolean(b));
+
+      await archiveExchangeWallet({
+        wallet,
+        custodyPassphrase: pass,
+        actorUid: currentUser.uid,
+        fallbackEncryptedBlobs: fallbackBlobs,
+      });
+
+      if (systemConfig.activeSwapWalletId === wallet.id) {
+        await saveExchangeSystemConfig(
+          {
+            maintenanceMode: systemConfig.maintenanceMode,
+            withdrawalsPaused: systemConfig.withdrawalsPaused,
+            hotWalletMaxPct: systemConfig.hotWalletMaxPct,
+            swapFeeBps: systemConfig.swapFeeBps,
+            updatedBy: currentUser.uid,
+          },
+          currentUser.uid
+        );
+      }
+
+      setArchiveOpenMap((prev) => ({ ...prev, [wallet.id]: false }));
+      setArchivePassInputs((prev) => ({ ...prev, [wallet.id]: '' }));
+      await loadDashboardData();
+    } catch (err) {
+      setArchiveErrors((prev) => ({
+        ...prev,
+        [wallet.id]:
+          err instanceof Error
+            ? err.message
+            : 'Failed to verify Admin Custody Encryption Passphrase.',
+      }));
+    } finally {
+      setArchivingWalletId(null);
+    }
+  };
+
+  const handleSetActiveSwapWallet = async (wallet: ExchangeTreasuryWallet) => {
+    if (!currentUser || wallet.status === 'archived' || wallet.status === 'frozen') return;
     setSavingSwapWallet(true);
     setDataError('');
     try {
@@ -706,13 +771,29 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     );
   }, [users, userSearch]);
 
+  const activeExchangeWallets = useMemo(
+    () => exchangeWallets.filter((w) => w.status !== 'archived'),
+    [exchangeWallets]
+  );
+
+  const archivedExchangeWallets = useMemo(
+    () => exchangeWallets.filter((w) => w.status === 'archived'),
+    [exchangeWallets]
+  );
+
+  const visibleExchangeWallets = useMemo(() => {
+    if (walletArchiveFilter === 'archived') return archivedExchangeWallets;
+    if (walletArchiveFilter === 'all') return exchangeWallets;
+    return activeExchangeWallets;
+  }, [walletArchiveFilter, activeExchangeWallets, archivedExchangeWallets, exchangeWallets]);
+
   const tierCounts = useMemo(() => {
     return {
-      cold: exchangeWallets.filter((w) => w.tier === 'cold').length,
-      pool: exchangeWallets.filter((w) => w.tier === 'pool').length,
-      hot: exchangeWallets.filter((w) => w.tier === 'hot').length,
+      cold: activeExchangeWallets.filter((w) => w.tier === 'cold').length,
+      pool: activeExchangeWallets.filter((w) => w.tier === 'pool').length,
+      hot: activeExchangeWallets.filter((w) => w.tier === 'hot').length,
     };
-  }, [exchangeWallets]);
+  }, [activeExchangeWallets]);
 
   const pendingClaimsCount = useMemo(
     () => claims.filter((c) => c.status === 'requested' || c.status === 'claimable').length,
@@ -906,7 +987,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       groupLabel: 'Custody & Treasury',
       items: [
         { id: 'overview', label: 'Overview', icon: LayoutGrid },
-        { id: 'wallets', label: 'Cold / Pool / Hot', icon: Snowflake, count: exchangeWallets.length },
+        { id: 'wallets', label: 'Cold / Pool / Hot', icon: Snowflake, count: activeExchangeWallets.length },
         { id: 'claims', label: 'Claims & Disbursement', icon: Banknote, count: pendingClaimsCount },
       ],
     },
@@ -1518,15 +1599,53 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 </form>
               )}
 
+              {exchangeWallets.length > 0 && (
+                <div className="bg-[#11151C] border border-white/10 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-1.5 p-1 rounded-lg bg-[#090B0F] border border-white/10">
+                    {(
+                      [
+                        { id: 'active', label: `Active (${activeExchangeWallets.length})` },
+                        { id: 'archived', label: `Archived (${archivedExchangeWallets.length})` },
+                        { id: 'all', label: `All (${exchangeWallets.length})` },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setWalletArchiveFilter(opt.id)}
+                        className={`px-3 py-1.5 rounded text-xs font-medium whitespace-nowrap transition-colors ${
+                          walletArchiveFilter === opt.id
+                            ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                            : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[11px] text-[#8A94A6]">
+                    Archive-Only Protection · Treasury vaults cannot be deleted
+                  </div>
+                </div>
+              )}
+
               {exchangeWallets.length === 0 ? (
                 <div className="bg-[#11151C] border border-white/10 rounded-xl p-12 text-center text-xs text-[#8A94A6]">
                   No exchange custody wallets generated yet. Use the generator to create your Cold, Pool, and Hot wallet architecture.
                 </div>
+              ) : visibleExchangeWallets.length === 0 ? (
+                <div className="bg-[#11151C] border border-white/10 rounded-xl p-10 text-center text-xs text-[#8A94A6]">
+                  {walletArchiveFilter === 'archived'
+                    ? 'No archived Cold Vaults, Pool Wallets, or Hot Wallets.'
+                    : 'No active custody wallets in this view.'}
+                </div>
               ) : (
-                exchangeWallets.map((ew) => {
+                visibleExchangeWallets.map((ew) => {
                   const isActiveSwap = systemConfig.activeSwapWalletId === ew.id;
                   const unlocked = unlockedTreasuryMap[ew.id];
                   const isInspectOpen = Boolean(inspectOpenMap[ew.id]);
+                  const isArchiveOpen = Boolean(archiveOpenMap[ew.id]);
+                  const isArchived = ew.status === 'archived';
                   const tierTitle =
                     ew.tier === 'cold'
                       ? 'Cold Vault'
@@ -1538,7 +1657,11 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     <div
                       key={ew.id}
                       className={`bg-[#11151C] border rounded-xl p-5 space-y-3 ${
-                        isActiveSwap ? 'border-emerald-500/50' : 'border-white/10'
+                        isArchived
+                          ? 'border-white/10 opacity-85'
+                          : isActiveSwap
+                          ? 'border-emerald-500/50'
+                          : 'border-white/10'
                       }`}
                     >
                       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -1566,12 +1689,22 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                                   ? 'text-emerald-400'
                                   : ew.status === 'frozen'
                                   ? 'text-red-400'
+                                  : ew.status === 'archived'
+                                  ? 'text-[#8A94A6] font-semibold'
                                   : 'text-amber-400'
                               }
                             >
                               {ew.status}
                             </span>
-                            {isActiveSwap && (
+                            {isArchived && ew.archivedAt && (
+                              <>
+                                <span className="text-[#64748B]">·</span>
+                                <span className="text-[11px] text-[#64748B]">
+                                  Archived {formatRelativeTime(ew.archivedAt)}
+                                </span>
+                              </>
+                            )}
+                            {isActiveSwap && !isArchived && (
                               <>
                                 <span className="text-[#64748B]">·</span>
                                 <span className="text-emerald-400 font-semibold">
@@ -1587,19 +1720,21 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                         </div>
 
                         <div className="flex flex-wrap items-center gap-1.5">
-                          <button
-                            type="button"
-                            disabled={savingSwapWallet || ew.status === 'frozen' || isActiveSwap}
-                            onClick={() => handleSetActiveSwapWallet(ew)}
-                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] whitespace-nowrap ${
-                              isActiveSwap
-                                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400 font-semibold'
-                                : 'bg-[#090B0F] border-white/10 hover:border-emerald-500/40 text-[#CBD5E1] disabled:opacity-40'
-                            }`}
-                          >
-                            <ArrowLeftRight className="w-3 h-3" />
-                            <span>{isActiveSwap ? 'Active for Swap' : 'Select for Swap'}</span>
-                          </button>
+                          {!isArchived && (
+                            <button
+                              type="button"
+                              disabled={savingSwapWallet || ew.status === 'frozen' || isActiveSwap}
+                              onClick={() => handleSetActiveSwapWallet(ew)}
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] whitespace-nowrap ${
+                                isActiveSwap
+                                  ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400 font-semibold'
+                                  : 'bg-[#090B0F] border-white/10 hover:border-emerald-500/40 text-[#CBD5E1] disabled:opacity-40'
+                              }`}
+                            >
+                              <ArrowLeftRight className="w-3 h-3" />
+                              <span>{isActiveSwap ? 'Active for Swap' : 'Select for Swap'}</span>
+                            </button>
+                          )}
 
                           <button
                             type="button"
@@ -1625,32 +1760,121 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                             </span>
                           </button>
 
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateExchangeWallet(
-                                ew.id,
-                                { status: ew.status === 'frozen' ? 'active' : 'frozen' },
-                                currentUser.uid
-                              ).then(loadDashboardData)
-                            }
-                            className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-amber-400"
-                          >
-                            {ew.status === 'frozen' ? 'Unfreeze' : 'Freeze'}
-                          </button>
+                          {!isArchived && (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  updateExchangeWallet(
+                                    ew.id,
+                                    { status: ew.status === 'frozen' ? 'active' : 'frozen' },
+                                    currentUser.uid
+                                  ).then(loadDashboardData)
+                                }
+                                className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-amber-400 whitespace-nowrap"
+                              >
+                                {ew.status === 'frozen' ? 'Unfreeze' : 'Freeze'}
+                              </button>
 
-                          <button
-                            type="button"
-                            onClick={() =>
-                              deleteExchangeWallet(ew.id, currentUser.uid).then(loadDashboardData)
-                            }
-                            className="p-1.5 rounded bg-[#090B0F] border border-white/10 text-[#8A94A6] hover:text-red-400"
-                            aria-label="Delete exchange wallet"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setArchiveErrors((prev) => ({ ...prev, [ew.id]: '' }));
+                                  setArchiveOpenMap((prev) => ({
+                                    ...prev,
+                                    [ew.id]: !prev[ew.id],
+                                  }));
+                                }}
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] whitespace-nowrap ${
+                                  isArchiveOpen
+                                    ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                                    : 'bg-[#090B0F] border-white/10 text-[#CBD5E1] hover:text-amber-300 hover:border-amber-500/40'
+                                }`}
+                                aria-label={`Archive ${tierTitle}`}
+                              >
+                                <Archive className="w-3 h-3" />
+                                <span>Archive</span>
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
+
+                      {isArchiveOpen && !isArchived && (
+                        <div className="p-4 rounded-lg bg-[#090B0F] border border-amber-500/30 space-y-3 text-xs">
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-1.5 font-semibold text-amber-300">
+                              <Archive className="w-3.5 h-3.5 shrink-0" />
+                              <span>
+                                Archive {tierTitle} · {ew.label}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-[#8A94A6] leading-relaxed">
+                              Cold Vaults, Pool Wallets, and Hot Wallets cannot be permanently deleted. Archiving preserves all addresses, audit history, and encrypted recovery keys while retiring the wallet from swaps and disbursements.
+                            </p>
+                            {isActiveSwap && (
+                              <p className="text-[11px] text-amber-400">
+                                Notice: This wallet is currently the Active Swap Settlement Wallet and will be cleared upon archiving.
+                              </p>
+                            )}
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="relative flex-1 min-w-[220px]">
+                              <input
+                                type={showArchivePassMap[ew.id] ? 'text' : 'password'}
+                                value={archivePassInputs[ew.id] ?? ''}
+                                onChange={(e) =>
+                                  setArchivePassInputs((prev) => ({
+                                    ...prev,
+                                    [ew.id]: e.target.value,
+                                  }))
+                                }
+                                placeholder="Enter Admin Custody Encryption Passphrase"
+                                className="w-full bg-[#11151C] border border-white/10 rounded-lg pl-3 pr-9 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setShowArchivePassMap((prev) => ({
+                                    ...prev,
+                                    [ew.id]: !prev[ew.id],
+                                  }))
+                                }
+                                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#64748B] hover:text-[#F4F6F9]"
+                                aria-label={showArchivePassMap[ew.id] ? 'Hide passphrase' : 'Show passphrase'}
+                              >
+                                {showArchivePassMap[ew.id] ? (
+                                  <EyeOff className="w-3.5 h-3.5" />
+                                ) : (
+                                  <Eye className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                            </div>
+                            <button
+                              type="button"
+                              disabled={archivingWalletId === ew.id}
+                              onClick={() => handleArchiveExchangeWallet(ew)}
+                              className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                            >
+                              {archivingWalletId === ew.id ? 'Archiving...' : `Confirm Archive ${tierTitle}`}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setArchiveOpenMap((prev) => ({ ...prev, [ew.id]: false }))
+                              }
+                              className="px-3 py-1.5 rounded-lg bg-[#11151C] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9]"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+
+                          {archiveErrors[ew.id] && (
+                            <div className="text-[11px] text-red-400">{archiveErrors[ew.id]}</div>
+                          )}
+                        </div>
+                      )}
 
                       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono">
                         {ew.evmAddress && (
@@ -1955,7 +2179,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                           : 'Select Active Swap Wallet...'}
                       </option>
                       {exchangeWallets
-                        .filter((w) => w.status !== 'frozen')
+                        .filter((w) => w.status !== 'frozen' && w.status !== 'archived')
                         .map((w) => (
                           <option key={w.id} value={w.id}>
                             {w.tier.toUpperCase()} · {w.label}
@@ -1974,10 +2198,10 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     onChange={(e) => setDisburseSourceWalletId(e.target.value)}
                     className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
                   >
-                    {exchangeWallets.length === 0 && (
+                    {activeExchangeWallets.length === 0 && (
                       <option value="">Exchange Settlement Pool</option>
                     )}
-                    {exchangeWallets.map((w) => (
+                    {activeExchangeWallets.map((w) => (
                       <option key={w.id} value={w.id}>
                         {w.tier.toUpperCase()} · {w.label}
                       </option>

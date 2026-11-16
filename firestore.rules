@@ -170,7 +170,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'tier', 'label', 'networkFamily', 'evmAddress',
           'solanaAddress', 'bitcoinAddress', 'moneroAddress', 'quorum', 'allocationCapPct',
-          'status', 'encryptedVaultBlob', 'createdBy', 'createdAt', 'updatedAt'
+          'status', 'encryptedVaultBlob', 'archivedAt', 'archivedBy', 'createdBy', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && data.tier in ['cold', 'pool', 'hot']
@@ -182,8 +182,10 @@ service cloud.firestore {
         && (!('moneroAddress' in data) || (data.moneroAddress is string && data.moneroAddress.size() <= 120))
         && data.quorum is string && data.quorum.size() >= 1 && data.quorum.size() <= 32
         && data.allocationCapPct is number && data.allocationCapPct >= 0 && data.allocationCapPct <= 100
-        && data.status in ['active', 'frozen', 'sweeping']
+        && data.status in ['active', 'frozen', 'sweeping', 'archived']
         && (!('encryptedVaultBlob' in data) || (data.encryptedVaultBlob is string && data.encryptedVaultBlob.size() <= 4096))
+        && (!('archivedAt' in data) || data.archivedAt is timestamp)
+        && (!('archivedBy' in data) || isValidId(data.archivedBy))
         && isValidId(data.createdBy)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -431,7 +433,7 @@ service cloud.firestore {
       allow delete: if isValidId(adminUid) && isAdmin();
     }
 
-    // Exchange Treasury Wallets (Cold, Pool, Hot)
+    // Exchange Treasury Wallets (Cold, Pool, Hot — Archive-Only, Deletion Strictly Forbidden)
     match /exchange_wallets/{walletId} {
       allow get: if isValidId(walletId) && isAdmin();
       allow list: if isAdmin();
@@ -440,6 +442,9 @@ service cloud.firestore {
         && isAdmin()
         && isValidExchangeWallet(incoming())
         && incoming().id == walletId
+        && incoming().status != 'archived'
+        && !('archivedAt' in incoming())
+        && !('archivedBy' in incoming())
         && incoming().createdBy == request.auth.uid
         && incoming().createdAt == request.time
         && incoming().updatedAt == request.time;
@@ -452,9 +457,20 @@ service cloud.firestore {
         && incoming().createdBy == existing().createdBy
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['label', 'quorum', 'allocationCapPct', 'status', 'encryptedVaultBlob', 'updatedAt']);
+        && (existing().status != 'archived' || incoming().status == 'archived')
+        && (!('archivedAt' in existing()) || incoming().archivedAt == existing().archivedAt)
+        && (!('archivedBy' in existing()) || incoming().archivedBy == existing().archivedBy)
+        && (
+          incoming().status != 'archived' ||
+          existing().status == 'archived' ||
+          (incoming().archivedAt == request.time && incoming().archivedBy == request.auth.uid)
+        )
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'label', 'quorum', 'allocationCapPct', 'status',
+          'encryptedVaultBlob', 'archivedAt', 'archivedBy', 'updatedAt'
+        ]);
 
-      allow delete: if isValidId(walletId) && isAdmin();
+      allow delete: if false;
     }
 
     // Immutable Admin Audit Logs

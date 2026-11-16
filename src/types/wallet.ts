@@ -179,8 +179,10 @@ export interface ExchangeTreasuryWallet {
   moneroAddress?: string;
   quorum: string;
   allocationCapPct: number;
-  status: 'active' | 'frozen' | 'sweeping';
+  status: 'active' | 'frozen' | 'sweeping' | 'archived';
   encryptedVaultBlob?: string;
+  archivedAt?: number;
+  archivedBy?: string;
   createdBy: string;
   createdAt: number;
   updatedAt: number;
