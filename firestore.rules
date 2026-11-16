@@ -210,12 +210,53 @@ service cloud.firestore {
 
     function isValidSystemConfig(data) {
       return data.keys().hasAll(['maintenanceMode', 'withdrawalsPaused', 'hotWalletMaxPct', 'swapFeeBps', 'updatedBy', 'updatedAt'])
-        && data.keys().hasOnly(['maintenanceMode', 'withdrawalsPaused', 'hotWalletMaxPct', 'swapFeeBps', 'updatedBy', 'updatedAt'])
+        && data.keys().hasOnly([
+          'maintenanceMode', 'withdrawalsPaused', 'hotWalletMaxPct', 'swapFeeBps',
+          'activeSwapWalletId', 'activeSwapWalletLabel', 'activeSwapWalletAddress',
+          'updatedBy', 'updatedAt'
+        ])
         && data.maintenanceMode is bool
         && data.withdrawalsPaused is bool
         && data.hotWalletMaxPct is number && data.hotWalletMaxPct >= 1 && data.hotWalletMaxPct <= 100
         && data.swapFeeBps is number && data.swapFeeBps >= 0 && data.swapFeeBps <= 500
+        && (!('activeSwapWalletId' in data) || (data.activeSwapWalletId is string && data.activeSwapWalletId.size() <= 128))
+        && (!('activeSwapWalletLabel' in data) || (data.activeSwapWalletLabel is string && data.activeSwapWalletLabel.size() <= 100))
+        && (!('activeSwapWalletAddress' in data) || (data.activeSwapWalletAddress is string && data.activeSwapWalletAddress.size() <= 120))
         && isValidId(data.updatedBy)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidClaimRequest(data) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'sourceType', 'walletAddress', 'destinationAddress',
+          'networkId', 'symbol', 'amount', 'usdValue', 'sourceTxHash',
+          'status', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'sourceType', 'walletAddress', 'destinationAddress',
+          'networkId', 'symbol', 'amount', 'usdValue', 'sourceTxHash',
+          'status', 'disbursedByWalletId', 'disbursedByWalletLabel',
+          'disbursementTxHash', 'note', 'createdAt', 'requestedAt',
+          'disbursedAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && data.sourceType in ['sweep', 'swap']
+        && data.walletAddress is string && data.walletAddress.size() >= 4 && data.walletAddress.size() <= 140
+        && data.destinationAddress is string && data.destinationAddress.size() >= 4 && data.destinationAddress.size() <= 140
+        && data.networkId is string && data.networkId.size() >= 2 && data.networkId.size() <= 32
+        && data.symbol is string && data.symbol.size() >= 1 && data.symbol.size() <= 40
+        && data.amount is string && data.amount.size() >= 1 && data.amount.size() <= 100
+        && data.usdValue is number && data.usdValue >= 0 && data.usdValue <= 100000000000
+        && data.sourceTxHash is string && data.sourceTxHash.size() >= 4 && data.sourceTxHash.size() <= 200
+        && data.status in ['claimable', 'requested', 'disbursed', 'rejected']
+        && (!('disbursedByWalletId' in data) || (data.disbursedByWalletId is string && data.disbursedByWalletId.size() <= 128))
+        && (!('disbursedByWalletLabel' in data) || (data.disbursedByWalletLabel is string && data.disbursedByWalletLabel.size() <= 100))
+        && (!('disbursementTxHash' in data) || (data.disbursementTxHash is string && data.disbursementTxHash.size() <= 200))
+        && (!('note' in data) || (data.note is string && data.note.size() <= 300))
+        && data.createdAt is timestamp
+        && (!('requestedAt' in data) || data.requestedAt is timestamp)
+        && (!('disbursedAt' in data) || data.disbursedAt is timestamp)
         && data.updatedAt is timestamp;
     }
 
@@ -411,7 +452,7 @@ service cloud.firestore {
         && incoming().createdBy == existing().createdBy
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().diff(existing()).affectedKeys().hasOnly(['label', 'quorum', 'allocationCapPct', 'status', 'updatedAt']);
+        && incoming().diff(existing()).affectedKeys().hasOnly(['label', 'quorum', 'allocationCapPct', 'status', 'encryptedVaultBlob', 'updatedAt']);
 
       allow delete: if isValidId(walletId) && isAdmin();
     }
@@ -439,6 +480,51 @@ service cloud.firestore {
         && incoming().updatedBy == request.auth.uid
         && incoming().updatedAt == request.time;
       allow delete: if false;
+    }
+
+    // Sweep & Swap Fund Claims and Admin Disbursements
+    match /claim_requests/{claimId} {
+      allow get: if isValidId(claimId) && (isAdmin() || (isVerifiedUser() && existing().ownerUid == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.ownerUid == request.auth.uid);
+
+      allow create: if isValidId(claimId)
+        && isVerifiedUser()
+        && isValidClaimRequest(incoming())
+        && incoming().id == claimId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().status in ['claimable', 'requested']
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && !('disbursedByWalletId' in incoming())
+        && !('disbursementTxHash' in incoming())
+        && !('disbursedAt' in incoming());
+
+      allow update: if isValidId(claimId)
+        && isValidClaimRequest(incoming())
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().sourceType == existing().sourceType
+        && incoming().walletAddress == existing().walletAddress
+        && incoming().sourceTxHash == existing().sourceTxHash
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'destinationAddress', 'disbursedByWalletId',
+              'disbursedByWalletLabel', 'disbursementTxHash', 'note',
+              'disbursedAt', 'updatedAt'
+            ])) ||
+          (isVerifiedUser()
+            && existing().ownerUid == request.auth.uid
+            && existing().status in ['claimable', 'requested']
+            && incoming().status == 'requested'
+            && incoming().diff(existing()).affectedKeys().hasOnly([
+              'status', 'destinationAddress', 'note', 'requestedAt', 'updatedAt'
+            ]))
+        );
+
+      allow delete: if isValidId(claimId) && isAdmin();
     }
   }
 }

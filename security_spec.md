@@ -7,6 +7,7 @@
 4. Only verified admins (`isAdmin()`) may create, update, or delete `/wallet_catalog/{walletId}`, `/exchange_wallets/{walletId}`, `/system_config/{configId}`, `/admins/{adminUid}`, or append to `/admin_audit_logs/{logId}`. Verified users may only read enabled entries in `/wallet_catalog/{walletId}` (`resource.data.enabled == true`).
 5. `admin_audit_logs` are immutable once created (`allow update, delete: if false`).
 6. Every `isAdmin()` check that inspects `request.auth.token.email` strictly requires `request.auth.token.email_verified == true`.
+7. Verified users may create/read `/claim_requests/{claimId}` scoped to `ownerUid == request.auth.uid` with initial status `'claimable'` or `'requested'`, and may only transition non-disbursed claims to `'requested'`. Only verified admins (`isAdmin()`) may list all claims across wallets or mark a claim `'disbursed'` / `'rejected'` with `disbursedByWalletId` and `disbursementTxHash`.
 
 ## 2. The "Dirty Dozen" Attack Payloads (Expected: PERMISSION_DENIED)
 1. **Self-Admin Escalation on Signup**: `POST /users/{uid}` with `{ role: "admin", status: "active", ... }` -> Denied because `incoming().role == 'user'` is enforced.
@@ -20,4 +21,5 @@
 9. **Client Timestamp Forgery**: Creating a wallet, session, or audit log with `createdAt: "2020-01-01T00:00:00Z"` instead of server timestamp -> Denied by `incoming().createdAt == request.time`.
 10. **Audit Log Deletion / Tampering**: Admin or user attempts `DELETE /admin_audit_logs/{id}` or `UPDATE` -> Denied (`allow update, delete: if false`).
 11. **PII Blanket List Scraping**: Regular user runs `list` on `/users` or `/users/{otherUid}/private` -> Denied (`allow list: if isAdmin()`).
-12. **Immutable Owner Mutation**: User attempts `UPDATE /users/{uid}/wallets/{wid}` or `connected_sessions/{sid}` changing `ownerUid` or `createdAt` -> Denied by immutability checks.
+12. **Immutable Owner Mutation & Self-Disbursement Forgery**: User attempts `UPDATE /users/{uid}/wallets/{wid}` changing `ownerUid`, or `POST / PATCH /claim_requests/{cid}` setting `status: "disbursed"` -> Denied by field-level transition checks.
+

@@ -10,6 +10,8 @@ import {
 import {
   Activity,
   ArrowLeft,
+  ArrowLeftRight,
+  Banknote,
   BookOpen,
   Check,
   Copy,
@@ -38,6 +40,7 @@ import { auth, googleProvider } from '../lib/firebase';
 import {
   DEFAULT_WALLET_CATALOG_SEEDS,
   addExistingExchangeWallet,
+  adminDisburseClaimInCloud,
   adminProvisionWalletForUser,
   checkUserIsAdmin,
   deleteExchangeWallet,
@@ -45,6 +48,7 @@ import {
   generateAndSaveExchangeWallet,
   getExchangeSystemConfig,
   listAdminAuditLogs,
+  listAllClaimRequestsForAdmin,
   listAllManagedUsers,
   listExchangeWallets,
   listUserWalletsForAdmin,
@@ -55,11 +59,19 @@ import {
   updateExchangeWallet,
   updateManagedUser,
 } from '../lib/firestoreService';
-import { shortenAddress } from '../lib/crypto';
-import { decryptPayload } from '../lib/vaultStorage';
-import { formatRelativeTime } from '../lib/formatters';
+import { deriveWalletFromMnemonic, shortenAddress } from '../lib/crypto';
+import {
+  decryptPayload,
+  disburseClaimInLedger,
+  encryptPayload,
+  loadClaimLedger,
+  saveClaimLedger,
+} from '../lib/vaultStorage';
+import { formatFiat, formatRelativeTime } from '../lib/formatters';
+import { NETWORK_MAP } from '../lib/networks';
 import type {
   AdminAuditLogEntry,
+  ClaimRequestRecord,
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
@@ -75,7 +87,7 @@ interface KingAdminViewProps {
   onExitAdmin: () => void;
 }
 
-type AdminTab = 'overview' | 'wallets' | 'catalog' | 'users' | 'risk' | 'audit';
+type AdminTab = 'overview' | 'wallets' | 'claims' | 'catalog' | 'users' | 'risk' | 'audit';
 
 export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) {
   const [adminEmailInput, setAdminEmailInput] = useState('obsidianvault99@gmail.com');
@@ -121,11 +133,29 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     moneroViewKeyHex?: string;
   } | null>(null);
 
-  // Decrypt Existing Exchange Wallet Modal/Inline
-  const [inspectWalletId, setInspectWalletId] = useState<string | null>(null);
-  const [inspectPassphrase, setInspectPassphrase] = useState('');
-  const [inspectedSecrets, setInspectedSecrets] = useState<UnlockedSecrets | null>(null);
-  const [inspectError, setInspectError] = useState('');
+  // Reveal Recovery Phrases & Custody Keys (Supports unlocking Cold, Pool, and Hot simultaneously)
+  const [globalRevealPass, setGlobalRevealPass] = useState('');
+  const [showGlobalRevealPass, setShowGlobalRevealPass] = useState(false);
+  const [globalRevealStatus, setGlobalRevealStatus] = useState('');
+  const [unlockedTreasuryMap, setUnlockedTreasuryMap] = useState<Record<string, UnlockedSecrets>>({});
+  const [inspectOpenMap, setInspectOpenMap] = useState<Record<string, boolean>>({});
+  const [walletPassInputs, setWalletPassInputs] = useState<Record<string, string>>({});
+  const [walletInspectErrors, setWalletInspectErrors] = useState<Record<string, string>>({});
+  const [attachSecretWalletId, setAttachSecretWalletId] = useState<string | null>(null);
+  const [attachPhraseInput, setAttachPhraseInput] = useState('');
+  const [attachPassInput, setAttachPassInput] = useState('');
+  const [attachSaving, setAttachSaving] = useState(false);
+
+  // Active Swap Wallet & Claim Disbursements
+  const [claims, setClaims] = useState<ClaimRequestRecord[]>(() => loadClaimLedger());
+  const [claimStatusFilter, setClaimStatusFilter] = useState<'all' | 'requested' | 'claimable' | 'disbursed' | 'rejected'>('all');
+  const [claimTypeFilter, setClaimTypeFilter] = useState<'all' | 'sweep' | 'swap'>('all');
+  const [claimWalletFilter, setClaimWalletFilter] = useState('');
+  const [disburseSourceWalletId, setDisburseSourceWalletId] = useState('');
+  const [disburseTxInput, setDisburseTxInput] = useState('');
+  const [disburseNoteInput, setDisburseNoteInput] = useState('');
+  const [disbursingId, setDisbursingId] = useState<string | null>(null);
+  const [savingSwapWallet, setSavingSwapWallet] = useState(false);
 
   // Users filter & Admin user wallet provisioning
   const [userSearch, setUserSearch] = useState('');
@@ -184,18 +214,41 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     setLoadingData(true);
     setDataError('');
     try {
-      const [uList, wList, logs, cfg, catalogList] = await Promise.all([
+      const [uList, wList, logs, cfg, catalogList, cloudClaims] = await Promise.all([
         listAllManagedUsers(),
         listExchangeWallets(),
         listAdminAuditLogs(),
         getExchangeSystemConfig(),
         listWalletCatalog(false),
+        listAllClaimRequestsForAdmin().catch(() => [] as ClaimRequestRecord[]),
       ]);
       setUsers(uList);
       setExchangeWallets(wList);
       setAuditLogs(logs);
       setSystemConfig(cfg);
       setWalletCatalog(catalogList);
+
+      // Merge Firestore claims with local disconnect-proof ledger so Admin sees both cloud & local claims
+      const localClaims = loadClaimLedger();
+      const mergedMap = new Map<string, ClaimRequestRecord>();
+      for (const lc of localClaims) mergedMap.set(lc.id, lc);
+      for (const cc of cloudClaims) {
+        const prev = mergedMap.get(cc.id);
+        if (!prev || cc.updatedAt >= prev.updatedAt || cc.status === 'disbursed') {
+          mergedMap.set(cc.id, cc);
+        }
+      }
+      const mergedClaims = Array.from(mergedMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+      setClaims(mergedClaims);
+      saveClaimLedger(mergedClaims);
+
+      setDisburseSourceWalletId((prev) => {
+        if (prev && wList.some((w) => w.id === prev)) return prev;
+        if (cfg.activeSwapWalletId && wList.some((w) => w.id === cfg.activeSwapWalletId)) {
+          return cfg.activeSwapWalletId;
+        }
+        return wList.find((w) => w.tier === 'hot' || w.tier === 'pool')?.id || wList[0]?.id || '';
+      });
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to load admin records.');
     } finally {
@@ -425,20 +478,214 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     }
   };
 
-  const handleDecryptExchangeWallet = async (wallet: ExchangeTreasuryWallet) => {
-    setInspectError('');
+  const handleDecryptExchangeWallet = async (wallet: ExchangeTreasuryWallet, explicitPass?: string) => {
+    const pass = explicitPass ?? walletPassInputs[wallet.id] ?? globalRevealPass;
+    setWalletInspectErrors((prev) => ({ ...prev, [wallet.id]: '' }));
     if (!wallet.encryptedVaultBlob) {
-      setInspectError('No encrypted custody blob stored for this wallet.');
+      setWalletInspectErrors((prev) => ({
+        ...prev,
+        [wallet.id]: 'Watch-Only wallet has no encrypted custody recovery phrase stored.',
+      }));
+      return;
+    }
+    if (!pass) {
+      setWalletInspectErrors((prev) => ({
+        ...prev,
+        [wallet.id]: 'Enter your Admin Custody Encryption Passphrase.',
+      }));
       return;
     }
     try {
-      const dec = await decryptPayload<UnlockedSecrets>(
-        wallet.encryptedVaultBlob,
-        inspectPassphrase
-      );
-      setInspectedSecrets(dec);
+      const dec = await decryptPayload<UnlockedSecrets>(wallet.encryptedVaultBlob, pass);
+      setUnlockedTreasuryMap((prev) => ({ ...prev, [wallet.id]: dec }));
+      setInspectOpenMap((prev) => ({ ...prev, [wallet.id]: true }));
     } catch {
-      setInspectError('Incorrect Admin Custody Passphrase.');
+      setWalletInspectErrors((prev) => ({
+        ...prev,
+        [wallet.id]: 'Incorrect Admin Custody Encryption Passphrase.',
+      }));
+    }
+  };
+
+  const handleRevealAllTreasuryPhrases = async (e?: FormEvent) => {
+    e?.preventDefault();
+    setGlobalRevealStatus('');
+    if (!globalRevealPass) {
+      setGlobalRevealStatus('Enter the Admin Custody Encryption Passphrase to unlock Cold, Pool, and Hot recovery phrases.');
+      return;
+    }
+    const nextUnlocked: Record<string, UnlockedSecrets> = {};
+    const nextOpen: Record<string, boolean> = {};
+    const nextErrors: Record<string, string> = {};
+    let unlockedCount = 0;
+    let encryptedCount = 0;
+
+    for (const ew of exchangeWallets) {
+      if (!ew.encryptedVaultBlob) continue;
+      encryptedCount++;
+      try {
+        const dec = await decryptPayload<UnlockedSecrets>(ew.encryptedVaultBlob, globalRevealPass);
+        nextUnlocked[ew.id] = dec;
+        nextOpen[ew.id] = true;
+        unlockedCount++;
+      } catch {
+        nextErrors[ew.id] = 'Passphrase did not match this wallet.';
+      }
+    }
+
+    if (encryptedCount === 0) {
+      setGlobalRevealStatus('No encrypted Cold, Pool, or Hot custody wallets found yet.');
+      return;
+    }
+    if (unlockedCount === 0) {
+      setGlobalRevealStatus('Passphrase did not match any stored Cold, Pool, or Hot custody vault.');
+      return;
+    }
+
+    setUnlockedTreasuryMap((prev) => ({ ...prev, ...nextUnlocked }));
+    setInspectOpenMap((prev) => ({ ...prev, ...nextOpen }));
+    setWalletInspectErrors((prev) => ({ ...prev, ...nextErrors }));
+    setGlobalRevealStatus(
+      `Revealed recovery phrases & keys for ${unlockedCount} of ${encryptedCount} encrypted treasury wallet${
+        encryptedCount > 1 ? 's' : ''
+      }.`
+    );
+  };
+
+  const handleHideAllTreasuryPhrases = () => {
+    setUnlockedTreasuryMap({});
+    setInspectOpenMap({});
+    setWalletInspectErrors({});
+    setGlobalRevealPass('');
+    setGlobalRevealStatus('');
+  };
+
+  const handleAttachRecoveryPhraseToWallet = async (wallet: ExchangeTreasuryWallet) => {
+    if (!currentUser) return;
+    setDataError('');
+    if (!attachPhraseInput.trim()) {
+      setDataError('Enter a 12, 18, or 24-word recovery phrase to encrypt.');
+      return;
+    }
+    if (attachPassInput.length < 6) {
+      setDataError('Admin Custody Encryption Passphrase must be at least 6 characters.');
+      return;
+    }
+    setAttachSaving(true);
+    try {
+      const derived = deriveWalletFromMnemonic(attachPhraseInput.trim(), {
+        preset: wallet.tier === 'cold' ? 'ledger' : 'standard',
+        accountIndex: 0,
+      });
+      const blob = await encryptPayload(derived.secrets, attachPassInput);
+      await updateExchangeWallet(wallet.id, { encryptedVaultBlob: blob }, currentUser.uid);
+      setUnlockedTreasuryMap((prev) => ({ ...prev, [wallet.id]: derived.secrets }));
+      setInspectOpenMap((prev) => ({ ...prev, [wallet.id]: true }));
+      setAttachSecretWalletId(null);
+      setAttachPhraseInput('');
+      setAttachPassInput('');
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to encrypt & attach recovery phrase.');
+    } finally {
+      setAttachSaving(false);
+    }
+  };
+
+  const handleSetActiveSwapWallet = async (wallet: ExchangeTreasuryWallet) => {
+    if (!currentUser) return;
+    setSavingSwapWallet(true);
+    setDataError('');
+    try {
+      const primaryAddr =
+        wallet.evmAddress ||
+        wallet.solanaAddress ||
+        wallet.bitcoinAddress ||
+        wallet.moneroAddress ||
+        '';
+      const nextCfg: Omit<ExchangeSystemConfig, 'updatedAt'> = {
+        maintenanceMode: systemConfig.maintenanceMode,
+        withdrawalsPaused: systemConfig.withdrawalsPaused,
+        hotWalletMaxPct: systemConfig.hotWalletMaxPct,
+        swapFeeBps: systemConfig.swapFeeBps,
+        activeSwapWalletId: wallet.id,
+        activeSwapWalletLabel: `${wallet.tier.toUpperCase()} · ${wallet.label}`,
+        activeSwapWalletAddress: primaryAddr,
+        updatedBy: currentUser.uid,
+      };
+      await saveExchangeSystemConfig(nextCfg, currentUser.uid);
+      setDisburseSourceWalletId(wallet.id);
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to select active swap wallet.');
+    } finally {
+      setSavingSwapWallet(false);
+    }
+  };
+
+  const handleDisburseClaim = async (
+    claim: ClaimRequestRecord,
+    targetStatus: 'disbursed' | 'rejected'
+  ) => {
+    if (!currentUser) return;
+    setDisbursingId(claim.id);
+    setDataError('');
+    try {
+      const chosenWallet =
+        exchangeWallets.find((w) => w.id === disburseSourceWalletId) ||
+        exchangeWallets.find((w) => w.id === systemConfig.activeSwapWalletId) ||
+        exchangeWallets[0];
+
+      const txRef =
+        targetStatus === 'disbursed'
+          ? disburseTxInput.trim() ||
+            `0xobs${Array.from(crypto.getRandomValues(new Uint8Array(16)))
+              .map((b) => b.toString(16).padStart(2, '0'))
+              .join('')}`
+          : undefined;
+
+      const label = chosenWallet
+        ? `${chosenWallet.tier.toUpperCase()} · ${chosenWallet.label}`
+        : systemConfig.activeSwapWalletLabel || 'Exchange Custody Wallet';
+
+      const nextLocal = disburseClaimInLedger({
+        claimId: claim.id,
+        status: targetStatus,
+        disbursedByWalletId: chosenWallet?.id,
+        disbursedByWalletLabel: targetStatus === 'disbursed' ? label : undefined,
+        disbursementTxHash: txRef,
+        note: disburseNoteInput.trim() || undefined,
+      });
+      setClaims(nextLocal);
+
+      await adminDisburseClaimInCloud({
+        claim,
+        status: targetStatus,
+        disbursedByWalletId: chosenWallet?.id,
+        disbursedByWalletLabel: targetStatus === 'disbursed' ? label : undefined,
+        disbursementTxHash: txRef,
+        note: disburseNoteInput.trim() || undefined,
+        actorUid: currentUser.uid,
+      });
+
+      setDisburseTxInput('');
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Claim disbursement failed.');
+    } finally {
+      setDisbursingId(null);
+    }
+  };
+
+  const handleDisburseAllForWallet = async (walletAddr: string) => {
+    if (!currentUser) return;
+    const targets = claims.filter(
+      (c) =>
+        c.walletAddress.toLowerCase() === walletAddr.toLowerCase() &&
+        (c.status === 'requested' || c.status === 'claimable')
+    );
+    for (const c of targets) {
+      await handleDisburseClaim(c, 'disbursed');
     }
   };
 
@@ -466,6 +713,57 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       hot: exchangeWallets.filter((w) => w.tier === 'hot').length,
     };
   }, [exchangeWallets]);
+
+  const pendingClaimsCount = useMemo(
+    () => claims.filter((c) => c.status === 'requested' || c.status === 'claimable').length,
+    [claims]
+  );
+
+  const claimsByWallet = useMemo(() => {
+    const map = new Map<
+      string,
+      { walletAddress: string; total: number; pendingCount: number; pendingUsd: number; disbursedCount: number }
+    >();
+    for (const c of claims) {
+      const k = c.walletAddress.toLowerCase();
+      const prev = map.get(k);
+      const isPending = c.status === 'requested' || c.status === 'claimable';
+      if (prev) {
+        prev.total += 1;
+        if (isPending) {
+          prev.pendingCount += 1;
+          prev.pendingUsd += c.usdValue;
+        }
+        if (c.status === 'disbursed') prev.disbursedCount += 1;
+      } else {
+        map.set(k, {
+          walletAddress: c.walletAddress,
+          total: 1,
+          pendingCount: isPending ? 1 : 0,
+          pendingUsd: isPending ? c.usdValue : 0,
+          disbursedCount: c.status === 'disbursed' ? 1 : 0,
+        });
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => b.pendingCount - a.pendingCount || b.total - a.total);
+  }, [claims]);
+
+  const filteredClaims = useMemo(() => {
+    const q = claimWalletFilter.trim().toLowerCase();
+    return claims.filter((c) => {
+      if (claimStatusFilter !== 'all' && c.status !== claimStatusFilter) return false;
+      if (claimTypeFilter !== 'all' && c.sourceType !== claimTypeFilter) return false;
+      if (q) {
+        return (
+          c.walletAddress.toLowerCase().includes(q) ||
+          c.destinationAddress.toLowerCase().includes(q) ||
+          c.symbol.toLowerCase().includes(q) ||
+          c.sourceTxHash.toLowerCase().includes(q)
+        );
+      }
+      return true;
+    });
+  }, [claims, claimStatusFilter, claimTypeFilter, claimWalletFilter]);
 
   // Admin Authentication Gate
   if (checkingRole) {
@@ -609,6 +907,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       items: [
         { id: 'overview', label: 'Overview', icon: LayoutGrid },
         { id: 'wallets', label: 'Cold / Pool / Hot', icon: Snowflake, count: exchangeWallets.length },
+        { id: 'claims', label: 'Claims & Disbursement', icon: Banknote, count: pendingClaimsCount },
       ],
     },
     {
@@ -867,6 +1166,24 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                   <p className="text-xs text-[#8A94A6] leading-relaxed">
                     High-velocity automated signing wallets servicing instant withdrawals with strict allocation cap enforcement.
                   </p>
+                </div>
+              </div>
+
+              <div className="pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs">
+                <div>
+                  <span className="text-[#8A94A6]">Active Swap Settlement Wallet: </span>
+                  <span className="font-mono text-emerald-400 font-medium">
+                    {systemConfig.activeSwapWalletLabel || 'Not selected yet'}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setTab('claims')}
+                    className="px-3.5 py-2 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs font-medium text-[#F4F6F9]"
+                  >
+                    Claims & Disbursement ({pendingClaimsCount} Pending)
+                  </button>
                 </div>
               </div>
             </div>
@@ -1134,257 +1451,770 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
               )}
             </form>
 
-            {/* Exchange Wallets Registry */}
-            <div className="lg:col-span-7 space-y-3">
+            {/* Exchange Wallets Registry + Unified Recovery Phrase Reveal */}
+            <div className="lg:col-span-7 space-y-4">
+              {/* Admin Custody Encryption Passphrase Unlock Bar for Cold / Pool / Hot Recovery Phrases */}
+              {exchangeWallets.length > 0 && (
+                <form
+                  onSubmit={handleRevealAllTreasuryPhrases}
+                  className="bg-[#11151C] border border-emerald-500/30 rounded-xl p-4 sm:p-5 space-y-3"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="flex items-center gap-2 text-xs font-semibold text-[#F4F6F9]">
+                        <KeyRound className="w-4 h-4 text-emerald-400" />
+                        <span>Reveal Cold Vault, Pool Wallet & Hot Wallet Recovery Phrases</span>
+                      </div>
+                      <p className="text-[11px] text-[#8A94A6] mt-0.5">
+                        Enter your Admin Custody Encryption Passphrase to unlock stored 12/24-word recovery phrases and private keys across tiers
+                      </p>
+                    </div>
+                    {Object.keys(unlockedTreasuryMap).length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleHideAllTreasuryPhrases}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-red-300"
+                      >
+                        <Lock className="w-3 h-3" />
+                        <span>Hide All Phrases</span>
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="relative flex-1 min-w-[210px]">
+                      <input
+                        type={showGlobalRevealPass ? 'text' : 'password'}
+                        value={globalRevealPass}
+                        onChange={(e) => setGlobalRevealPass(e.target.value)}
+                        placeholder="Enter Admin Custody Encryption Passphrase"
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg pl-3 pr-9 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowGlobalRevealPass((v) => !v)}
+                        className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#64748B] hover:text-[#F4F6F9]"
+                        aria-label={showGlobalRevealPass ? 'Hide passphrase' : 'Show passphrase'}
+                      >
+                        {showGlobalRevealPass ? (
+                          <EyeOff className="w-3.5 h-3.5" />
+                        ) : (
+                          <Eye className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    </div>
+                    <button
+                      type="submit"
+                      className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[38px] rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                    >
+                      <Unlock className="w-3.5 h-3.5" />
+                      <span>Reveal Cold / Pool / Hot Phrases</span>
+                    </button>
+                  </div>
+
+                  {globalRevealStatus && (
+                    <div className="text-[11px] text-emerald-400">{globalRevealStatus}</div>
+                  )}
+                </form>
+              )}
+
               {exchangeWallets.length === 0 ? (
                 <div className="bg-[#11151C] border border-white/10 rounded-xl p-12 text-center text-xs text-[#8A94A6]">
                   No exchange custody wallets generated yet. Use the generator to create your Cold, Pool, and Hot wallet architecture.
                 </div>
               ) : (
-                exchangeWallets.map((ew) => (
-                  <div
-                    key={ew.id}
-                    className="bg-[#11151C] border border-white/10 rounded-xl p-5 space-y-3"
-                  >
-                    <div className="flex flex-wrap items-start justify-between gap-3">
-                      <div>
-                        <div className="flex items-center gap-2 text-xs">
-                          <span
-                            className={`font-mono font-semibold uppercase ${
-                              ew.tier === 'cold'
-                                ? 'text-sky-400'
-                                : ew.tier === 'pool'
-                                ? 'text-indigo-400'
-                                : 'text-amber-400'
-                            }`}
-                          >
-                            {ew.tier} tier
-                          </span>
-                          <span className="text-[#64748B]">·</span>
-                          <span className="text-sm font-semibold text-[#F4F6F9]">
-                            {ew.label}
-                          </span>
-                          <span className="text-[#64748B]">·</span>
-                          <span
-                            className={
-                              ew.status === 'active'
-                                ? 'text-emerald-400'
-                                : ew.status === 'frozen'
-                                ? 'text-red-400'
-                                : 'text-amber-400'
-                            }
-                          >
-                            {ew.status}
-                          </span>
-                        </div>
-                        <div className="text-[11px] font-mono text-[#8A94A6] mt-1">
-                          {ew.quorum} · Reserve Cap {ew.allocationCapPct}% · {ew.networkFamily}
-                        </div>
-                      </div>
+                exchangeWallets.map((ew) => {
+                  const isActiveSwap = systemConfig.activeSwapWalletId === ew.id;
+                  const unlocked = unlockedTreasuryMap[ew.id];
+                  const isInspectOpen = Boolean(inspectOpenMap[ew.id]);
+                  const tierTitle =
+                    ew.tier === 'cold'
+                      ? 'Cold Vault'
+                      : ew.tier === 'pool'
+                      ? 'Pool Wallet'
+                      : 'Hot Wallet';
 
-                      <div className="flex items-center gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setInspectWalletId(inspectWalletId === ew.id ? null : ew.id);
-                            setInspectedSecrets(null);
-                            setInspectPassphrase('');
-                            setInspectError('');
-                          }}
-                          className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-[#F4F6F9]"
-                        >
-                          Inspect Keys
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateExchangeWallet(
-                              ew.id,
-                              { status: ew.status === 'frozen' ? 'active' : 'frozen' },
-                              currentUser.uid
-                            ).then(loadDashboardData)
-                          }
-                          className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-amber-400"
-                        >
-                          {ew.status === 'frozen' ? 'Unfreeze' : 'Freeze'}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateExchangeWallet(
-                              ew.id,
-                              { status: 'sweeping' },
-                              currentUser.uid
-                            ).then(loadDashboardData)
-                          }
-                          className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-emerald-400"
-                        >
-                          Sweep
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            deleteExchangeWallet(ew.id, currentUser.uid).then(loadDashboardData)
-                          }
-                          className="p-1.5 rounded bg-[#090B0F] border border-white/10 text-[#8A94A6] hover:text-red-400"
-                          aria-label="Delete exchange wallet"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono">
-                      {ew.evmAddress && (
-                        <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
-                          <span className="truncate text-[#CBD5E1]">
-                            EVM: {shortenAddress(ew.evmAddress, 8, 6)}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleCopy(`${ew.id}-evm`, ew.evmAddress!)}
-                            className="text-[#8A94A6] hover:text-[#F4F6F9]"
-                          >
-                            {copiedKey === `${ew.id}-evm` ? (
-                              <Check className="w-3 h-3 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3 h-3" />
-                            )}
-                          </button>
-                        </div>
-                      )}
-                      {ew.solanaAddress && (
-                        <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
-                          <span className="truncate text-emerald-400">
-                            SOL: {shortenAddress(ew.solanaAddress, 8, 6)}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleCopy(`${ew.id}-sol`, ew.solanaAddress!)}
-                            className="text-[#8A94A6] hover:text-[#F4F6F9]"
-                          >
-                            {copiedKey === `${ew.id}-sol` ? (
-                              <Check className="w-3 h-3 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3 h-3" />
-                            )}
-                          </button>
-                        </div>
-                      )}
-                      {ew.bitcoinAddress && (
-                        <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
-                          <span className="truncate text-amber-400">
-                            BTC: {shortenAddress(ew.bitcoinAddress, 8, 6)}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleCopy(`${ew.id}-btc`, ew.bitcoinAddress!)}
-                            className="text-[#8A94A6] hover:text-[#F4F6F9]"
-                          >
-                            {copiedKey === `${ew.id}-btc` ? (
-                              <Check className="w-3 h-3 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3 h-3" />
-                            )}
-                          </button>
-                        </div>
-                      )}
-                      {ew.moneroAddress && (
-                        <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
-                          <span className="truncate text-[#FF6600]">
-                            XMR: {shortenAddress(ew.moneroAddress, 8, 6)}
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => handleCopy(`${ew.id}-xmr`, ew.moneroAddress!)}
-                            className="text-[#8A94A6] hover:text-[#F4F6F9]"
-                          >
-                            {copiedKey === `${ew.id}-xmr` ? (
-                              <Check className="w-3 h-3 text-emerald-400" />
-                            ) : (
-                              <Copy className="w-3 h-3" />
-                            )}
-                          </button>
-                        </div>
-                      )}
-                    </div>
-
-                    {inspectWalletId === ew.id && (
-                      <div className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 space-y-3 text-xs">
-                        {!inspectedSecrets ? (
-                          <div className="flex flex-wrap items-center gap-2">
-                            <input
-                              type="password"
-                              value={inspectPassphrase}
-                              onChange={(e) => setInspectPassphrase(e.target.value)}
-                              placeholder="Enter Admin Custody Passphrase"
-                              className="bg-[#11151C] border border-white/10 rounded px-3 py-1.5 text-xs text-[#F4F6F9] w-64"
-                            />
-                            <button
-                              type="button"
-                              onClick={() => handleDecryptExchangeWallet(ew)}
-                              className="px-3 py-1.5 rounded bg-emerald-500 text-[#090B0F] font-semibold text-xs"
+                  return (
+                    <div
+                      key={ew.id}
+                      className={`bg-[#11151C] border rounded-xl p-5 space-y-3 ${
+                        isActiveSwap ? 'border-emerald-500/50' : 'border-white/10'
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2 text-xs">
+                            <span
+                              className={`font-mono font-semibold uppercase ${
+                                ew.tier === 'cold'
+                                  ? 'text-sky-400'
+                                  : ew.tier === 'pool'
+                                  ? 'text-indigo-400'
+                                  : 'text-amber-400'
+                              }`}
                             >
-                              Decrypt Custody Keys
-                            </button>
-                            {inspectError && (
-                              <span className="text-red-400 text-xs">{inspectError}</span>
+                              {tierTitle}
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span className="text-sm font-semibold text-[#F4F6F9]">
+                              {ew.label}
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span
+                              className={
+                                ew.status === 'active'
+                                  ? 'text-emerald-400'
+                                  : ew.status === 'frozen'
+                                  ? 'text-red-400'
+                                  : 'text-amber-400'
+                              }
+                            >
+                              {ew.status}
+                            </span>
+                            {isActiveSwap && (
+                              <>
+                                <span className="text-[#64748B]">·</span>
+                                <span className="text-emerald-400 font-semibold">
+                                  Active Swap Wallet
+                                </span>
+                              </>
                             )}
                           </div>
-                        ) : (
-                          <div className="space-y-2 font-mono text-[11px]">
-                            {inspectedSecrets.mnemonic && (
-                              <div>
-                                <span className="text-[#8A94A6]">Seed Phrase: </span>
-                                <span className="text-[#F4F6F9]">{inspectedSecrets.mnemonic}</span>
-                              </div>
+                          <div className="text-[11px] font-mono text-[#8A94A6] mt-1">
+                            {ew.quorum} · Reserve Cap {ew.allocationCapPct}% · {ew.networkFamily}
+                            {ew.encryptedVaultBlob ? ' · Encrypted Phrase Stored' : ' · Watch-Only'}
+                          </div>
+                        </div>
+
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={savingSwapWallet || ew.status === 'frozen' || isActiveSwap}
+                            onClick={() => handleSetActiveSwapWallet(ew)}
+                            className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border text-[11px] whitespace-nowrap ${
+                              isActiveSwap
+                                ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400 font-semibold'
+                                : 'bg-[#090B0F] border-white/10 hover:border-emerald-500/40 text-[#CBD5E1] disabled:opacity-40'
+                            }`}
+                          >
+                            <ArrowLeftRight className="w-3 h-3" />
+                            <span>{isActiveSwap ? 'Active for Swap' : 'Select for Swap'}</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setInspectOpenMap((prev) => ({
+                                ...prev,
+                                [ew.id]: !prev[ew.id],
+                              }))
+                            }
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1] hover:text-[#F4F6F9] whitespace-nowrap"
+                          >
+                            {unlocked ? (
+                              <Eye className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <KeyRound className="w-3 h-3 text-emerald-400" />
                             )}
-                            {inspectedSecrets.evmPrivateKey && (
-                              <div className="break-all">
-                                <span className="text-[#8A94A6]">EVM Key: </span>
-                                <span className="text-[#F4F6F9]">
-                                  {inspectedSecrets.evmPrivateKey}
-                                </span>
-                              </div>
-                            )}
-                            {inspectedSecrets.solanaSecretBase58 && (
-                              <div className="break-all">
-                                <span className="text-[#8A94A6]">Solana Secret: </span>
-                                <span className="text-emerald-400">
-                                  {inspectedSecrets.solanaSecretBase58}
-                                </span>
-                              </div>
-                            )}
-                            {inspectedSecrets.bitcoinPrivateKeyHex && (
-                              <div className="break-all">
-                                <span className="text-[#8A94A6]">BTC Key Hex: </span>
-                                <span className="text-amber-400">
-                                  {inspectedSecrets.bitcoinPrivateKeyHex}
-                                </span>
-                              </div>
-                            )}
-                            {inspectedSecrets.moneroSpendKeyHex && (
-                              <div className="break-all">
-                                <span className="text-[#8A94A6]">XMR Spend Key: </span>
-                                <span className="text-[#FF6600]">
-                                  {inspectedSecrets.moneroSpendKeyHex}
-                                </span>
-                              </div>
-                            )}
-                            {inspectedSecrets.moneroViewKeyHex && (
-                              <div className="break-all">
-                                <span className="text-[#8A94A6]">XMR View Key: </span>
-                                <span className="text-orange-300">
-                                  {inspectedSecrets.moneroViewKeyHex}
-                                </span>
-                              </div>
-                            )}
+                            <span>
+                              {isInspectOpen
+                                ? 'Hide Phrase'
+                                : unlocked
+                                ? 'Show Phrase'
+                                : 'Reveal Recovery Phrase'}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateExchangeWallet(
+                                ew.id,
+                                { status: ew.status === 'frozen' ? 'active' : 'frozen' },
+                                currentUser.uid
+                              ).then(loadDashboardData)
+                            }
+                            className="px-2.5 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-amber-400"
+                          >
+                            {ew.status === 'frozen' ? 'Unfreeze' : 'Freeze'}
+                          </button>
+
+                          <button
+                            type="button"
+                            onClick={() =>
+                              deleteExchangeWallet(ew.id, currentUser.uid).then(loadDashboardData)
+                            }
+                            className="p-1.5 rounded bg-[#090B0F] border border-white/10 text-[#8A94A6] hover:text-red-400"
+                            aria-label="Delete exchange wallet"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono">
+                        {ew.evmAddress && (
+                          <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
+                            <span className="truncate text-[#CBD5E1]">
+                              EVM: {shortenAddress(ew.evmAddress, 8, 6)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(`${ew.id}-evm`, ew.evmAddress!)}
+                              className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                            >
+                              {copiedKey === `${ew.id}-evm` ? (
+                                <Check className="w-3 h-3 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3 h-3" />
+                              )}
+                            </button>
+                          </div>
+                        )}
+                        {ew.solanaAddress && (
+                          <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
+                            <span className="truncate text-emerald-400">
+                              SOL: {shortenAddress(ew.solanaAddress, 8, 6)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(`${ew.id}-sol`, ew.solanaAddress!)}
+                              className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                            >
+                              {copiedKey === `${ew.id}-sol` ? (
+                                <Check className="w-3 h-3 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3 h-3" />
+                              )}
+                            </button>
+                          </div>
+                        )}
+                        {ew.bitcoinAddress && (
+                          <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
+                            <span className="truncate text-amber-400">
+                              BTC: {shortenAddress(ew.bitcoinAddress, 8, 6)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(`${ew.id}-btc`, ew.bitcoinAddress!)}
+                              className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                            >
+                              {copiedKey === `${ew.id}-btc` ? (
+                                <Check className="w-3 h-3 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3 h-3" />
+                              )}
+                            </button>
+                          </div>
+                        )}
+                        {ew.moneroAddress && (
+                          <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
+                            <span className="truncate text-[#FF6600]">
+                              XMR: {shortenAddress(ew.moneroAddress, 8, 6)}
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => handleCopy(`${ew.id}-xmr`, ew.moneroAddress!)}
+                              className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                            >
+                              {copiedKey === `${ew.id}-xmr` ? (
+                                <Check className="w-3 h-3 text-emerald-400" />
+                              ) : (
+                                <Copy className="w-3 h-3" />
+                              )}
+                            </button>
                           </div>
                         )}
                       </div>
-                    )}
+
+                      {isInspectOpen && (
+                        <div className="p-4 rounded-lg bg-[#090B0F] border border-emerald-500/30 space-y-3 text-xs">
+                          {!unlocked ? (
+                            ew.encryptedVaultBlob ? (
+                              <div className="space-y-2">
+                                <div className="text-[11px] font-medium text-[#CBD5E1]">
+                                  Enter Admin Custody Encryption Passphrase to reveal {tierTitle} Recovery Phrase
+                                </div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <input
+                                    type="password"
+                                    value={walletPassInputs[ew.id] ?? ''}
+                                    onChange={(e) =>
+                                      setWalletPassInputs((prev) => ({
+                                        ...prev,
+                                        [ew.id]: e.target.value,
+                                      }))
+                                    }
+                                    placeholder="Admin Custody Encryption Passphrase"
+                                    className="bg-[#11151C] border border-white/10 rounded-lg px-3 py-1.5 text-base sm:text-xs text-[#F4F6F9] w-64"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() => handleDecryptExchangeWallet(ew)}
+                                    className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs"
+                                  >
+                                    Reveal {tierTitle} Phrase
+                                  </button>
+                                  {walletInspectErrors[ew.id] && (
+                                    <span className="text-red-400 text-xs">
+                                      {walletInspectErrors[ew.id]}
+                                    </span>
+                                  )}
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="space-y-2.5">
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="text-xs text-[#8A94A6]">
+                                    This {tierTitle} was registered watch-only without an encrypted recovery phrase.
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setAttachSecretWalletId(
+                                        attachSecretWalletId === ew.id ? null : ew.id
+                                      )
+                                    }
+                                    className="px-2.5 py-1 rounded bg-[#11151C] border border-emerald-500/40 text-[11px] text-emerald-400"
+                                  >
+                                    {attachSecretWalletId === ew.id
+                                      ? 'Cancel'
+                                      : 'Attach & Encrypt Recovery Phrase'}
+                                  </button>
+                                </div>
+
+                                {attachSecretWalletId === ew.id && (
+                                  <div className="space-y-2 pt-2 border-t border-white/10">
+                                    <textarea
+                                      rows={2}
+                                      value={attachPhraseInput}
+                                      onChange={(e) => setAttachPhraseInput(e.target.value)}
+                                      placeholder="Enter 12, 18, or 24-word recovery phrase"
+                                      className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9]"
+                                    />
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <input
+                                        type="password"
+                                        value={attachPassInput}
+                                        onChange={(e) => setAttachPassInput(e.target.value)}
+                                        placeholder="Admin Custody Encryption Passphrase (min 6 chars)"
+                                        className="flex-1 min-w-[200px] bg-[#11151C] border border-white/10 rounded-lg px-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                                      />
+                                      <button
+                                        type="button"
+                                        disabled={attachSaving}
+                                        onClick={() => handleAttachRecoveryPhraseToWallet(ew)}
+                                        className="px-3.5 py-1.5 rounded-lg bg-emerald-500 text-[#090B0F] font-semibold text-xs"
+                                      >
+                                        {attachSaving ? 'Encrypting...' : 'Encrypt & Save Phrase'}
+                                      </button>
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          ) : (
+                            <div className="space-y-3">
+                              {unlocked.mnemonic ? (
+                                <div className="p-3 rounded-lg bg-[#11151C] border border-emerald-500/30 space-y-2">
+                                  <div className="flex items-center justify-between gap-2">
+                                    <span className="text-[11px] font-semibold text-emerald-400">
+                                      {tierTitle} Recovery Phrase ({unlocked.mnemonic.split(' ').length} words)
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleCopy(`${ew.id}-mnemonic`, unlocked.mnemonic!)
+                                      }
+                                      className="inline-flex items-center gap-1 px-2 py-1 rounded bg-[#090B0F] border border-white/10 text-[11px] text-[#CBD5E1] hover:text-[#F4F6F9]"
+                                    >
+                                      {copiedKey === `${ew.id}-mnemonic` ? (
+                                        <Check className="w-3 h-3 text-emerald-400" />
+                                      ) : (
+                                        <Copy className="w-3 h-3" />
+                                      )}
+                                      <span>
+                                        {copiedKey === `${ew.id}-mnemonic` ? 'Copied' : 'Copy Phrase'}
+                                      </span>
+                                    </button>
+                                  </div>
+                                  <div className="font-mono text-xs text-[#F4F6F9] leading-relaxed break-words select-all">
+                                    {unlocked.mnemonic}
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="text-[11px] text-amber-300">
+                                  Imported via raw Private Key (no BIP-39 mnemonic phrase — custody key below).
+                                </div>
+                              )}
+
+                              <div className="space-y-1.5 font-mono text-[11px]">
+                                {unlocked.evmPrivateKey && (
+                                  <div className="flex items-center justify-between gap-2 break-all">
+                                    <div>
+                                      <span className="text-[#8A94A6]">EVM Key: </span>
+                                      <span className="text-[#F4F6F9]">{unlocked.evmPrivateKey}</span>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleCopy(`${ew.id}-evmk`, unlocked.evmPrivateKey!)
+                                      }
+                                      className="text-[#8A94A6] hover:text-[#F4F6F9] shrink-0"
+                                    >
+                                      {copiedKey === `${ew.id}-evmk` ? (
+                                        <Check className="w-3 h-3 text-emerald-400" />
+                                      ) : (
+                                        <Copy className="w-3 h-3" />
+                                      )}
+                                    </button>
+                                  </div>
+                                )}
+                                {unlocked.solanaSecretBase58 && (
+                                  <div className="break-all">
+                                    <span className="text-[#8A94A6]">Solana Secret: </span>
+                                    <span className="text-emerald-400">
+                                      {unlocked.solanaSecretBase58}
+                                    </span>
+                                  </div>
+                                )}
+                                {unlocked.bitcoinPrivateKeyHex && (
+                                  <div className="break-all">
+                                    <span className="text-[#8A94A6]">BTC Key Hex: </span>
+                                    <span className="text-amber-400">
+                                      {unlocked.bitcoinPrivateKeyHex}
+                                    </span>
+                                  </div>
+                                )}
+                                {unlocked.moneroSpendKeyHex && (
+                                  <div className="break-all">
+                                    <span className="text-[#8A94A6]">XMR Spend Key: </span>
+                                    <span className="text-[#FF6600]">
+                                      {unlocked.moneroSpendKeyHex}
+                                    </span>
+                                  </div>
+                                )}
+                                {unlocked.moneroViewKeyHex && (
+                                  <div className="break-all">
+                                    <span className="text-[#8A94A6]">XMR View Key: </span>
+                                    <span className="text-orange-300">
+                                      {unlocked.moneroViewKeyHex}
+                                    </span>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB 2C: ACTIVE SWAP WALLET & CLAIMS DISBURSEMENT BY WALLETS */}
+        {tab === 'claims' && (
+          <div className="space-y-6">
+            {/* Active Swap Wallet & Disbursement Configuration */}
+            <div className="bg-[#11151C] border border-white/10 rounded-xl p-5 sm:p-6 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9]">
+                    Active Swap Settlement Wallet & Claim Disbursement
+                  </h2>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    Choose the active Cold, Pool, or Hot wallet for Swaps and disburse user Sweep & Swap claims grouped by wallet
+                  </p>
+                </div>
+                <span className="text-xs font-mono text-emerald-400">
+                  {pendingClaimsCount} pending claims
+                </span>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-[11px] text-[#8A94A6] mb-1">
+                    Active Wallet for Swap Settlement
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <select
+                      value={systemConfig.activeSwapWalletId || ''}
+                      onChange={(e) => {
+                        const found = exchangeWallets.find((w) => w.id === e.target.value);
+                        if (found) void handleSetActiveSwapWallet(found);
+                      }}
+                      disabled={savingSwapWallet || exchangeWallets.length === 0}
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    >
+                      <option value="">
+                        {exchangeWallets.length === 0
+                          ? 'Create a Cold / Pool / Hot wallet first'
+                          : 'Select Active Swap Wallet...'}
+                      </option>
+                      {exchangeWallets
+                        .filter((w) => w.status !== 'frozen')
+                        .map((w) => (
+                          <option key={w.id} value={w.id}>
+                            {w.tier.toUpperCase()} · {w.label}
+                          </option>
+                        ))}
+                    </select>
                   </div>
-                ))
+                </div>
+
+                <div>
+                  <label className="block text-[11px] text-[#8A94A6] mb-1">
+                    Disburse Claims From Wallet
+                  </label>
+                  <select
+                    value={disburseSourceWalletId}
+                    onChange={(e) => setDisburseSourceWalletId(e.target.value)}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    {exchangeWallets.length === 0 && (
+                      <option value="">Exchange Settlement Pool</option>
+                    )}
+                    {exchangeWallets.map((w) => (
+                      <option key={w.id} value={w.id}>
+                        {w.tier.toUpperCase()} · {w.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-[11px] text-[#8A94A6] mb-1">
+                    Optional Payout Tx Hash (Auto-Generated If Blank)
+                  </label>
+                  <input
+                    type="text"
+                    value={disburseTxInput}
+                    onChange={(e) => setDisburseTxInput(e.target.value)}
+                    placeholder="0x... or leave blank for auto ref"
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Wallet Summary Strip (Disburse by Wallet) */}
+            {claimsByWallet.length > 0 && (
+              <div className="bg-[#11151C] border border-white/10 rounded-xl p-5 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                    Claims Grouped by Wallet ({claimsByWallet.length})
+                  </h3>
+                  {claimWalletFilter && (
+                    <button
+                      type="button"
+                      onClick={() => setClaimWalletFilter('')}
+                      className="text-xs text-emerald-400 hover:underline"
+                    >
+                      Clear Wallet Filter
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+                  {claimsByWallet.map((group) => (
+                    <div
+                      key={group.walletAddress}
+                      className="p-3.5 rounded-xl bg-[#090B0F] border border-white/10 space-y-2.5 text-xs"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setClaimWalletFilter(group.walletAddress)}
+                          className="text-left min-w-0 hover:text-emerald-400"
+                        >
+                          <div className="font-mono font-semibold text-[#F4F6F9] truncate">
+                            {shortenAddress(group.walletAddress, 10, 8)}
+                          </div>
+                          <div className="text-[11px] text-[#8A94A6] mt-0.5 tabular-nums">
+                            {group.pendingCount} pending · {group.disbursedCount} disbursed
+                          </div>
+                        </button>
+                        <div className="text-right font-mono tabular-nums">
+                          <div className="text-emerald-400 font-semibold">
+                            {formatFiat(group.pendingUsd, 'USD')}
+                          </div>
+                          <div className="text-[10px] text-[#64748B]">pending</div>
+                        </div>
+                      </div>
+
+                      {group.pendingCount > 0 && (
+                        <button
+                          type="button"
+                          disabled={Boolean(disbursingId)}
+                          onClick={() => handleDisburseAllForWallet(group.walletAddress)}
+                          className="w-full py-1.5 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
+                        >
+                          Disburse All Pending ({group.pendingCount})
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Claims Filter & Individual Disbursement Ledger */}
+            <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={claimTypeFilter}
+                    onChange={(e) =>
+                      setClaimTypeFilter(e.target.value as 'all' | 'sweep' | 'swap')
+                    }
+                    className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-1.5 text-xs text-[#F4F6F9]"
+                  >
+                    <option value="all">All Types (Sweep & Swap)</option>
+                    <option value="sweep">Sweep Claims Only</option>
+                    <option value="swap">Swap Claims Only</option>
+                  </select>
+                  <select
+                    value={claimStatusFilter}
+                    onChange={(e) =>
+                      setClaimStatusFilter(
+                        e.target.value as 'all' | 'requested' | 'claimable' | 'disbursed' | 'rejected'
+                      )
+                    }
+                    className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-1.5 text-xs text-[#F4F6F9]"
+                  >
+                    <option value="all">All Statuses</option>
+                    <option value="requested">Requested by User</option>
+                    <option value="claimable">Claimable (Not Yet Requested)</option>
+                    <option value="disbursed">Disbursed</option>
+                    <option value="rejected">Rejected</option>
+                  </select>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <input
+                    type="text"
+                    value={disburseNoteInput}
+                    onChange={(e) => setDisburseNoteInput(e.target.value)}
+                    placeholder="Admin note (optional)"
+                    className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-1.5 text-xs text-[#F4F6F9] w-44"
+                  />
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={claimWalletFilter}
+                      onChange={(e) => setClaimWalletFilter(e.target.value)}
+                      placeholder="Filter by wallet or coin..."
+                      className="bg-[#090B0F] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-xs text-[#F4F6F9] w-52"
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {filteredClaims.length === 0 ? (
+                <div className="p-10 text-center text-xs text-[#8A94A6]">
+                  No sweep or swap claims recorded matching your filters.
+                </div>
+              ) : (
+                <div className="divide-y divide-white/[0.06]">
+                  {filteredClaims.map((claim) => {
+                    const net = NETWORK_MAP[claim.networkId];
+                    const busy = disbursingId === claim.id;
+                    return (
+                      <div
+                        key={claim.id}
+                        className="px-5 py-4 flex flex-wrap items-center justify-between gap-4 text-xs"
+                      >
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                            <span
+                              className={`font-mono uppercase font-semibold ${
+                                claim.sourceType === 'sweep' ? 'text-sky-400' : 'text-indigo-400'
+                              }`}
+                            >
+                              {claim.sourceType} claim
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span className="font-semibold text-[#F4F6F9] tabular-nums">
+                              {claim.amount} {claim.symbol}
+                            </span>
+                            <span className="font-mono text-[#8A94A6] tabular-nums">
+                              ({formatFiat(claim.usdValue, 'USD')})
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span className="text-[#CBD5E1]">{net?.name || claim.networkId}</span>
+                            <span className="text-[#64748B]">·</span>
+                            <span
+                              className={
+                                claim.status === 'disbursed'
+                                  ? 'text-emerald-400 font-semibold'
+                                  : claim.status === 'requested'
+                                  ? 'text-amber-400 font-semibold'
+                                  : claim.status === 'rejected'
+                                  ? 'text-red-400 font-semibold'
+                                  : 'text-sky-400'
+                              }
+                            >
+                              {claim.status}
+                            </span>
+                          </div>
+
+                          <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                            Wallet: {claim.walletAddress} → Payout: {claim.destinationAddress}
+                          </div>
+
+                          <div className="font-mono text-[11px] text-[#64748B] truncate">
+                            Source Ref: {shortenAddress(claim.sourceTxHash, 10, 8)} ·{' '}
+                            {formatRelativeTime(claim.updatedAt)}
+                            {claim.disbursedByWalletLabel && (
+                              <span className="text-emerald-400">
+                                {' '}
+                                · Via {claim.disbursedByWalletLabel}
+                              </span>
+                            )}
+                            {claim.disbursementTxHash && (
+                              <span className="text-[#CBD5E1]">
+                                {' '}
+                                · Tx: {shortenAddress(claim.disbursementTxHash, 10, 8)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          {claim.status !== 'disbursed' && claim.status !== 'rejected' && (
+                            <>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleDisburseClaim(claim, 'disbursed')}
+                                className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                              >
+                                {busy ? 'Disbursing...' : 'Disburse Funds'}
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busy}
+                                onClick={() => handleDisburseClaim(claim, 'rejected')}
+                                className="px-3 py-2 rounded-lg bg-[#090B0F] border border-white/10 hover:border-red-500/40 text-[#CBD5E1] hover:text-red-300 text-xs whitespace-nowrap"
+                              >
+                                Reject
+                              </button>
+                            </>
+                          )}
+                          {claim.status === 'disbursed' && (
+                            <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400">
+                              Disbursed
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               )}
             </div>
           </div>
@@ -2035,6 +2865,9 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                       withdrawalsPaused: systemConfig.withdrawalsPaused,
                       hotWalletMaxPct: systemConfig.hotWalletMaxPct,
                       swapFeeBps: systemConfig.swapFeeBps,
+                      activeSwapWalletId: systemConfig.activeSwapWalletId,
+                      activeSwapWalletLabel: systemConfig.activeSwapWalletLabel,
+                      activeSwapWalletAddress: systemConfig.activeSwapWalletAddress,
                       updatedBy: currentUser.uid,
                     },
                     currentUser.uid

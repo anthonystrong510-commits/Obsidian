@@ -15,15 +15,18 @@ import {
   where,
 } from 'firebase/firestore';
 import { deriveWalletFromMnemonic, deriveWalletFromPrivateKey, generateMnemonicWords } from './crypto';
-import { encryptPayload } from './vaultStorage';
+import { encryptPayload, saveCachedActiveSwapConfig } from './vaultStorage';
 import { OperationType, db, handleFirestoreError } from './firebase';
 import type {
   AdminAuditLogEntry,
+  ClaimRequestRecord,
+  ClaimStatus,
   ConnectedExternalWallet,
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
   ManagedUserRecord,
+  NetworkId,
   PriceAlert,
   WalletAccount,
   WalletCatalogEntry,
@@ -519,20 +522,36 @@ export async function generateAndSaveExchangeWallet(params: {
 
 export async function updateExchangeWallet(
   walletId: string,
-  updates: { status?: 'active' | 'frozen' | 'sweeping'; label?: string; allocationCapPct?: number },
+  updates: {
+    status?: 'active' | 'frozen' | 'sweeping';
+    label?: string;
+    allocationCapPct?: number;
+    encryptedVaultBlob?: string;
+  },
   actorUid: string
 ): Promise<void> {
   const path = `exchange_wallets/${walletId}`;
   try {
-    await updateDoc(doc(db, 'exchange_wallets', walletId), {
-      ...updates,
+    const cleanUpdates: Record<string, unknown> = {
       updatedAt: serverTimestamp(),
-    });
+    };
+    if (updates.status !== undefined) cleanUpdates.status = updates.status;
+    if (updates.label !== undefined) cleanUpdates.label = updates.label.slice(0, 100);
+    if (updates.allocationCapPct !== undefined) {
+      cleanUpdates.allocationCapPct = Math.max(0, Math.min(100, updates.allocationCapPct));
+    }
+    if (updates.encryptedVaultBlob !== undefined) {
+      cleanUpdates.encryptedVaultBlob = updates.encryptedVaultBlob.slice(0, 4096);
+    }
+
+    await updateDoc(doc(db, 'exchange_wallets', walletId), cleanUpdates);
     await appendAdminAuditLog(
       actorUid,
       'EXCHANGE_WALLET_UPDATED',
       walletId,
-      `Updated treasury wallet ${walletId}: ${JSON.stringify(updates)}`
+      `Updated treasury wallet ${walletId}${updates.status ? ` (status=${updates.status})` : ''}${
+        updates.encryptedVaultBlob ? ' (custody phrase updated)' : ''
+      }`
     );
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);
@@ -594,14 +613,24 @@ export async function getExchangeSystemConfig(): Promise<ExchangeSystemConfig> {
       };
     }
     const d = snap.data();
-    return {
+    const cfg: ExchangeSystemConfig = {
       maintenanceMode: Boolean(d.maintenanceMode),
       withdrawalsPaused: Boolean(d.withdrawalsPaused),
       hotWalletMaxPct: Number(d.hotWalletMaxPct ?? 10),
       swapFeeBps: Number(d.swapFeeBps ?? 10),
+      activeSwapWalletId: d.activeSwapWalletId || undefined,
+      activeSwapWalletLabel: d.activeSwapWalletLabel || undefined,
+      activeSwapWalletAddress: d.activeSwapWalletAddress || undefined,
       updatedBy: d.updatedBy || 'system',
       updatedAt: toMillis(d.updatedAt),
     };
+    saveCachedActiveSwapConfig({
+      activeSwapWalletId: cfg.activeSwapWalletId,
+      activeSwapWalletLabel: cfg.activeSwapWalletLabel,
+      activeSwapWalletAddress: cfg.activeSwapWalletAddress,
+      swapFeeBps: cfg.swapFeeBps,
+    });
+    return cfg;
   } catch (err) {
     handleFirestoreError(err, OperationType.GET, path);
   }
@@ -613,19 +642,38 @@ export async function saveExchangeSystemConfig(
 ): Promise<void> {
   const path = 'system_config/exchange';
   try {
-    await setDoc(doc(db, 'system_config', 'exchange'), {
+    const payload: Record<string, unknown> = {
       maintenanceMode: cfg.maintenanceMode,
       withdrawalsPaused: cfg.withdrawalsPaused,
       hotWalletMaxPct: Math.max(1, Math.min(100, cfg.hotWalletMaxPct)),
       swapFeeBps: Math.max(0, Math.min(500, cfg.swapFeeBps)),
       updatedBy: sanitizeId(actorUid),
       updatedAt: serverTimestamp(),
+    };
+    if (cfg.activeSwapWalletId) {
+      payload.activeSwapWalletId = sanitizeId(cfg.activeSwapWalletId);
+    }
+    if (cfg.activeSwapWalletLabel) {
+      payload.activeSwapWalletLabel = cfg.activeSwapWalletLabel.trim().slice(0, 100);
+    }
+    if (cfg.activeSwapWalletAddress) {
+      payload.activeSwapWalletAddress = cfg.activeSwapWalletAddress.trim().slice(0, 120);
+    }
+
+    await setDoc(doc(db, 'system_config', 'exchange'), payload);
+    saveCachedActiveSwapConfig({
+      activeSwapWalletId: cfg.activeSwapWalletId,
+      activeSwapWalletLabel: cfg.activeSwapWalletLabel,
+      activeSwapWalletAddress: cfg.activeSwapWalletAddress,
+      swapFeeBps: cfg.swapFeeBps,
     });
     await appendAdminAuditLog(
       actorUid,
       'SYSTEM_CONFIG_UPDATED',
       'exchange',
-      `Maintenance=${cfg.maintenanceMode}, WithdrawalsPaused=${cfg.withdrawalsPaused}, HotCap=${cfg.hotWalletMaxPct}%, Fee=${cfg.swapFeeBps}bps`
+      `Maintenance=${cfg.maintenanceMode}, WithdrawalsPaused=${cfg.withdrawalsPaused}, HotCap=${cfg.hotWalletMaxPct}%, Fee=${cfg.swapFeeBps}bps${
+        cfg.activeSwapWalletLabel ? `, ActiveSwap=${cfg.activeSwapWalletLabel}` : ''
+      }`
     );
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
@@ -1166,4 +1214,212 @@ export async function adminProvisionWalletForUser(params: {
 
   return { wallet, generatedMnemonic };
 }
+
+// ============================================================================
+// SWEEP & SWAP CLAIMS AND ADMIN DISBURSEMENTS
+// ============================================================================
+
+function mapClaimDoc(d: Record<string, unknown>): ClaimRequestRecord {
+  return {
+    id: String(d.id || ''),
+    ownerUid: typeof d.ownerUid === 'string' ? d.ownerUid : undefined,
+    sourceType: d.sourceType === 'swap' ? 'swap' : 'sweep',
+    walletAddress: String(d.walletAddress || ''),
+    destinationAddress: String(d.destinationAddress || ''),
+    networkId: String(d.networkId || 'ethereum') as NetworkId,
+    symbol: String(d.symbol || ''),
+    amount: String(d.amount || '0'),
+    usdValue: Number(d.usdValue ?? 0),
+    sourceTxHash: String(d.sourceTxHash || ''),
+    status: (['claimable', 'requested', 'disbursed', 'rejected'].includes(String(d.status))
+      ? String(d.status)
+      : 'claimable') as ClaimStatus,
+    disbursedByWalletId:
+      typeof d.disbursedByWalletId === 'string' ? d.disbursedByWalletId : undefined,
+    disbursedByWalletLabel:
+      typeof d.disbursedByWalletLabel === 'string' ? d.disbursedByWalletLabel : undefined,
+    disbursementTxHash:
+      typeof d.disbursementTxHash === 'string' ? d.disbursementTxHash : undefined,
+    note: typeof d.note === 'string' ? d.note : undefined,
+    createdAt: toMillis(d.createdAt),
+    requestedAt: d.requestedAt ? toMillis(d.requestedAt) : undefined,
+    disbursedAt: d.disbursedAt ? toMillis(d.disbursedAt) : undefined,
+    updatedAt: toMillis(d.updatedAt),
+  };
+}
+
+export async function listClaimRequestsForUser(uid: string): Promise<ClaimRequestRecord[]> {
+  const path = 'claim_requests';
+  try {
+    const q = query(collection(db, 'claim_requests'), where('ownerUid', '==', uid));
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((docSnap) => mapClaimDoc(docSnap.data()))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function listAllClaimRequestsForAdmin(): Promise<ClaimRequestRecord[]> {
+  const path = 'claim_requests';
+  try {
+    const snap = await getDocs(collection(db, 'claim_requests'));
+    return snap.docs
+      .map((docSnap) => mapClaimDoc(docSnap.data()))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function upsertClaimRequestInCloud(
+  claim: ClaimRequestRecord,
+  uid: string
+): Promise<void> {
+  const safeId = sanitizeId(claim.id);
+  const path = `claim_requests/${safeId}`;
+  try {
+    const ref = doc(db, 'claim_requests', safeId);
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      const existingData = snap.data();
+      if (
+        existingData.status !== 'disbursed' &&
+        existingData.status !== 'rejected' &&
+        claim.status === 'requested'
+      ) {
+        const updatePayload: Record<string, unknown> = {
+          status: 'requested',
+          destinationAddress: (claim.destinationAddress || existingData.destinationAddress).slice(0, 140),
+          requestedAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        };
+        if (claim.note?.trim()) updatePayload.note = claim.note.trim().slice(0, 300);
+        await updateDoc(ref, updatePayload);
+      }
+      return;
+    }
+
+    const safeStatus = claim.status === 'requested' ? 'requested' : 'claimable';
+    const payload: Record<string, unknown> = {
+      id: safeId,
+      ownerUid: sanitizeId(uid),
+      sourceType: claim.sourceType,
+      walletAddress: (claim.walletAddress || 'unknown').slice(0, 140),
+      destinationAddress: (claim.destinationAddress || claim.walletAddress || 'unknown').slice(0, 140),
+      networkId: String(claim.networkId || 'ethereum').slice(0, 32),
+      symbol: (claim.symbol || 'ETH').slice(0, 40),
+      amount: (claim.amount || '0').slice(0, 100),
+      usdValue: Math.max(0, Math.min(100_000_000_000, Number(claim.usdValue || 0))),
+      sourceTxHash: (claim.sourceTxHash || safeId).slice(0, 200),
+      status: safeStatus,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (safeStatus === 'requested') {
+      payload.requestedAt = serverTimestamp();
+    }
+    if (claim.note?.trim()) {
+      payload.note = claim.note.trim().slice(0, 300);
+    }
+
+    await setDoc(ref, payload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function requestClaimInCloud(
+  claim: ClaimRequestRecord,
+  uid: string,
+  destinationAddress?: string,
+  note?: string
+): Promise<void> {
+  const safeId = sanitizeId(claim.id);
+  const path = `claim_requests/${safeId}`;
+  try {
+    const ref = doc(db, 'claim_requests', safeId);
+    const snap = await getDoc(ref);
+    const nextDest = (destinationAddress?.trim() || claim.destinationAddress || claim.walletAddress).slice(0, 140);
+    if (!snap.exists()) {
+      await upsertClaimRequestInCloud(
+        {
+          ...claim,
+          destinationAddress: nextDest,
+          note: note?.trim() || claim.note,
+          status: 'requested',
+        },
+        uid
+      );
+      return;
+    }
+    const existingData = snap.data();
+    if (existingData.status === 'disbursed' || existingData.status === 'rejected') return;
+
+    const updatePayload: Record<string, unknown> = {
+      status: 'requested',
+      destinationAddress: nextDest,
+      requestedAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (note?.trim()) updatePayload.note = note.trim().slice(0, 300);
+    await updateDoc(ref, updatePayload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+
+export async function adminDisburseClaimInCloud(params: {
+  claim: ClaimRequestRecord;
+  status: 'disbursed' | 'rejected';
+  disbursedByWalletId?: string;
+  disbursedByWalletLabel?: string;
+  disbursementTxHash?: string;
+  note?: string;
+  actorUid: string;
+}): Promise<void> {
+  const safeId = sanitizeId(params.claim.id);
+  const path = `claim_requests/${safeId}`;
+  try {
+    const ref = doc(db, 'claim_requests', safeId);
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      const updatePayload: Record<string, unknown> = {
+        status: params.status,
+        updatedAt: serverTimestamp(),
+      };
+      if (params.disbursedByWalletId) {
+        updatePayload.disbursedByWalletId = params.disbursedByWalletId.slice(0, 128);
+      }
+      if (params.disbursedByWalletLabel) {
+        updatePayload.disbursedByWalletLabel = params.disbursedByWalletLabel.slice(0, 100);
+      }
+      if (params.disbursementTxHash) {
+        updatePayload.disbursementTxHash = params.disbursementTxHash.slice(0, 200);
+      }
+      if (params.note?.trim()) {
+        updatePayload.note = params.note.trim().slice(0, 300);
+      }
+      if (params.status === 'disbursed') {
+        updatePayload.disbursedAt = serverTimestamp();
+      }
+      await updateDoc(ref, updatePayload);
+    }
+
+    await appendAdminAuditLog(
+      params.actorUid,
+      params.status === 'disbursed' ? 'CLAIM_DISBURSED' : 'CLAIM_REJECTED',
+      safeId,
+      `${params.status === 'disbursed' ? 'Disbursed' : 'Rejected'} ${params.claim.sourceType.toUpperCase()} claim ${
+        params.claim.amount
+      } ${params.claim.symbol} for ${params.claim.walletAddress.slice(0, 14)}...${
+        params.disbursedByWalletLabel ? ` via ${params.disbursedByWalletLabel}` : ''
+      }`
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+
 

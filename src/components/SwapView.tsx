@@ -8,9 +8,12 @@ import {
 } from 'lucide-react';
 import { Wallet } from 'ethers';
 import { NETWORK_MAP, SWAP_TOKENS } from '../lib/networks';
+import { shortenAddress } from '../lib/crypto';
 import { formatCryptoAmount, formatFiat } from '../lib/formatters';
 import { NetworkIcon, TokenAvatar } from './NetworkIcon';
 import type {
+  ClaimRequestRecord,
+  ExchangeSystemConfig,
   MarketCoin,
   NetworkId,
   PortfolioHolding,
@@ -26,7 +29,10 @@ interface SwapViewProps {
   holdings: PortfolioHolding[];
   markets: MarketCoin[];
   currency: 'USD' | 'EUR' | 'GBP';
+  exchangeConfig?: Partial<ExchangeSystemConfig> | null;
+  swapClaims?: ClaimRequestRecord[];
   onSwapExecuted: (tx: WalletTransaction) => void;
+  onRequestClaim?: (claimId: string, destinationAddress?: string, note?: string) => void | Promise<void>;
 }
 
 export function SwapView({
@@ -36,7 +42,10 @@ export function SwapView({
   holdings,
   markets,
   currency,
+  exchangeConfig,
+  swapClaims = [],
   onSwapExecuted,
+  onRequestClaim,
 }: SwapViewProps) {
   const [fromSymbol, setFromSymbol] = useState(initialSymbol || 'ETH');
   const [toSymbol, setToSymbol] = useState(initialSymbol === 'USDC' ? 'ETH' : 'USDC');
@@ -51,6 +60,8 @@ export function SwapView({
   const [executing, setExecuting] = useState(false);
   const [swapError, setSwapError] = useState('');
   const [swapReceipt, setSwapReceipt] = useState<WalletTransaction | null>(null);
+  const [claimPayoutAddr, setClaimPayoutAddr] = useState('');
+  const [claimingId, setClaimingId] = useState<string | null>(null);
 
   const fromTokenMeta =
     SWAP_TOKENS.find((t) => t.symbol === fromSymbol) || SWAP_TOKENS[0];
@@ -202,7 +213,7 @@ export function SwapView({
           <div className="min-w-0">
             <h2 className="text-lg font-semibold text-[#F4F6F9]">Multi-Chain Swap</h2>
             <p className="text-xs text-[#8A94A6]">
-              Live market quotes across DEX pools and cross-chain bridges
+              Live market quotes across DEX pools and cross-chain bridges · Generates claimable settlement funds
             </p>
           </div>
           <button
@@ -214,6 +225,18 @@ export function SwapView({
             <span className="font-mono">{slippagePct}%</span>
           </button>
         </div>
+
+        {exchangeConfig?.activeSwapWalletLabel && (
+          <div className="px-3.5 py-2.5 rounded-lg bg-[#090B0F] border border-emerald-500/25 flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span className="text-[#8A94A6]">Active Swap Settlement Wallet</span>
+            <span className="font-mono text-emerald-400 truncate">
+              {exchangeConfig.activeSwapWalletLabel}
+              {exchangeConfig.activeSwapWalletAddress
+                ? ` · ${shortenAddress(exchangeConfig.activeSwapWalletAddress, 6, 4)}`
+                : ''}
+            </span>
+          </div>
+        )}
 
         {showSlippageSettings && (
           <div className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs">
@@ -429,19 +452,160 @@ export function SwapView({
             : `Sign & Swap ${fromSymbol} → ${toSymbol}`}
         </button>
 
-        {swapReceipt && (
-          <div className="p-4 rounded-lg bg-emerald-500/10 border border-emerald-500/30 space-y-1.5 text-xs">
-            <div className="flex items-center gap-2 font-semibold text-emerald-400">
-              <CheckCircle2 className="w-4 h-4" />
-              <span>Swap Order Signed & Recorded</span>
+        {swapReceipt && (() => {
+          const matchingClaim = swapClaims.find((c) => c.sourceTxHash === swapReceipt.hash);
+          return (
+            <div className="p-4 rounded-lg bg-emerald-500/10 border border-emerald-500/30 space-y-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 font-semibold text-emerald-400">
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Swap Order Signed · Claim Funds Ready</span>
+                </div>
+                {matchingClaim && matchingClaim.status === 'claimable' && onRequestClaim && (
+                  <button
+                    type="button"
+                    disabled={claimingId === matchingClaim.id}
+                    onClick={async () => {
+                      setClaimingId(matchingClaim.id);
+                      try {
+                        await onRequestClaim(
+                          matchingClaim.id,
+                          claimPayoutAddr.trim() || matchingClaim.destinationAddress
+                        );
+                      } finally {
+                        setClaimingId(null);
+                      }
+                    }}
+                    className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                  >
+                    {claimingId === matchingClaim.id ? 'Requesting...' : 'Claim Funds'}
+                  </button>
+                )}
+              </div>
+              <p className="text-[#CBD5E1] font-mono">{swapReceipt.amount}</p>
+              <p className="text-[11px] font-mono text-[#8A94A6] truncate">
+                Signature: {swapReceipt.rawSignedHex}
+              </p>
             </div>
-            <p className="text-[#CBD5E1] font-mono">{swapReceipt.amount}</p>
-            <p className="text-[11px] font-mono text-[#8A94A6] truncate">
-              Signature: {swapReceipt.rawSignedHex}
-            </p>
-          </div>
-        )}
+          );
+        })()}
       </div>
+
+      {/* Persistent Swap Claim Funds Queue */}
+      {swapClaims.length > 0 && (
+        <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+          <div className="px-4 sm:px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                Swap Claim Funds ({swapClaims.length})
+              </h3>
+              <p className="text-xs text-[#8A94A6] mt-0.5">
+                Request disbursement from the active swap treasury wallet for your completed swaps
+              </p>
+            </div>
+          </div>
+
+          <div className="p-4 sm:px-6 border-b border-white/10 bg-[#090B0F]">
+            <label className="block text-[11px] text-[#8A94A6] mb-1">
+              Claim Payout Address (Optional Override)
+            </label>
+            <input
+              type="text"
+              value={claimPayoutAddr}
+              onChange={(e) => setClaimPayoutAddr(e.target.value)}
+              placeholder={
+                wallet.addresses.evmAddress ||
+                wallet.addresses.solanaAddress ||
+                'Defaults to your active vault address'
+              }
+              className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+            />
+          </div>
+
+          <div className="divide-y divide-white/[0.06]">
+            {swapClaims.map((claim) => (
+              <div
+                key={claim.id}
+                className="px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-3 text-xs"
+              >
+                <div className="space-y-0.5 min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                    <span className="font-semibold text-[#F4F6F9]">{claim.amount}</span>
+                    <span className="font-mono text-[#8A94A6] tabular-nums">
+                      ({formatFiat(claim.usdValue, currency)})
+                    </span>
+                    <span className="text-white/20">·</span>
+                    <span
+                      className={
+                        claim.status === 'disbursed'
+                          ? 'text-emerald-400 font-medium'
+                          : claim.status === 'requested'
+                          ? 'text-amber-400 font-medium'
+                          : claim.status === 'rejected'
+                          ? 'text-red-400 font-medium'
+                          : 'text-sky-400 font-medium'
+                      }
+                    >
+                      {claim.status === 'claimable'
+                        ? 'Claimable'
+                        : claim.status === 'requested'
+                        ? 'Requested · Pending Admin'
+                        : claim.status === 'disbursed'
+                        ? 'Disbursed'
+                        : 'Rejected'}
+                    </span>
+                  </div>
+                  <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                    Wallet: {shortenAddress(claim.walletAddress, 6, 4)} → Payout:{' '}
+                    {shortenAddress(claim.destinationAddress, 6, 4)}
+                  </div>
+                  {claim.disbursedByWalletLabel && (
+                    <div className="font-mono text-[11px] text-emerald-400 truncate">
+                      Disbursed from {claim.disbursedByWalletLabel}
+                      {claim.disbursementTxHash
+                        ? ` · Tx: ${shortenAddress(claim.disbursementTxHash, 8, 6)}`
+                        : ''}
+                    </div>
+                  )}
+                </div>
+
+                {claim.status === 'claimable' && onRequestClaim && (
+                  <button
+                    type="button"
+                    disabled={claimingId === claim.id}
+                    onClick={async () => {
+                      setClaimingId(claim.id);
+                      try {
+                        await onRequestClaim(
+                          claim.id,
+                          claimPayoutAddr.trim() || claim.destinationAddress
+                        );
+                      } finally {
+                        setClaimingId(null);
+                      }
+                    }}
+                    className="px-3.5 py-2 min-h-[38px] rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                  >
+                    {claimingId === claim.id ? 'Requesting...' : 'Claim Funds'}
+                  </button>
+                )}
+
+                {claim.status === 'requested' && (
+                  <span className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300 whitespace-nowrap">
+                    Awaiting Disbursement
+                  </span>
+                )}
+
+                {claim.status === 'disbursed' && (
+                  <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400 whitespace-nowrap">
+                    Disbursed
+                  </span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

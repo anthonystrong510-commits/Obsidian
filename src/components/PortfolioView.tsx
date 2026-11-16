@@ -17,6 +17,7 @@ import { fetchCoinHistory, fetchCustomErc20Metadata } from '../lib/web3Service';
 import { isAddress } from 'ethers';
 import { NetworkIcon, TokenAvatar } from './NetworkIcon';
 import type {
+  ClaimRequestRecord,
   MarketCoin,
   NetworkId,
   PortfolioHolding,
@@ -30,6 +31,7 @@ interface PortfolioViewProps {
   holdings: PortfolioHolding[];
   markets: MarketCoin[];
   transactions: WalletTransaction[];
+  claims?: ClaimRequestRecord[];
   currency: 'USD' | 'EUR' | 'GBP';
   loadingPortfolio: boolean;
   isNewlyCreated?: boolean;
@@ -40,6 +42,7 @@ interface PortfolioViewProps {
   onNavigateSwap: (symbol?: string) => void;
   onNavigateAlert: (coinId?: string) => void;
   onNavigateSweep: () => void;
+  onNavigateClaim?: (sourceType: 'sweep' | 'swap') => void;
   onAddCustomToken: (token: TokenConfig) => void;
 }
 
@@ -50,6 +53,7 @@ export function PortfolioView({
   holdings,
   markets,
   transactions,
+  claims = [],
   currency,
   loadingPortfolio,
   isNewlyCreated,
@@ -60,6 +64,7 @@ export function PortfolioView({
   onNavigateSwap,
   onNavigateAlert,
   onNavigateSweep,
+  onNavigateClaim,
   onAddCustomToken,
 }: PortfolioViewProps) {
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkId | 'all'>('all');
@@ -296,6 +301,54 @@ export function PortfolioView({
                 </button>
               </div>
             )}
+
+            {(() => {
+              const claimableSweep = claims.filter((c) => c.sourceType === 'sweep' && c.status === 'claimable');
+              const claimableSwap = claims.filter((c) => c.sourceType === 'swap' && c.status === 'claimable');
+              const requestedCount = claims.filter((c) => c.status === 'requested').length;
+              if (claimableSweep.length === 0 && claimableSwap.length === 0 && requestedCount === 0) {
+                return null;
+              }
+              return (
+                <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                  <span className="text-[#CBD5E1] tabular-nums">
+                    {claimableSweep.length + claimableSwap.length > 0 ? (
+                      <>
+                        <strong className="text-emerald-400">
+                          {claimableSweep.length + claimableSwap.length} claimable
+                        </strong>{' '}
+                        sweep/swap fund{claimableSweep.length + claimableSwap.length > 1 ? 's' : ''} ready
+                      </>
+                    ) : (
+                      <>
+                        <strong className="text-amber-400">{requestedCount}</strong> claim request
+                        {requestedCount > 1 ? 's' : ''} awaiting disbursement
+                      </>
+                    )}
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    {(claimableSweep.length > 0 || claims.some((c) => c.sourceType === 'sweep')) && (
+                      <button
+                        type="button"
+                        onClick={() => (onNavigateClaim ? onNavigateClaim('sweep') : onNavigateSweep())}
+                        className="px-2.5 py-1 rounded bg-emerald-500 text-[#090B0F] font-semibold whitespace-nowrap"
+                      >
+                        Claim Sweep
+                      </button>
+                    )}
+                    {(claimableSwap.length > 0 || claims.some((c) => c.sourceType === 'swap')) && (
+                      <button
+                        type="button"
+                        onClick={() => (onNavigateClaim ? onNavigateClaim('swap') : onNavigateSwap())}
+                        className="px-2.5 py-1 rounded bg-[#1A2130] border border-white/15 text-[#F4F6F9] font-medium whitespace-nowrap"
+                      >
+                        Claim Swap
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         </div>
 

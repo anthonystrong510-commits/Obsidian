@@ -1,6 +1,8 @@
 import type {
   AddressBookEntry,
+  ClaimRequestRecord,
   ConnectedExternalWallet,
+  ExchangeSystemConfig,
   NetworkId,
   PriceAlert,
   TokenConfig,
@@ -358,4 +360,122 @@ export function saveWalletAuthSession(session: WalletAuthSession | null): void {
 export function clearWalletAuthSession(): void {
   localStorage.removeItem(WALLET_AUTH_SESSION_KEY);
 }
+
+// Global Disconnect-Proof Claim Ledger (persists across Disconnect, Disconnect All, and Wallet-Auth logout)
+const CLAIM_LEDGER_KEY = 'obsidian_claim_ledger_v1';
+const ACTIVE_SWAP_CONFIG_KEY = 'obsidian_active_swap_config_v1';
+
+export function loadClaimLedger(): ClaimRequestRecord[] {
+  try {
+    const raw = localStorage.getItem(CLAIM_LEDGER_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as ClaimRequestRecord[];
+    return Array.isArray(parsed)
+      ? parsed.sort((a, b) => b.updatedAt - a.updatedAt)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveClaimLedger(claims: ClaimRequestRecord[]): void {
+  try {
+    const sorted = [...claims].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 500);
+    localStorage.setItem(CLAIM_LEDGER_KEY, JSON.stringify(sorted));
+  } catch {
+    // Ignore storage quota errors
+  }
+}
+
+export function upsertClaimRecord(record: ClaimRequestRecord): ClaimRequestRecord[] {
+  const existing = loadClaimLedger();
+  const idx = existing.findIndex((c) => c.id === record.id);
+  let next: ClaimRequestRecord[];
+  if (idx >= 0) {
+    const prev = existing[idx];
+    // Never regress a disbursed/requested state back to claimable
+    const statusPriority: Record<ClaimRequestRecord['status'], number> = {
+      claimable: 0,
+      requested: 1,
+      disbursed: 2,
+      rejected: 2,
+    };
+    const merged: ClaimRequestRecord =
+      statusPriority[prev.status] > statusPriority[record.status]
+        ? { ...record, ...prev, updatedAt: Math.max(prev.updatedAt, record.updatedAt) }
+        : record;
+    next = existing.map((c, i) => (i === idx ? merged : c));
+  } else {
+    next = [record, ...existing];
+  }
+  saveClaimLedger(next);
+  return next;
+}
+
+export function requestClaimInLedger(
+  claimId: string,
+  destinationAddress?: string,
+  note?: string
+): ClaimRequestRecord[] {
+  const existing = loadClaimLedger();
+  const now = Date.now();
+  const next = existing.map((c) => {
+    if (c.id !== claimId || c.status === 'disbursed') return c;
+    return {
+      ...c,
+      destinationAddress: destinationAddress?.trim() || c.destinationAddress,
+      note: note?.trim() || c.note,
+      status: 'requested' as const,
+      requestedAt: c.requestedAt || now,
+      updatedAt: now,
+    };
+  });
+  saveClaimLedger(next);
+  return next;
+}
+
+export function disburseClaimInLedger(params: {
+  claimId: string;
+  status: 'disbursed' | 'rejected';
+  disbursedByWalletId?: string;
+  disbursedByWalletLabel?: string;
+  disbursementTxHash?: string;
+  note?: string;
+}): ClaimRequestRecord[] {
+  const existing = loadClaimLedger();
+  const now = Date.now();
+  const next = existing.map((c) => {
+    if (c.id !== params.claimId) return c;
+    return {
+      ...c,
+      status: params.status,
+      disbursedByWalletId: params.disbursedByWalletId ?? c.disbursedByWalletId,
+      disbursedByWalletLabel: params.disbursedByWalletLabel ?? c.disbursedByWalletLabel,
+      disbursementTxHash: params.disbursementTxHash ?? c.disbursementTxHash,
+      note: params.note?.trim() || c.note,
+      disbursedAt: params.status === 'disbursed' ? now : c.disbursedAt,
+      updatedAt: now,
+    };
+  });
+  saveClaimLedger(next);
+  return next;
+}
+
+export function loadCachedActiveSwapConfig(): Partial<ExchangeSystemConfig> | null {
+  try {
+    const raw = localStorage.getItem(ACTIVE_SWAP_CONFIG_KEY);
+    return raw ? (JSON.parse(raw) as Partial<ExchangeSystemConfig>) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveCachedActiveSwapConfig(cfg: Partial<ExchangeSystemConfig>): void {
+  try {
+    localStorage.setItem(ACTIVE_SWAP_CONFIG_KEY, JSON.stringify(cfg));
+  } catch {
+    // Ignore
+  }
+}
+
 

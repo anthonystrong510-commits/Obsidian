@@ -45,6 +45,7 @@ import {
 } from '../lib/walletConnectService';
 import { NetworkIcon, TokenAvatar } from './NetworkIcon';
 import type {
+  ClaimRequestRecord,
   ConnectedExternalWallet,
   DiscoveredWalletProvider,
   MarketCoin,
@@ -64,11 +65,14 @@ interface ConnectSweepViewProps {
   currency: 'USD' | 'EUR' | 'GBP';
   connectedExternals: ConnectedExternalWallet[];
   walletCatalog: WalletCatalogEntry[];
+  claims?: ClaimRequestRecord[];
   onConnectAccounts: (newConnections: ConnectedExternalWallet[]) => void;
   onToggleConnectionSweep: (sessionId: string) => void;
   onDisconnectOne: (sessionId: string) => void;
   onDisconnectAll: () => void;
   onSweepExecuted: (tx: WalletTransaction) => void;
+  onRequestClaim?: (claimId: string, destinationAddress?: string, note?: string) => void | Promise<void>;
+  onRequestAllClaims?: (claimIds: string[], destinationAddress?: string) => void | Promise<void>;
   onDismissNewBanner?: () => void;
   isExpressMobileMode?: boolean;
   onOpenFullVaultAuth?: () => void;
@@ -100,11 +104,14 @@ export function ConnectSweepView({
   currency,
   connectedExternals,
   walletCatalog,
+  claims = [],
   onConnectAccounts,
   onToggleConnectionSweep,
   onDisconnectOne,
   onDisconnectAll,
   onSweepExecuted,
+  onRequestClaim,
+  onRequestAllClaims,
   onDismissNewBanner,
   isExpressMobileMode = false,
   onOpenFullVaultAuth,
@@ -142,6 +149,14 @@ export function ConnectSweepView({
   const [batchSweeping, setBatchSweeping] = useState(false);
   const [error, setError] = useState('');
   const [sweepReceipts, setSweepReceipts] = useState<WalletTransaction[]>([]);
+
+  // Persistent Sweep Claims State (remains available even after disconnecting wallets)
+  const [claimWalletFilter, setClaimWalletFilter] = useState<string>('all');
+  const [claimStatusFilter, setClaimStatusFilter] = useState<'all' | 'claimable' | 'requested' | 'disbursed'>('all');
+  const [claimPayoutAddress, setClaimPayoutAddress] = useState('');
+  const [claimNote, setClaimNote] = useState('');
+  const [claimingId, setClaimingId] = useState<string | null>(null);
+  const [claimingAll, setClaimingAll] = useState(false);
 
   const isMobile = useMemo(() => isMobileUserAgent(), []);
   const inAppWallet = useMemo(() => isInAppWalletBrowser(), []);
@@ -635,6 +650,83 @@ export function ConnectSweepView({
     await navigator.clipboard.writeText(val);
     setCopiedDest(kind);
     setTimeout(() => setCopiedDest(null), 1600);
+  };
+
+  // Persistent Sweep Claims Derived Data (available even after disconnecting all wallets)
+  const sweepClaims = useMemo(
+    () => claims.filter((c) => c.sourceType === 'sweep'),
+    [claims]
+  );
+
+  const previouslySweptWallets = useMemo(() => {
+    const map = new Map<string, { address: string; count: number; claimableUsd: number; isConnected: boolean }>();
+    const connectedSet = new Set(connectedExternals.map((c) => c.address.toLowerCase()));
+    for (const c of sweepClaims) {
+      const key = c.walletAddress.toLowerCase();
+      const prev = map.get(key);
+      const addUsd = c.status === 'claimable' ? c.usdValue : 0;
+      if (prev) {
+        prev.count += 1;
+        prev.claimableUsd += addUsd;
+      } else {
+        map.set(key, {
+          address: c.walletAddress,
+          count: 1,
+          claimableUsd: addUsd,
+          isConnected: connectedSet.has(key),
+        });
+      }
+    }
+    return Array.from(map.values());
+  }, [sweepClaims, connectedExternals]);
+
+  const filteredSweepClaims = useMemo(() => {
+    return sweepClaims.filter((c) => {
+      if (claimWalletFilter !== 'all' && c.walletAddress.toLowerCase() !== claimWalletFilter.toLowerCase()) {
+        return false;
+      }
+      if (claimStatusFilter !== 'all' && c.status !== claimStatusFilter) {
+        return false;
+      }
+      return true;
+    });
+  }, [sweepClaims, claimWalletFilter, claimStatusFilter]);
+
+  const claimableSweepIds = useMemo(
+    () => filteredSweepClaims.filter((c) => c.status === 'claimable').map((c) => c.id),
+    [filteredSweepClaims]
+  );
+
+  const defaultClaimDestination =
+    claimPayoutAddress.trim() ||
+    destinationWallet.addresses.evmAddress ||
+    destinationWallet.addresses.solanaAddress ||
+    '';
+
+  const handleTriggerSingleClaim = async (claim: ClaimRequestRecord) => {
+    if (!onRequestClaim) return;
+    setClaimingId(claim.id);
+    try {
+      const targetAddr =
+        claimPayoutAddress.trim() ||
+        (NETWORK_MAP[claim.networkId]?.family === 'solana'
+          ? destinationWallet.addresses.solanaAddress
+          : destinationWallet.addresses.evmAddress) ||
+        claim.destinationAddress;
+      await onRequestClaim(claim.id, targetAddr, claimNote.trim() || undefined);
+    } finally {
+      setClaimingId(null);
+    }
+  };
+
+  const handleTriggerAllSweepClaims = async () => {
+    if (!onRequestAllClaims || claimableSweepIds.length === 0) return;
+    setClaimingAll(true);
+    try {
+      await onRequestAllClaims(claimableSweepIds, claimPayoutAddress.trim() || undefined);
+    } finally {
+      setClaimingAll(false);
+    }
   };
 
   return (
@@ -1360,12 +1452,252 @@ export function ConnectSweepView({
         </div>
       )}
 
+      {/* Persistent Claim Swept Coins Console (Always Available Even After Disconnecting) */}
+      <div className="bg-[#11151C] border border-emerald-500/30 rounded-xl overflow-hidden">
+        <div className="px-4 sm:px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                Claim Swept Coins & Payout Requests
+              </h3>
+            </div>
+            <p className="text-xs text-[#8A94A6] mt-0.5">
+              Wallets with previous sweeps always retain their Claim Funds button here — even after disconnecting
+            </p>
+          </div>
+
+          {claimableSweepIds.length > 0 && onRequestAllClaims && (
+            <button
+              type="button"
+              disabled={claimingAll}
+              onClick={handleTriggerAllSweepClaims}
+              className="inline-flex items-center gap-1.5 px-4 py-2 min-h-[40px] rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+            >
+              <Zap className="w-3.5 h-3.5" />
+              <span>
+                {claimingAll
+                  ? 'Requesting Claims...'
+                  : `Claim All Swept (${claimableSweepIds.length})`}
+              </span>
+            </button>
+          )}
+        </div>
+
+        <div className="p-4 sm:p-6 space-y-4">
+          {sweepClaims.length === 0 ? (
+            <div className="p-6 rounded-xl bg-[#090B0F] border border-white/10 text-center space-y-1.5">
+              <p className="text-xs font-medium text-[#CBD5E1]">
+                No swept coin claims recorded yet
+              </p>
+              <p className="text-xs text-[#64748B]">
+                Execute a sweep above — once completed, your wallet address keeps permanent Claim Funds access even if you disconnect all external wallets.
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* Previously Swept Wallet Selector (Persists Post-Disconnect) */}
+              <div className="space-y-2">
+                <div className="text-[11px] font-medium text-[#8A94A6]">
+                  Wallets With Previous Sweeps ({previouslySweptWallets.length})
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setClaimWalletFilter('all')}
+                    className={`px-3 py-1.5 rounded-lg text-xs border transition-colors whitespace-nowrap ${
+                      claimWalletFilter === 'all'
+                        ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400 font-medium'
+                        : 'bg-[#090B0F] border-white/10 text-[#8A94A6] hover:text-[#F4F6F9]'
+                    }`}
+                  >
+                    All Swept Wallets ({sweepClaims.length})
+                  </button>
+                  {previouslySweptWallets.map((pw) => {
+                    const active = claimWalletFilter.toLowerCase() === pw.address.toLowerCase();
+                    return (
+                      <button
+                        key={pw.address}
+                        type="button"
+                        onClick={() => setClaimWalletFilter(pw.address)}
+                        className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs border transition-colors whitespace-nowrap ${
+                          active
+                            ? 'bg-emerald-500/15 border-emerald-500/40 text-emerald-400 font-medium'
+                            : 'bg-[#090B0F] border-white/10 text-[#CBD5E1] hover:border-white/20'
+                        }`}
+                      >
+                        <span className="font-mono">{shortenAddress(pw.address, 6, 4)}</span>
+                        <span className="text-white/20">·</span>
+                        <span className={pw.isConnected ? 'text-emerald-400' : 'text-[#8A94A6]'}>
+                          {pw.isConnected ? 'Connected' : 'Disconnected'}
+                        </span>
+                        <span className="text-white/20">·</span>
+                        <span className="font-mono tabular-nums">{pw.count}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Claim Payout Override & Status Filter */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3 p-3.5 rounded-xl bg-[#090B0F] border border-white/10">
+                <div className="md:col-span-5">
+                  <label className="block text-[11px] text-[#8A94A6] mb-1">
+                    Claim Payout Destination (Defaults to Active Vault)
+                  </label>
+                  <input
+                    type="text"
+                    value={claimPayoutAddress}
+                    onChange={(e) => setClaimPayoutAddress(e.target.value)}
+                    placeholder={defaultClaimDestination || '0x... or Solana destination'}
+                    className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                  />
+                </div>
+                <div className="md:col-span-4">
+                  <label className="block text-[11px] text-[#8A94A6] mb-1">
+                    Request Note (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={claimNote}
+                    onChange={(e) => setClaimNote(e.target.value)}
+                    placeholder="Preferred chain or payout note"
+                    className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  />
+                </div>
+                <div className="md:col-span-3">
+                  <label className="block text-[11px] text-[#8A94A6] mb-1">Status Filter</label>
+                  <select
+                    value={claimStatusFilter}
+                    onChange={(e) =>
+                      setClaimStatusFilter(
+                        e.target.value as 'all' | 'claimable' | 'requested' | 'disbursed'
+                      )
+                    }
+                    className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    <option value="all">All Claims</option>
+                    <option value="claimable">Claimable Now</option>
+                    <option value="requested">Requested</option>
+                    <option value="disbursed">Disbursed</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Sweep Claims List */}
+              <div className="divide-y divide-white/[0.06] border border-white/10 rounded-xl overflow-hidden bg-[#090B0F]">
+                {filteredSweepClaims.length === 0 ? (
+                  <div className="p-6 text-center text-xs text-[#8A94A6]">
+                    No sweep claims match the current wallet or status filter.
+                  </div>
+                ) : (
+                  filteredSweepClaims.map((claim) => {
+                    const net = NETWORK_MAP[claim.networkId];
+                    const isBusy = claimingId === claim.id;
+                    const isConnected = connectedExternals.some(
+                      (c) => c.address.toLowerCase() === claim.walletAddress.toLowerCase()
+                    );
+                    return (
+                      <div
+                        key={claim.id}
+                        className="p-4 flex flex-wrap items-center justify-between gap-4 text-xs"
+                      >
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                            <span className="font-semibold text-[#F4F6F9] tabular-nums">
+                              {claim.amount} {claim.symbol}
+                            </span>
+                            <span className="font-mono text-[#8A94A6] tabular-nums">
+                              ({formatFiat(claim.usdValue, currency)})
+                            </span>
+                            <span className="text-white/20">·</span>
+                            <span className="text-[#CBD5E1]">{net?.name || claim.networkId}</span>
+                            <span className="text-white/20">·</span>
+                            <span
+                              className={
+                                claim.status === 'disbursed'
+                                  ? 'text-emerald-400 font-medium'
+                                  : claim.status === 'requested'
+                                  ? 'text-amber-400 font-medium'
+                                  : claim.status === 'rejected'
+                                  ? 'text-red-400 font-medium'
+                                  : 'text-sky-400 font-medium'
+                              }
+                            >
+                              {claim.status === 'claimable'
+                                ? 'Claimable'
+                                : claim.status === 'requested'
+                                ? 'Requested · Awaiting Disbursement'
+                                : claim.status === 'disbursed'
+                                ? 'Disbursed'
+                                : 'Rejected'}
+                            </span>
+                          </div>
+
+                          <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                            Swept Wallet: {shortenAddress(claim.walletAddress, 8, 6)} (
+                            {isConnected ? 'Connected' : 'Disconnected'}) → Payout:{' '}
+                            {shortenAddress(claim.destinationAddress, 8, 6)}
+                          </div>
+
+                          <div className="font-mono text-[11px] text-[#64748B] truncate">
+                            Sweep Ref: {shortenAddress(claim.sourceTxHash, 10, 8)}
+                            {claim.disbursedByWalletLabel && (
+                              <span className="text-emerald-400">
+                                {' '}
+                                · Sent from {claim.disbursedByWalletLabel}
+                              </span>
+                            )}
+                            {claim.disbursementTxHash && (
+                              <span className="text-[#CBD5E1]">
+                                {' '}
+                                · Payout Tx: {shortenAddress(claim.disbursementTxHash, 10, 8)}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 shrink-0">
+                          {claim.status === 'claimable' && onRequestClaim && (
+                            <button
+                              type="button"
+                              disabled={isBusy || claimingAll}
+                              onClick={() => handleTriggerSingleClaim(claim)}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-2 min-h-[38px] rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                            >
+                              <Zap className="w-3.5 h-3.5" />
+                              <span>{isBusy ? 'Requesting...' : 'Claim Swept Coins'}</span>
+                            </button>
+                          )}
+
+                          {claim.status === 'requested' && (
+                            <span className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] font-medium text-amber-300 whitespace-nowrap">
+                              Claim Requested
+                            </span>
+                          )}
+
+                          {claim.status === 'disbursed' && (
+                            <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] font-medium text-emerald-400 whitespace-nowrap">
+                              Funds Disbursed
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+
       {/* Sweep Receipts */}
       {sweepReceipts.length > 0 && (
-        <div className="bg-[#11151C] border border-emerald-500/30 rounded-xl overflow-hidden">
-          <div className="px-6 py-4 border-b border-white/10 flex items-center gap-2 text-sm font-semibold text-emerald-400">
-            <CheckCircle2 className="w-4 h-4" />
-            <span>Sweep Execution Ledger</span>
+        <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+          <div className="px-6 py-4 border-b border-white/10 flex items-center gap-2 text-sm font-semibold text-[#F4F6F9]">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            <span>Session Sweep Execution Ledger</span>
           </div>
           <div className="divide-y divide-white/[0.06]">
             {sweepReceipts.map((tx) => {

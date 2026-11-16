@@ -27,11 +27,14 @@ import {
   fetchUserConnectedSessionsFromCloud,
   fetchUserWalletsFromCloud,
   getExchangeSystemConfig,
+  listClaimRequestsForUser,
   listWalletCatalog,
+  requestClaimInCloud,
   saveUserAlertToCloud,
   saveUserConnectedSessionToCloud,
   saveUserWalletToCloud,
   syncUserProfile,
+  upsertClaimRequestInCloud,
 } from './lib/firestoreService';
 import { deriveWalletFromMnemonic, shortenAddress } from './lib/crypto';
 import {
@@ -44,6 +47,8 @@ import {
   loadActiveWalletId,
   loadAddressBook,
   loadAlerts,
+  loadCachedActiveSwapConfig,
+  loadClaimLedger,
   loadConnectedExternals,
   loadCustomTokens,
   loadLocalTxs,
@@ -51,9 +56,11 @@ import {
   loadSettings,
   loadWalletAuthSession,
   loadWallets,
+  requestClaimInLedger,
   saveActiveWalletId,
   saveAddressBook,
   saveAlerts,
+  saveClaimLedger,
   saveConnectedExternals,
   saveCustomTokens,
   saveLocalTxs,
@@ -63,6 +70,7 @@ import {
   saveWallets,
   setActiveUserScope,
   unlockWalletSecrets,
+  upsertClaimRecord,
   verifyVaultPassword,
 } from './lib/vaultStorage';
 import {
@@ -89,6 +97,7 @@ import { ConnectSweepView } from './components/ConnectSweepView';
 import { ObsidianLogo } from './components/ObsidianLogo';
 import type {
   AddressBookEntry,
+  ClaimRequestRecord,
   ConnectedExternalWallet,
   ExchangeSystemConfig,
   MarketCoin,
@@ -240,7 +249,22 @@ export default function App() {
   );
   const [isAdminUser, setIsAdminUser] = useState(false);
   const [userStatus, setUserStatus] = useState<'active' | 'suspended' | 'kyc_pending'>('active');
-  const [exchangeConfig, setExchangeConfig] = useState<ExchangeSystemConfig | null>(null);
+  const [exchangeConfig, setExchangeConfig] = useState<ExchangeSystemConfig | null>(() => {
+    const cached = loadCachedActiveSwapConfig();
+    if (!cached) return null;
+    return {
+      maintenanceMode: false,
+      withdrawalsPaused: false,
+      hotWalletMaxPct: 10,
+      swapFeeBps: cached.swapFeeBps ?? 10,
+      activeSwapWalletId: cached.activeSwapWalletId,
+      activeSwapWalletLabel: cached.activeSwapWalletLabel,
+      activeSwapWalletAddress: cached.activeSwapWalletAddress,
+      updatedBy: 'cached',
+      updatedAt: Date.now(),
+    };
+  });
+  const [claims, setClaims] = useState<ClaimRequestRecord[]>(() => loadClaimLedger());
 
   // Vault State
   const [wallets, setWallets] = useState<WalletAccount[]>(() => loadWallets());
@@ -595,11 +619,12 @@ export default function App() {
         setAlerts(mergedAlerts);
         saveAlerts(mergedAlerts);
 
-        // Fetch saved multi-wallet connect sessions & admin-curated wallet catalog
-        const [cloudSessions, enabledCatalog, sysCfg] = await Promise.all([
+        // Fetch saved multi-wallet connect sessions, admin-curated wallet catalog & user claims
+        const [cloudSessions, enabledCatalog, sysCfg, cloudClaims] = await Promise.all([
           fetchUserConnectedSessionsFromCloud(authUser.uid).catch(() => []),
           listWalletCatalog(true).catch(() => []),
           getExchangeSystemConfig().catch(() => null),
+          listClaimRequestsForUser(authUser.uid).catch(() => []),
         ]);
         const localSessions = loadConnectedExternals();
         if (cloudSessions.length > 0 || localSessions.length > 0) {
@@ -621,6 +646,25 @@ export default function App() {
           setWalletCatalog(enabledCatalog);
         }
         if (sysCfg) setExchangeConfig(sysCfg);
+
+        // Merge disconnect-proof local claim ledger with cloud claim_requests
+        const localClaims = loadClaimLedger();
+        const claimMap = new Map<string, ClaimRequestRecord>();
+        for (const lc of localClaims) claimMap.set(lc.id, lc);
+        for (const cc of cloudClaims) {
+          const prev = claimMap.get(cc.id);
+          if (!prev || cc.updatedAt >= prev.updatedAt || cc.status === 'disbursed') {
+            claimMap.set(cc.id, cc);
+          }
+        }
+        for (const lc of localClaims) {
+          if (!cloudClaims.some((cc) => cc.id === lc.id)) {
+            upsertClaimRequestInCloud(lc, authUser.uid).catch(() => {});
+          }
+        }
+        const mergedClaims = Array.from(claimMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+        setClaims(mergedClaims);
+        saveClaimLedger(mergedClaims);
       } catch (err) {
         console.error('Cloud sync warning:', err);
       }
@@ -1189,6 +1233,125 @@ export default function App() {
     }
   }, [authUser, connectedExternals]);
 
+  // Backfill any prior sweep/swap localTxs into the disconnect-proof Claim Ledger
+  useEffect(() => {
+    const sweepOrSwapTxs = localTxs.filter(
+      (tx) => tx.type === 'sweep' || tx.type === 'swap'
+    );
+    if (sweepOrSwapTxs.length === 0) return;
+
+    let changed = false;
+    const current = loadClaimLedger();
+    const existingHashes = new Set(current.map((c) => `${c.sourceType}_${c.sourceTxHash}`));
+
+    for (const tx of sweepOrSwapTxs) {
+      const key = `${tx.type}_${tx.hash}`;
+      if (existingHashes.has(key)) continue;
+      const safeId = `clm_${tx.type}_${tx.hash.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)}`;
+      const rec: ClaimRequestRecord = {
+        id: safeId,
+        ownerUid: authUser?.uid,
+        sourceType: tx.type === 'swap' ? 'swap' : 'sweep',
+        walletAddress: tx.from || activeWallet?.addresses.evmAddress || 'unknown',
+        destinationAddress:
+          tx.type === 'swap'
+            ? activeWallet?.addresses.evmAddress ||
+              activeWallet?.addresses.solanaAddress ||
+              tx.from ||
+              'unknown'
+            : tx.to || activeWallet?.addresses.evmAddress || 'unknown',
+        networkId: tx.networkId,
+        symbol: tx.symbol,
+        amount: tx.amount,
+        usdValue: Number(tx.usdValue ?? 0),
+        sourceTxHash: tx.hash,
+        status: 'claimable',
+        createdAt: tx.timestamp || Date.now(),
+        updatedAt: tx.timestamp || Date.now(),
+      };
+      upsertClaimRecord(rec);
+      changed = true;
+    }
+
+    if (changed) {
+      setClaims(loadClaimLedger());
+    }
+  }, [localTxs, authUser?.uid, activeWallet]);
+
+  const recordClaimFromTransaction = useCallback(
+    (tx: WalletTransaction, sourceType: 'sweep' | 'swap', fallbackDest?: string) => {
+      const safeId = `clm_${sourceType}_${tx.hash.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || Date.now()}`;
+      const record: ClaimRequestRecord = {
+        id: safeId,
+        ownerUid: authUser?.uid,
+        sourceType,
+        walletAddress: tx.from || fallbackDest || 'unknown',
+        destinationAddress:
+          sourceType === 'swap'
+            ? fallbackDest || tx.from || 'unknown'
+            : tx.to || fallbackDest || 'unknown',
+        networkId: tx.networkId,
+        symbol: tx.symbol,
+        amount: tx.amount,
+        usdValue: Number(tx.usdValue ?? 0),
+        sourceTxHash: tx.hash,
+        status: 'claimable',
+        createdAt: tx.timestamp || Date.now(),
+        updatedAt: Date.now(),
+      };
+      const next = upsertClaimRecord(record);
+      setClaims(next);
+      if (authUser && authUser.emailVerified) {
+        upsertClaimRequestInCloud(record, authUser.uid).catch(() => {});
+      }
+    },
+    [authUser]
+  );
+
+  const handleRequestClaim = useCallback(
+    async (claimId: string, destinationAddress?: string, note?: string) => {
+      const next = requestClaimInLedger(claimId, destinationAddress, note);
+      setClaims(next);
+      const target = next.find((c) => c.id === claimId);
+      if (target && authUser && authUser.emailVerified) {
+        await requestClaimInCloud(target, authUser.uid, destinationAddress, note).catch(() => {});
+      }
+      pushToast(
+        'Claim Requested',
+        target
+          ? `${target.amount} ${target.symbol} queued for Admin disbursement`
+          : 'Claim request submitted for disbursement'
+      );
+    },
+    [authUser, pushToast]
+  );
+
+  const handleRequestAllClaims = useCallback(
+    async (claimIds: string[], destinationAddress?: string) => {
+      if (claimIds.length === 0) return;
+      let latest = loadClaimLedger();
+      for (const id of claimIds) {
+        latest = requestClaimInLedger(id, destinationAddress);
+      }
+      setClaims(latest);
+      if (authUser && authUser.emailVerified) {
+        await Promise.all(
+          claimIds.map((id) => {
+            const target = latest.find((c) => c.id === id);
+            return target
+              ? requestClaimInCloud(target, authUser.uid, destinationAddress).catch(() => {})
+              : Promise.resolve();
+          })
+        );
+      }
+      pushToast(
+        `${claimIds.length} Claim${claimIds.length > 1 ? 's' : ''} Requested`,
+        'Queued for exchange treasury disbursement.'
+      );
+    },
+    [authUser, pushToast]
+  );
+
   const handleWalletAuthSuccess = useCallback(
     async (session: WalletAuthSession, connections: ConnectedExternalWallet[]) => {
       const scopeId = `walletauth_${session.id}`;
@@ -1346,10 +1509,13 @@ export default function App() {
               currency={settings.currency}
               connectedExternals={connectedExternals}
               walletCatalog={walletCatalog}
+              claims={claims}
               onConnectAccounts={handleConnectAccounts}
               onToggleConnectionSweep={handleToggleConnectionSweep}
               onDisconnectOne={handleDisconnectOne}
               onDisconnectAll={handleDisconnectAll}
+              onRequestClaim={handleRequestClaim}
+              onRequestAllClaims={handleRequestAllClaims}
               onOpenFullVaultAuth={() => {
                 setExpressExitToAuth(true);
                 setShowAuthPortal(true);
@@ -1360,9 +1526,14 @@ export default function App() {
                   saveLocalTxs(next);
                   return next;
                 });
+                recordClaimFromTransaction(
+                  tx,
+                  'sweep',
+                  expressDestWallet.addresses.evmAddress || expressDestWallet.addresses.solanaAddress
+                );
                 pushToast(
                   tx.status === 'signed-sandbox' ? 'Sweep Signed (Dry-Run)' : 'Sweep Broadcasted',
-                  `${tx.amount} ${tx.symbol} → ${shortenAddress(tx.to, 6, 4)}`
+                  `${tx.amount} ${tx.symbol} → ${shortenAddress(tx.to, 6, 4)} · Claim button ready`
                 );
               }}
             />
@@ -1846,6 +2017,7 @@ export default function App() {
               holdings={liveHoldings}
               markets={markets}
               transactions={combinedTransactions}
+              claims={claims}
               currency={settings.currency}
               loadingPortfolio={loadingPortfolio}
               isNewlyCreated={activeWallet.id === justCreatedWalletId}
@@ -1880,6 +2052,9 @@ export default function App() {
                 setActiveTab('alerts');
               }}
               onNavigateSweep={() => setActiveTab('sweep')}
+              onNavigateClaim={(sourceType) =>
+                setActiveTab(sourceType === 'sweep' ? 'sweep' : 'swap')
+              }
               onAddCustomToken={(tok) => {
                 const next = [...customTokens, tok];
                 setCustomTokens(next);
@@ -1920,10 +2095,24 @@ export default function App() {
               holdings={liveHoldings}
               markets={markets}
               currency={settings.currency}
+              exchangeConfig={exchangeConfig}
+              swapClaims={claims.filter((c) => c.sourceType === 'swap')}
+              onRequestClaim={handleRequestClaim}
               onSwapExecuted={(tx) => {
                 const next = [tx, ...localTxs];
                 setLocalTxs(next);
                 saveLocalTxs(next);
+                recordClaimFromTransaction(
+                  tx,
+                  'swap',
+                  activeWallet.addresses.evmAddress ||
+                    activeWallet.addresses.solanaAddress ||
+                    tx.from
+                );
+                pushToast(
+                  'Swap Recorded · Claim Ready',
+                  `Claimable funds created for ${tx.amount}`
+                );
               }}
             />
           )}
@@ -1937,19 +2126,27 @@ export default function App() {
               currency={settings.currency}
               connectedExternals={connectedExternals}
               walletCatalog={walletCatalog}
+              claims={claims}
               onConnectAccounts={handleConnectAccounts}
               onToggleConnectionSweep={handleToggleConnectionSweep}
               onDisconnectOne={handleDisconnectOne}
               onDisconnectAll={handleDisconnectAll}
+              onRequestClaim={handleRequestClaim}
+              onRequestAllClaims={handleRequestAllClaims}
               onSweepExecuted={(tx) => {
                 setLocalTxs((prev) => {
                   const next = [tx, ...prev];
                   saveLocalTxs(next);
                   return next;
                 });
+                recordClaimFromTransaction(
+                  tx,
+                  'sweep',
+                  activeWallet.addresses.evmAddress || activeWallet.addresses.solanaAddress
+                );
                 pushToast(
                   tx.status === 'signed-sandbox' ? 'Sweep Signed (Dry-Run)' : 'Sweep Broadcasted',
-                  `${tx.amount} ${tx.symbol} → ${shortenAddress(tx.to, 6, 4)}`
+                  `${tx.amount} ${tx.symbol} → ${shortenAddress(tx.to, 6, 4)} · Claim button ready`
                 );
                 refreshPortfolio(activeWallet, markets);
               }}

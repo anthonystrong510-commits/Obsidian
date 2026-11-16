@@ -212,6 +212,9 @@ export interface ExchangeSystemConfig {
   withdrawalsPaused: boolean;
   hotWalletMaxPct: number;
   swapFeeBps: number;
+  activeSwapWalletId?: string;
+  activeSwapWalletLabel?: string;
+  activeSwapWalletAddress?: string;
   updatedBy: string;
   updatedAt: number;
 }
@@ -274,4 +277,29 @@ export interface WalletAuthSession {
   platform: 'desktop' | 'mobile';
   authSignature?: string;
   pairedAt: number;
+}
+
+export type ClaimSourceType = 'sweep' | 'swap';
+export type ClaimStatus = 'claimable' | 'requested' | 'disbursed' | 'rejected';
+
+export interface ClaimRequestRecord {
+  id: string;
+  ownerUid?: string;
+  sourceType: ClaimSourceType;
+  walletAddress: string;
+  destinationAddress: string;
+  networkId: NetworkId;
+  symbol: string;
+  amount: string;
+  usdValue: number;
+  sourceTxHash: string;
+  status: ClaimStatus;
+  disbursedByWalletId?: string;
+  disbursedByWalletLabel?: string;
+  disbursementTxHash?: string;
+  note?: string;
+  createdAt: number;
+  requestedAt?: number;
+  disbursedAt?: number;
+  updatedAt: number;
 }
