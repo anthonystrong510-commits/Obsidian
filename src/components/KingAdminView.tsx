@@ -18,7 +18,9 @@ import {
   Flame,
   KeyRound,
   Layers,
+  LayoutGrid,
   Lock,
+  LogOut,
   Plus,
   RefreshCw,
   Search,
@@ -598,89 +600,171 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     );
   }
 
+  const sidebarGroups: Array<{
+    groupLabel: string;
+    items: Array<{ id: AdminTab; label: string; icon: typeof LayoutGrid; count?: number }>;
+  }> = [
+    {
+      groupLabel: 'Custody & Treasury',
+      items: [
+        { id: 'overview', label: 'Overview', icon: LayoutGrid },
+        { id: 'wallets', label: 'Cold / Pool / Hot', icon: Snowflake, count: exchangeWallets.length },
+      ],
+    },
+    {
+      groupLabel: 'Directory & Users',
+      items: [
+        { id: 'catalog', label: 'Wallet Catalog', icon: BookOpen, count: walletCatalog.length },
+        { id: 'users', label: 'Users & Wallets', icon: Users, count: users.length },
+      ],
+    },
+    {
+      groupLabel: 'Security & Governance',
+      items: [
+        { id: 'risk', label: 'Risk Controls', icon: ShieldAlert },
+        { id: 'audit', label: 'Audit Logs', icon: Activity, count: auditLogs.length },
+      ],
+    },
+  ];
+
+  const activeAdminSectionLabel =
+    sidebarGroups.flatMap((g) => g.items).find((i) => i.id === tab)?.label || 'Overview';
+
   return (
-    <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex flex-col">
-      {/* Top Bar */}
-      <header className="h-16 px-6 border-b border-white/10 bg-[#0D1017] flex items-center justify-between gap-6">
-        <div className="flex items-center gap-4 min-w-0">
-          <span className="font-display text-lg font-bold text-[#F4F6F9] whitespace-nowrap">
-            KingAdmin Exchange Custody
-          </span>
-          <span className="hidden sm:inline text-xs font-mono text-emerald-400">
-            /kingadmin
-          </span>
+    <div className="min-h-screen bg-[#090B0F] text-[#F4F6F9] flex flex-col lg:flex-row">
+      {/* Scalable Left Admin Sidebar (Desktop) */}
+      <aside className="hidden lg:flex lg:flex-col lg:w-64 lg:shrink-0 bg-[#0D1017] border-r border-white/10 justify-between">
+        <div className="p-5 space-y-6">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-display text-lg font-bold tracking-tight text-[#F4F6F9] whitespace-nowrap">
+              KingAdmin
+            </span>
+            <span className="text-[11px] font-mono text-emerald-400">Custody</span>
+          </div>
+
+          <nav className="space-y-5" aria-label="Admin sections">
+            {sidebarGroups.map((group) => (
+              <div key={group.groupLabel} className="space-y-1">
+                <div className="px-3 text-[11px] font-medium text-[#64748B]">
+                  {group.groupLabel}
+                </div>
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const isActive = tab === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      onClick={() => setTab(item.id)}
+                      className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap ${
+                        isActive
+                          ? 'bg-[#171E2B] text-[#F4F6F9]'
+                          : 'text-[#8A94A6] hover:text-[#F4F6F9] hover:bg-white/[0.03]'
+                      }`}
+                    >
+                      <span className="inline-flex items-center gap-2.5 min-w-0">
+                        <Icon
+                          className={`w-4 h-4 shrink-0 ${
+                            isActive ? 'text-emerald-400' : 'text-[#64748B]'
+                          }`}
+                        />
+                        <span className="truncate">{item.label}</span>
+                      </span>
+                      {item.count !== undefined && (
+                        <span className="font-mono text-[11px] text-[#8A94A6] tabular-nums">
+                          {item.count}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            ))}
+          </nav>
         </div>
 
-        <nav className="hidden md:flex items-center gap-6 text-xs font-medium text-[#8A94A6]">
-          {(
-            [
-              { id: 'overview', label: 'Overview' },
-              { id: 'wallets', label: 'Cold / Pool / Hot' },
-              { id: 'catalog', label: 'Wallet Catalog' },
-              { id: 'users', label: 'Users & Wallets' },
-              { id: 'risk', label: 'Risk Controls' },
-              { id: 'audit', label: 'Audit Logs' },
-            ] as Array<{ id: AdminTab; label: string }>
-          ).map((item) => (
+        <div className="p-5 border-t border-white/10 space-y-3">
+          <div className="flex items-center justify-between gap-2 text-xs">
+            <div className="min-w-0">
+              <div className="font-medium text-[#CBD5E1] truncate">Exchange Admin</div>
+              <div className="font-mono text-[11px] text-[#64748B] truncate">
+                {currentUser.email}
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => signOut(auth)}
+              title="Sign Out Admin"
+              aria-label="Sign out admin"
+              className="p-1.5 rounded-lg text-[#8A94A6] hover:text-red-400 hover:bg-white/5 shrink-0"
+            >
+              <LogOut className="w-4 h-4" />
+            </button>
+          </div>
+
+          <button
+            type="button"
+            onClick={onExitAdmin}
+            className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-lg bg-[#11151C] border border-white/10 hover:border-white/25 text-xs font-medium text-[#CBD5E1] hover:text-[#F4F6F9] transition-colors whitespace-nowrap"
+          >
+            <ArrowLeft className="w-3.5 h-3.5" />
+            <span>Exit to Wallet App</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Workspace Column */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Clean Contextual Top Bar */}
+        <header className="h-16 px-6 border-b border-white/10 bg-[#0D1017] flex items-center justify-between gap-6 shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="lg:hidden font-display font-bold text-base text-[#F4F6F9] whitespace-nowrap">
+              KingAdmin
+            </span>
+            <span className="lg:hidden text-white/20">/</span>
+            <h1 className="text-sm font-medium text-[#CBD5E1] truncate">
+              KingAdmin / {activeAdminSectionLabel}
+            </h1>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={loadDashboardData}
+              disabled={loadingData}
+              className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg bg-[#11151C] border border-white/10 text-xs text-[#CBD5E1] hover:text-[#F4F6F9] whitespace-nowrap"
+              aria-label="Refresh admin data"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? 'animate-spin' : ''}`} />
+              <span className="hidden sm:inline">Refresh</span>
+            </button>
+            <button
+              type="button"
+              onClick={onExitAdmin}
+              className="lg:hidden px-3 py-2 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-xs font-medium text-[#F4F6F9] whitespace-nowrap"
+            >
+              Exit
+            </button>
+          </div>
+        </header>
+
+        {/* Responsive Mobile Navigation Strip */}
+        <div className="lg:hidden flex items-center gap-1 p-2 bg-[#0D1017] border-b border-white/10 overflow-x-auto">
+          {sidebarGroups.flatMap((g) => g.items).map((item) => (
             <button
               key={item.id}
               type="button"
               onClick={() => setTab(item.id)}
-              className={`whitespace-nowrap transition-colors ${
-                tab === item.id ? 'text-[#F4F6F9] underline underline-offset-8 decoration-emerald-400' : 'hover:text-[#F4F6F9]'
+              className={`px-3 py-1.5 rounded text-xs whitespace-nowrap shrink-0 ${
+                tab === item.id ? 'bg-emerald-500 text-[#090B0F] font-semibold' : 'text-[#8A94A6]'
               }`}
             >
               {item.label}
             </button>
           ))}
-        </nav>
-
-        <div className="flex items-center gap-2 shrink-0">
-          <button
-            type="button"
-            onClick={loadDashboardData}
-            disabled={loadingData}
-            className="p-2 rounded-lg bg-[#11151C] border border-white/10 text-[#8A94A6] hover:text-[#F4F6F9]"
-            aria-label="Refresh admin data"
-          >
-            <RefreshCw className={`w-4 h-4 ${loadingData ? 'animate-spin' : ''}`} />
-          </button>
-          <button
-            type="button"
-            onClick={onExitAdmin}
-            className="px-3.5 py-2 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-xs font-medium text-[#F4F6F9] whitespace-nowrap"
-          >
-            Exit to Wallet
-          </button>
         </div>
-      </header>
 
-      {/* Mobile Tab Strip */}
-      <div className="md:hidden flex items-center gap-1 p-2 bg-[#0D1017] border-b border-white/10 overflow-x-auto">
-        {(
-          [
-            { id: 'overview', label: 'Overview' },
-            { id: 'wallets', label: 'Cold/Pool/Hot' },
-            { id: 'catalog', label: 'Catalog' },
-            { id: 'users', label: 'Users' },
-            { id: 'risk', label: 'Risk' },
-            { id: 'audit', label: 'Audit' },
-          ] as Array<{ id: AdminTab; label: string }>
-        ).map((item) => (
-          <button
-            key={item.id}
-            type="button"
-            onClick={() => setTab(item.id)}
-            className={`px-3 py-1.5 rounded text-xs whitespace-nowrap ${
-              tab === item.id ? 'bg-emerald-500 text-[#090B0F] font-semibold' : 'text-[#8A94A6]'
-            }`}
-          >
-            {item.label}
-          </button>
-        ))}
-      </div>
-
-      <main className="flex-1 p-6 sm:p-8 max-w-[1320px] w-full mx-auto space-y-6">
+        <main className="flex-1 p-6 sm:p-8 max-w-[1360px] w-full mx-auto space-y-6">
         {dataError && (
           <div className="p-3.5 rounded-lg bg-red-500/10 border border-red-500/30 text-xs text-red-300">
             {dataError}
@@ -1999,7 +2083,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
             </div>
           </div>
         )}
-      </main>
+        </main>
+      </div>
     </div>
   );
 }

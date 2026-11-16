@@ -10,9 +10,9 @@ import {
   type User,
 } from 'firebase/auth';
 import {
+  ArrowLeft,
   ArrowRight,
   CheckCircle2,
-  Lock,
   Mail,
   RefreshCw,
   ShieldAlert,
@@ -22,18 +22,20 @@ import { auth, googleProvider } from '../lib/firebase';
 
 interface AuthPortalProps {
   unverifiedUser: User | null;
+  initialMode?: 'signin' | 'signup';
   onRefreshVerification: () => Promise<void>;
-  onNavigateAdmin: () => void;
+  onBackToLanding?: () => void;
 }
 
 type AuthMode = 'signin' | 'signup' | 'reset';
 
 export function AuthPortal({
   unverifiedUser,
+  initialMode = 'signin',
   onRefreshVerification,
-  onNavigateAdmin,
+  onBackToLanding,
 }: AuthPortalProps) {
-  const [mode, setMode] = useState<AuthMode>('signin');
+  const [mode, setMode] = useState<AuthMode>(initialMode);
   const [displayName, setDisplayName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -230,10 +232,23 @@ export function AuthPortal({
         {/* Left Auth Form Column */}
         <div className="lg:col-span-7 p-6 sm:p-10 flex flex-col justify-between gap-6">
           <div className="space-y-6">
-            <div className="flex items-center justify-between">
-              <span className="font-display text-xl font-bold tracking-tight text-[#F4F6F9]">
-                Obsidian Vault
-              </span>
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3">
+                {onBackToLanding && (
+                  <button
+                    type="button"
+                    onClick={onBackToLanding}
+                    className="inline-flex items-center gap-1 text-xs text-[#8A94A6] hover:text-[#F4F6F9] transition-colors"
+                    aria-label="Back to landing page"
+                  >
+                    <ArrowLeft className="w-3.5 h-3.5" />
+                    <span>Home</span>
+                  </button>
+                )}
+                <span className="font-display text-xl font-bold tracking-tight text-[#F4F6F9]">
+                  Obsidian Vault
+                </span>
+              </div>
               <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
                 <button
                   type="button"
@@ -442,14 +457,7 @@ export function AuthPortal({
 
           <div className="pt-4 border-t border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs text-[#64748B]">
             <span>Zero-trust AES-256-GCM wallet encryption</span>
-            <button
-              type="button"
-              onClick={onNavigateAdmin}
-              className="inline-flex items-center gap-1.5 text-[#8A94A6] hover:text-emerald-400 transition-colors"
-            >
-              <Lock className="w-3.5 h-3.5" />
-              <span>Admin Portal (/kingadmin)</span>
-            </button>
+            <span>BIP-39 / BIP-44 / CryptoNote</span>
           </div>
         </div>
 

@@ -56,6 +56,7 @@ import {
   fetchMultiChainPortfolio,
   fetchOnChainTransactions,
 } from './lib/web3Service';
+import { LandingPage } from './components/LandingPage';
 import { AuthPortal } from './components/AuthPortal';
 import { KingAdminView } from './components/KingAdminView';
 import { WalletOnboarding } from './components/WalletOnboarding';
@@ -148,9 +149,11 @@ export default function App() {
     pathname.replace(/\/+$/, '').startsWith('/kingadmin') ||
     hashPath.startsWith('#/kingadmin');
 
-  // Firebase Auth State
+  // Firebase Auth & Landing State
   const [authReady, setAuthReady] = useState(false);
   const [authUser, setAuthUser] = useState<User | null>(null);
+  const [showAuthPortal, setShowAuthPortal] = useState(false);
+  const [authInitialMode, setAuthInitialMode] = useState<'signin' | 'signup'>('signin');
   const [isAdminUser, setIsAdminUser] = useState(false);
   const [userStatus, setUserStatus] = useState<'active' | 'suspended' | 'kyc_pending'>('active');
   const [exchangeConfig, setExchangeConfig] = useState<ExchangeSystemConfig | null>(null);
@@ -731,6 +734,7 @@ export default function App() {
     setSessionPassword(null);
     setUnlockedSecretsMap({});
     setConnectedExternals([]);
+    setShowAuthPortal(false);
     syncedUidRef.current = null;
   };
 
@@ -753,11 +757,25 @@ export default function App() {
     );
   }
 
-  // GATE 1: Firebase Authentication (Google Sign-In & Email/Password Sign-Up)
+  // GATE 1: Landing Page -> Firebase Authentication (Google Sign-In & Email/Password Sign-Up)
   if (!authUser || !authUser.emailVerified) {
+    if (!authUser && !showAuthPortal) {
+      return (
+        <LandingPage
+          markets={markets}
+          onOpenAuth={(mode) => {
+            setAuthInitialMode(mode);
+            setShowAuthPortal(true);
+          }}
+        />
+      );
+    }
+
     return (
       <AuthPortal
         unverifiedUser={authUser && !authUser.emailVerified ? authUser : null}
+        initialMode={authInitialMode}
+        onBackToLanding={() => setShowAuthPortal(false)}
         onRefreshVerification={async () => {
           if (!auth.currentUser) return;
           await auth.currentUser.reload();
@@ -768,7 +786,6 @@ export default function App() {
             setIsAdminUser(adminOk);
           }
         }}
-        onNavigateAdmin={() => navigateRoute('/kingadmin')}
       />
     );
   }
