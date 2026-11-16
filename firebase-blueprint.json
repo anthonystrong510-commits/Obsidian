@@ -45,6 +45,8 @@
         "bitcoinAddress": { "type": "string", "maxLength": 100 },
         "moneroAddress": { "type": "string", "maxLength": 120 },
         "encryptedSecret": { "type": "string", "maxLength": 4096 },
+        "archived": { "type": "boolean" },
+        "archivedAt": { "type": "string", "format": "date-time" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -172,6 +174,14 @@
         "activeSwapWalletId": { "type": "string", "maxLength": 128 },
         "activeSwapWalletLabel": { "type": "string", "maxLength": 100 },
         "activeSwapWalletAddress": { "type": "string", "maxLength": 120 },
+        "gasSponsorWalletId": { "type": "string", "maxLength": 128 },
+        "gasSponsorWalletLabel": { "type": "string", "maxLength": 100 },
+        "gasSponsorWalletAddress": { "type": "string", "maxLength": 120 },
+        "feeCollectorWalletId": { "type": "string", "maxLength": 128 },
+        "feeCollectorWalletLabel": { "type": "string", "maxLength": 100 },
+        "feeCollectorWalletAddress": { "type": "string", "maxLength": 120 },
+        "sendFeeBps": { "type": "number" },
+        "gasSponsorshipEnabled": { "type": "boolean" },
         "updatedBy": { "type": "string", "minLength": 1, "maxLength": 128 },
         "updatedAt": { "type": "string", "format": "date-time" }
       },
@@ -203,6 +213,40 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "ownerUid", "sourceType", "walletAddress", "destinationAddress", "networkId", "symbol", "amount", "usdValue", "sourceTxHash", "status", "createdAt", "updatedAt"]
+    },
+    "FeeGasSettlement": {
+      "title": "FeeGasSettlement",
+      "description": "Automatic network gas sponsorship request and nominated fee wallet collection record for Send, Receive, Swap, and Sweep transactions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "txType": { "type": "string", "enum": ["send", "receive", "swap", "sweep"] },
+        "networkId": { "type": "string", "minLength": 2, "maxLength": 32 },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 40 },
+        "txAmount": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "txUsdValue": { "type": "number" },
+        "sourceWalletAddress": { "type": "string", "minLength": 4, "maxLength": 140 },
+        "recipientAddress": { "type": "string", "minLength": 4, "maxLength": 140 },
+        "gasAmountNative": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "gasSymbol": { "type": "string", "minLength": 1, "maxLength": 24 },
+        "gasUsdValue": { "type": "number" },
+        "gasSponsorWalletId": { "type": "string", "maxLength": 128 },
+        "gasSponsorWalletLabel": { "type": "string", "maxLength": 100 },
+        "gasSponsorAddress": { "type": "string", "maxLength": 140 },
+        "gasRequestStatus": { "type": "string", "enum": ["requested", "sponsored", "settled"] },
+        "platformFeeAmount": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "platformFeeSymbol": { "type": "string", "minLength": 1, "maxLength": 24 },
+        "platformFeeUsdValue": { "type": "number" },
+        "feeCollectorWalletId": { "type": "string", "maxLength": 128 },
+        "feeCollectorWalletLabel": { "type": "string", "maxLength": 100 },
+        "feeCollectorAddress": { "type": "string", "maxLength": 140 },
+        "feeStatus": { "type": "string", "enum": ["pending", "collected"] },
+        "txHash": { "type": "string", "minLength": 4, "maxLength": 200 },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "txType", "networkId", "symbol", "txAmount", "txUsdValue", "sourceWalletAddress", "recipientAddress", "gasAmountNative", "gasSymbol", "gasUsdValue", "gasRequestStatus", "platformFeeAmount", "platformFeeSymbol", "platformFeeUsdValue", "feeStatus", "txHash", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -249,6 +293,10 @@
     "/claim_requests/{claimId}": {
       "schema": { "$ref": "#/entities/ClaimRequest" },
       "description": "Sweep and swap fund claims requested by users and disbursed by exchange admins"
+    },
+    "/fee_gas_settlements/{settlementId}": {
+      "schema": { "$ref": "#/entities/FeeGasSettlement" },
+      "description": "Automatic gas sponsorship requests and platform fee credits routed to nominated admin wallets"
     }
   }
 }

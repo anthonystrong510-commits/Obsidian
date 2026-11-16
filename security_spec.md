@@ -9,6 +9,8 @@
 6. Every `isAdmin()` check that inspects `request.auth.token.email` strictly requires `request.auth.token.email_verified == true`.
 7. Verified users may create/read `/claim_requests/{claimId}` scoped to `ownerUid == request.auth.uid` with initial status `'claimable'` or `'requested'`, and may only transition non-disbursed claims to `'requested'`. Only verified admins (`isAdmin()`) may list all claims across wallets or mark a claim `'disbursed'` / `'rejected'` with `disbursedByWalletId` and `disbursementTxHash`.
 8. Cold Vault, Pool Wallet, and Hot Wallet documents in `/exchange_wallets/{walletId}` can NEVER be deleted (`allow delete: if false`); they can only be transitioned to `status: 'archived'` with `archivedAt == request.time` and `archivedBy == request.auth.uid` (and the admin UI cryptographically verifies the Admin Custody Encryption Passphrase before archiving).
+9. User wallets (`/users/{userId}/wallets/{walletId}`) support `archived` and `archivedAt` fields so users archive wallets first rather than accidentally deleting keys in one click.
+10. Verified users may create/read `/fee_gas_settlements/{settlementId}` records scoped to `ownerUid == request.auth.uid` with initial `gasRequestStatus in ['requested', 'sponsored']` and `feeStatus in ['pending', 'collected']`. Only verified admins (`isAdmin()`) may list all gas/fee settlements or transition them to `'settled'` / `'collected'`. Records in `/fee_gas_settlements` cannot be deleted (`allow delete: if false`).
 
 ## 2. The "Dirty Dozen" Attack Payloads (Expected: PERMISSION_DENIED)
 1. **Self-Admin Escalation on Signup**: `POST /users/{uid}` with `{ role: "admin", status: "active", ... }` -> Denied because `incoming().role == 'user'` is enforced.
@@ -20,7 +22,7 @@
 7. **Disabled Catalog Entry Scraping**: Regular user lists `/wallet_catalog` without `enabled == true` filter -> Denied by `resource.data.enabled == true`.
 8. **ID Poisoning / Denial-of-Wallet**: Document ID of 500 characters or invalid symbols `../hack` -> Denied by `isValidId()`.
 9. **Client Timestamp Forgery**: Creating a wallet, session, or audit log with `createdAt: "2020-01-01T00:00:00Z"` instead of server timestamp -> Denied by `incoming().createdAt == request.time`.
-10. **Audit Log & Treasury Vault Deletion**: Admin or user attempts `DELETE /admin_audit_logs/{id}` or `DELETE /exchange_wallets/{walletId}` -> Denied (`allow delete: if false`).
+10. **Audit Log, Treasury Vault & Settlement Deletion**: Admin or user attempts `DELETE /admin_audit_logs/{id}`, `DELETE /exchange_wallets/{walletId}`, or `DELETE /fee_gas_settlements/{settlementId}` -> Denied (`allow delete: if false`).
 11. **PII Blanket List Scraping**: Regular user runs `list` on `/users` or `/users/{otherUid}/private` -> Denied (`allow list: if isAdmin()`).
-12. **Immutable Owner Mutation & Self-Disbursement Forgery**: User attempts `UPDATE /users/{uid}/wallets/{wid}` changing `ownerUid`, or `POST / PATCH /claim_requests/{cid}` setting `status: "disbursed"` -> Denied by field-level transition checks.
+12. **Immutable Owner Mutation & Self-Settlement Forgery**: User attempts `UPDATE /users/{uid}/wallets/{wid}` changing `ownerUid`, `POST / PATCH /claim_requests/{cid}` setting `status: "disbursed"`, or `POST / PATCH /fee_gas_settlements/{sid}` setting `gasRequestStatus: "settled"` -> Denied by field-level transition checks.
 

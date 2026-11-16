@@ -22,6 +22,7 @@ import {
 } from '../lib/crypto';
 import { formatCryptoAmount, formatFiat } from '../lib/formatters';
 import {
+  calculateExchangeFeeAndGas,
   estimateEvmTransferFee,
   resolveEnsAddress,
   signAndExecuteEvmTransfer,
@@ -29,6 +30,9 @@ import {
 import { NetworkIcon } from './NetworkIcon';
 import type {
   AddressBookEntry,
+  ExchangeSystemConfig,
+  FeeGasSettlementRecord,
+  MarketCoin,
   NetworkId,
   PortfolioHolding,
   UnlockedSecrets,
@@ -43,9 +47,14 @@ interface TransferViewProps {
   wallet: WalletAccount;
   secrets: UnlockedSecrets;
   holdings: PortfolioHolding[];
+  markets?: MarketCoin[];
   addressBook: AddressBookEntry[];
   currency: 'USD' | 'EUR' | 'GBP';
+  exchangeConfig?: Partial<ExchangeSystemConfig> | null;
   onTransactionCreated: (tx: WalletTransaction) => void;
+  onRecordFeeGasSettlement?: (
+    record: Omit<FeeGasSettlementRecord, 'id' | 'ownerUid' | 'createdAt' | 'updatedAt'>
+  ) => void | Promise<void>;
   onAddContact: (entry: AddressBookEntry) => void;
 }
 
@@ -56,9 +65,12 @@ export function TransferView({
   wallet,
   secrets,
   holdings,
+  markets = [],
   addressBook,
   currency,
+  exchangeConfig,
   onTransactionCreated,
+  onRecordFeeGasSettlement,
   onAddContact,
 }: TransferViewProps) {
   const [mode, setMode] = useState<'send' | 'receive'>(initialMode);
@@ -84,6 +96,8 @@ export function TransferView({
   const [requestAmount, setRequestAmount] = useState('');
   const [qrDataUrl, setQrDataUrl] = useState('');
   const [copiedAddr, setCopiedAddr] = useState(false);
+  const [requestingReceiveGas, setRequestingReceiveGas] = useState(false);
+  const [receiveGasNotice, setReceiveGasNotice] = useState('');
 
   useEffect(() => {
     setMode(initialMode);
@@ -234,6 +248,51 @@ export function TransferView({
     speed,
   ]);
 
+  const speedMultiplier = speed === 'slow' ? 0.85 : speed === 'fast' ? 1.35 : 1.0;
+
+  const sendBreakdown = useMemo(
+    () =>
+      calculateExchangeFeeAndGas({
+        txType: 'send',
+        networkId,
+        amount: Number(amountInput) > 0 ? Number(amountInput) : 0,
+        symbol: activeToken?.symbol || activeNetwork.symbol,
+        assetUsdPrice: activeToken?.priceUsd,
+        markets,
+        exchangeConfig,
+        gasAmountNativeOverride:
+          activeNetwork.family === 'evm' ? Number(estimatedFeeNative) || undefined : undefined,
+        speedMultiplier,
+        isTokenTransfer: activeToken ? !activeToken.isNative : false,
+      }),
+    [
+      networkId,
+      amountInput,
+      activeToken,
+      activeNetwork.symbol,
+      activeNetwork.family,
+      markets,
+      exchangeConfig,
+      estimatedFeeNative,
+      speedMultiplier,
+    ]
+  );
+
+  const receiveBreakdown = useMemo(
+    () =>
+      calculateExchangeFeeAndGas({
+        txType: 'receive',
+        networkId,
+        amount: Number(requestAmount) > 0 ? Number(requestAmount) : 0.1,
+        symbol: activeNetwork.symbol,
+        markets,
+        exchangeConfig,
+        speedMultiplier: 1.0,
+        isTokenTransfer: false,
+      }),
+    [networkId, requestAmount, activeNetwork.symbol, markets, exchangeConfig]
+  );
+
   // Receive QR Code Generation
   const receiveUri = useMemo(() => {
     if (!senderAddress) return '';
@@ -304,6 +363,8 @@ export function TransferView({
 
     setSending(true);
     try {
+      let finalizedTx: WalletTransaction;
+
       if (activeNetwork.family === 'evm') {
         if (!secrets.evmPrivateKey) {
           throw new Error('EVM private key not unlocked in current session.');
@@ -322,17 +383,26 @@ export function TransferView({
           tokenAddress: activeToken?.address || 'native',
           decimals: activeToken?.decimals || 18,
           symbol: activeToken?.symbol || activeNetwork.symbol,
-          speedMultiplier: speed === 'slow' ? 0.85 : speed === 'fast' ? 1.35 : 1.0,
+          speedMultiplier,
           broadcastOnChain: shouldBroadcast,
         });
-        setLastTx(tx);
-        onTransactionCreated(tx);
+        finalizedTx = {
+          ...tx,
+          usdValue: sendBreakdown.txUsdValue,
+          note: `${
+            shouldBroadcast ? 'Broadcasted' : 'Signed dry-run'
+          } · Gas ${sendBreakdown.gasAmountFormatted} ${sendBreakdown.gasSymbol} requested from ${
+            sendBreakdown.gasSponsorWalletLabel
+          } · Fee ${sendBreakdown.platformFeeFormatted} ${sendBreakdown.platformFeeSymbol} → ${
+            sendBreakdown.feeCollectorWalletLabel
+          }`,
+        };
       } else {
         // Non-EVM cryptographic signed payload + local/sandbox broadcast preview
         const mockSig = Array.from(crypto.getRandomValues(new Uint8Array(32)))
           .map((b) => b.toString(16).padStart(2, '0'))
           .join('');
-        const tx: WalletTransaction = {
+        finalizedTx = {
           hash:
             activeNetwork.family === 'solana'
               ? `sol_${mockSig.slice(0, 44)}`
@@ -344,20 +414,44 @@ export function TransferView({
           status: 'signed-sandbox',
           from: senderAddress,
           to: targetAddress,
-          symbol: activeNetwork.symbol,
+          symbol: activeToken?.symbol || activeNetwork.symbol,
           amount: amountInput,
-          feeFormatted:
-            activeNetwork.family === 'solana'
-              ? '0.000005 SOL'
-              : activeNetwork.family === 'monero'
-              ? '0.00002 XMR'
-              : '0.000024 BTC',
+          usdValue: sendBreakdown.txUsdValue,
+          feeFormatted: `${sendBreakdown.gasAmountFormatted} ${sendBreakdown.gasSymbol} + ${sendBreakdown.platformFeeFormatted} ${sendBreakdown.platformFeeSymbol} fee`,
           rawSignedHex: `0x${mockSig}`,
           timestamp: Date.now(),
-          note: `${activeNetwork.name} transfer signed locally in sandbox mode`,
+          note: `${activeNetwork.name} withdrawal signed · Gas requested from ${sendBreakdown.gasSponsorWalletLabel} · Fee routed to ${sendBreakdown.feeCollectorWalletLabel}`,
         };
-        setLastTx(tx);
-        onTransactionCreated(tx);
+      }
+
+      setLastTx(finalizedTx);
+      onTransactionCreated(finalizedTx);
+
+      if (onRecordFeeGasSettlement) {
+        await onRecordFeeGasSettlement({
+          txType: 'send',
+          networkId,
+          symbol: activeToken?.symbol || activeNetwork.symbol,
+          txAmount: amountInput,
+          txUsdValue: sendBreakdown.txUsdValue,
+          sourceWalletAddress: senderAddress || wallet.addresses.evmAddress || 'unknown',
+          recipientAddress: targetAddress,
+          gasAmountNative: sendBreakdown.gasAmountFormatted,
+          gasSymbol: sendBreakdown.gasSymbol,
+          gasUsdValue: sendBreakdown.gasUsdValue,
+          gasSponsorWalletId: sendBreakdown.gasSponsorWalletId,
+          gasSponsorWalletLabel: sendBreakdown.gasSponsorWalletLabel,
+          gasSponsorAddress: sendBreakdown.gasSponsorAddress,
+          gasRequestStatus: 'requested',
+          platformFeeAmount: sendBreakdown.platformFeeFormatted,
+          platformFeeSymbol: sendBreakdown.platformFeeSymbol,
+          platformFeeUsdValue: sendBreakdown.platformFeeUsdValue,
+          feeCollectorWalletId: sendBreakdown.feeCollectorWalletId,
+          feeCollectorWalletLabel: sendBreakdown.feeCollectorWalletLabel,
+          feeCollectorAddress: sendBreakdown.feeCollectorAddress,
+          feeStatus: sendBreakdown.feeCollectorWalletId ? 'collected' : 'pending',
+          txHash: finalizedTx.hash,
+        });
       }
 
       if (saveToBookLabel.trim()) {
@@ -374,6 +468,47 @@ export function TransferView({
       setSendError(err instanceof Error ? err.message : 'Transaction signing failed.');
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleRequestReceiveConsolidationGas = async () => {
+    if (!senderAddress || !onRecordFeeGasSettlement) return;
+    setRequestingReceiveGas(true);
+    setReceiveGasNotice('');
+    try {
+      const txRef = `rcv_${Array.from(crypto.getRandomValues(new Uint8Array(12)))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('')}`;
+      const amtStr = Number(requestAmount) > 0 ? requestAmount : '0.1';
+      await onRecordFeeGasSettlement({
+        txType: 'receive',
+        networkId,
+        symbol: activeNetwork.symbol,
+        txAmount: amtStr,
+        txUsdValue: receiveBreakdown.txUsdValue,
+        sourceWalletAddress: senderAddress,
+        recipientAddress: receiveBreakdown.feeCollectorAddress || senderAddress,
+        gasAmountNative: receiveBreakdown.gasAmountFormatted,
+        gasSymbol: receiveBreakdown.gasSymbol,
+        gasUsdValue: receiveBreakdown.gasUsdValue,
+        gasSponsorWalletId: receiveBreakdown.gasSponsorWalletId,
+        gasSponsorWalletLabel: receiveBreakdown.gasSponsorWalletLabel,
+        gasSponsorAddress: receiveBreakdown.gasSponsorAddress,
+        gasRequestStatus: 'requested',
+        platformFeeAmount: receiveBreakdown.platformFeeFormatted,
+        platformFeeSymbol: receiveBreakdown.platformFeeSymbol,
+        platformFeeUsdValue: receiveBreakdown.platformFeeUsdValue,
+        feeCollectorWalletId: receiveBreakdown.feeCollectorWalletId,
+        feeCollectorWalletLabel: receiveBreakdown.feeCollectorWalletLabel,
+        feeCollectorAddress: receiveBreakdown.feeCollectorAddress,
+        feeStatus: receiveBreakdown.feeCollectorWalletId ? 'collected' : 'pending',
+        txHash: txRef,
+      });
+      setReceiveGasNotice(
+        `Requested ${receiveBreakdown.gasAmountFormatted} ${receiveBreakdown.gasSymbol} consolidation gas from ${receiveBreakdown.gasSponsorWalletLabel}; deposit fee (${receiveBreakdown.platformFeeFormatted} ${receiveBreakdown.platformFeeSymbol}) routed to ${receiveBreakdown.feeCollectorWalletLabel}.`
+      );
+    } finally {
+      setRequestingReceiveGas(false);
     }
   };
 
@@ -640,19 +775,44 @@ export function TransferView({
                 ))}
               </div>
 
-              <div className="space-y-2 text-xs pt-2 border-t border-white/10">
-                <div className="flex justify-between">
-                  <span className="text-[#8A94A6]">Estimated Fee</span>
-                  <span className="font-mono text-[#F4F6F9] tabular-nums">
-                    {activeNetwork.family === 'evm'
-                      ? `${estimatedFeeNative} ${activeNetwork.symbol}`
-                      : activeNetwork.family === 'solana'
-                      ? '0.000005 SOL'
-                      : activeNetwork.family === 'monero'
-                      ? '0.00002 XMR'
-                      : '0.000024 BTC'}
+              <div className="space-y-2.5 text-xs pt-2 border-t border-white/10">
+                <div className="flex justify-between gap-2">
+                  <span className="text-[#8A94A6]">Calculated Network Gas</span>
+                  <span className="font-mono text-[#F4F6F9] tabular-nums text-right">
+                    {sendBreakdown.gasAmountFormatted} {sendBreakdown.gasSymbol} (
+                    {formatFiat(sendBreakdown.gasUsdValue, currency)})
                   </span>
                 </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[#8A94A6]">Gas Requested From</span>
+                  <span className="font-mono text-sky-400 truncate max-w-[175px]">
+                    {sendBreakdown.gasSponsorWalletLabel}
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[#8A94A6]">
+                    Exchange Fee ({(sendBreakdown.feeBps / 100).toFixed(2)}%)
+                  </span>
+                  <span className="font-mono text-emerald-400 tabular-nums text-right">
+                    {sendBreakdown.platformFeeFormatted} {sendBreakdown.platformFeeSymbol} (
+                    {formatFiat(sendBreakdown.platformFeeUsdValue, currency)})
+                  </span>
+                </div>
+                <div className="flex justify-between gap-2">
+                  <span className="text-[#8A94A6]">Fee Routed To</span>
+                  <span className="font-mono text-amber-400 truncate max-w-[175px]">
+                    {sendBreakdown.feeCollectorWalletLabel}
+                  </span>
+                </div>
+                {Number(amountInput) > 0 && (
+                  <div className="flex justify-between gap-2 pt-2 border-t border-white/10">
+                    <span className="text-[#8A94A6]">Net Recipient Amount</span>
+                    <span className="font-mono font-semibold text-[#F4F6F9] tabular-nums">
+                      {formatCryptoAmount(sendBreakdown.netAmountAfterFee, 6)}{' '}
+                      {activeToken?.symbol || activeNetwork.symbol}
+                    </span>
+                  </div>
+                )}
                 <div className="flex justify-between">
                   <span className="text-[#8A94A6]">Signing Standard</span>
                   <span className="font-mono text-[#CBD5E1]">
@@ -778,7 +938,7 @@ export function TransferView({
 
             <div>
               <label className="block text-xs text-[#8A94A6] mb-1.5">
-                Request Specific Amount (Embeds Payment URI in QR)
+                Request Specific Amount (Embeds Payment URI & Calculates Deposit Gas)
               </label>
               <div className="relative max-w-xs">
                 <input
@@ -786,14 +946,71 @@ export function TransferView({
                   min="0"
                   step="any"
                   value={requestAmount}
-                  onChange={(e) => setRequestAmount(e.target.value)}
-                  placeholder="Optional amount"
-                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 pr-14 font-mono text-xs text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+                  onChange={(e) => {
+                    setRequestAmount(e.target.value);
+                    setReceiveGasNotice('');
+                  }}
+                  placeholder="Optional amount (defaults 0.1)"
+                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 pr-14 font-mono text-base sm:text-xs text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
                 />
                 <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs font-mono text-[#8A94A6]">
                   {activeNetwork.symbol}
                 </span>
               </div>
+            </div>
+
+            {/* Exchange Inbound Deposit Gas & Nominated Fee Preview */}
+            <div className="p-4 rounded-xl bg-[#090B0F] border border-white/10 space-y-2.5 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-[#F4F6F9] inline-flex items-center gap-1.5">
+                  <Fuel className="w-3.5 h-3.5 text-sky-400" />
+                  <span>Auto-Calculated Inbound Gas & Fee Routing</span>
+                </span>
+                <span className="font-mono text-[11px] text-[#8A94A6]">
+                  {(receiveBreakdown.feeBps / 100).toFixed(2)}% exchange fee
+                </span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-[#8A94A6]">Consolidation Gas Requested</span>
+                <span className="font-mono text-[#F4F6F9] tabular-nums">
+                  {receiveBreakdown.gasAmountFormatted} {receiveBreakdown.gasSymbol} (
+                  {formatFiat(receiveBreakdown.gasUsdValue, currency)})
+                </span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-[#8A94A6]">Gas Sponsor Wallet</span>
+                <span className="font-mono text-sky-400 truncate max-w-[200px]">
+                  {receiveBreakdown.gasSponsorWalletLabel}
+                </span>
+              </div>
+              <div className="flex justify-between gap-2">
+                <span className="text-[#8A94A6]">Fee Collected To</span>
+                <span className="font-mono text-amber-400 truncate max-w-[200px]">
+                  {receiveBreakdown.platformFeeFormatted} {receiveBreakdown.platformFeeSymbol} →{' '}
+                  {receiveBreakdown.feeCollectorWalletLabel}
+                </span>
+              </div>
+
+              {onRecordFeeGasSettlement && senderAddress && (
+                <div className="pt-2 border-t border-white/10 flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    disabled={requestingReceiveGas}
+                    onClick={handleRequestReceiveConsolidationGas}
+                    className="px-3.5 py-2 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-emerald-500/30 text-xs font-medium text-emerald-400 whitespace-nowrap"
+                  >
+                    {requestingReceiveGas
+                      ? 'Requesting Gas...'
+                      : 'Request Deposit Consolidation Gas from Gas Wallet'}
+                  </button>
+                </div>
+              )}
+
+              {receiveGasNotice && (
+                <div className="text-[11px] text-emerald-400 leading-relaxed pt-1">
+                  {receiveGasNotice}
+                </div>
+              )}
             </div>
 
             <div className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6] leading-relaxed">

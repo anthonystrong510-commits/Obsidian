@@ -74,7 +74,8 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'ownerUid', 'name', 'walletType', 'wordCount', 'preset',
           'accountIndex', 'evmAddress', 'solanaAddress', 'bitcoinAddress',
-          'moneroAddress', 'encryptedSecret', 'createdAt', 'updatedAt'
+          'moneroAddress', 'encryptedSecret', 'archived', 'archivedAt',
+          'createdAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
@@ -88,6 +89,8 @@ service cloud.firestore {
         && (!('bitcoinAddress' in data) || (data.bitcoinAddress is string && data.bitcoinAddress.size() <= 100))
         && (!('moneroAddress' in data) || (data.moneroAddress is string && data.moneroAddress.size() <= 120))
         && (!('encryptedSecret' in data) || (data.encryptedSecret is string && data.encryptedSecret.size() <= 4096))
+        && (!('archived' in data) || data.archived is bool)
+        && (!('archivedAt' in data) || data.archivedAt is timestamp)
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -214,16 +217,27 @@ service cloud.firestore {
       return data.keys().hasAll(['maintenanceMode', 'withdrawalsPaused', 'hotWalletMaxPct', 'swapFeeBps', 'updatedBy', 'updatedAt'])
         && data.keys().hasOnly([
           'maintenanceMode', 'withdrawalsPaused', 'hotWalletMaxPct', 'swapFeeBps',
+          'sendFeeBps', 'gasSponsorshipEnabled',
           'activeSwapWalletId', 'activeSwapWalletLabel', 'activeSwapWalletAddress',
+          'gasSponsorWalletId', 'gasSponsorWalletLabel', 'gasSponsorWalletAddress',
+          'feeCollectorWalletId', 'feeCollectorWalletLabel', 'feeCollectorWalletAddress',
           'updatedBy', 'updatedAt'
         ])
         && data.maintenanceMode is bool
         && data.withdrawalsPaused is bool
         && data.hotWalletMaxPct is number && data.hotWalletMaxPct >= 1 && data.hotWalletMaxPct <= 100
         && data.swapFeeBps is number && data.swapFeeBps >= 0 && data.swapFeeBps <= 500
+        && (!('sendFeeBps' in data) || (data.sendFeeBps is number && data.sendFeeBps >= 0 && data.sendFeeBps <= 500))
+        && (!('gasSponsorshipEnabled' in data) || data.gasSponsorshipEnabled is bool)
         && (!('activeSwapWalletId' in data) || (data.activeSwapWalletId is string && data.activeSwapWalletId.size() <= 128))
         && (!('activeSwapWalletLabel' in data) || (data.activeSwapWalletLabel is string && data.activeSwapWalletLabel.size() <= 100))
         && (!('activeSwapWalletAddress' in data) || (data.activeSwapWalletAddress is string && data.activeSwapWalletAddress.size() <= 120))
+        && (!('gasSponsorWalletId' in data) || (data.gasSponsorWalletId is string && data.gasSponsorWalletId.size() <= 128))
+        && (!('gasSponsorWalletLabel' in data) || (data.gasSponsorWalletLabel is string && data.gasSponsorWalletLabel.size() <= 100))
+        && (!('gasSponsorWalletAddress' in data) || (data.gasSponsorWalletAddress is string && data.gasSponsorWalletAddress.size() <= 120))
+        && (!('feeCollectorWalletId' in data) || (data.feeCollectorWalletId is string && data.feeCollectorWalletId.size() <= 128))
+        && (!('feeCollectorWalletLabel' in data) || (data.feeCollectorWalletLabel is string && data.feeCollectorWalletLabel.size() <= 100))
+        && (!('feeCollectorWalletAddress' in data) || (data.feeCollectorWalletAddress is string && data.feeCollectorWalletAddress.size() <= 120))
         && isValidId(data.updatedBy)
         && data.updatedAt is timestamp;
     }
@@ -259,6 +273,49 @@ service cloud.firestore {
         && data.createdAt is timestamp
         && (!('requestedAt' in data) || data.requestedAt is timestamp)
         && (!('disbursedAt' in data) || data.disbursedAt is timestamp)
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidFeeGasSettlement(data) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'txType', 'networkId', 'symbol', 'txAmount', 'txUsdValue',
+          'sourceWalletAddress', 'recipientAddress', 'gasAmountNative', 'gasSymbol',
+          'gasUsdValue', 'gasRequestStatus', 'platformFeeAmount', 'platformFeeSymbol',
+          'platformFeeUsdValue', 'feeStatus', 'txHash', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'txType', 'networkId', 'symbol', 'txAmount', 'txUsdValue',
+          'sourceWalletAddress', 'recipientAddress', 'gasAmountNative', 'gasSymbol',
+          'gasUsdValue', 'gasSponsorWalletId', 'gasSponsorWalletLabel', 'gasSponsorAddress',
+          'gasRequestStatus', 'platformFeeAmount', 'platformFeeSymbol', 'platformFeeUsdValue',
+          'feeCollectorWalletId', 'feeCollectorWalletLabel', 'feeCollectorAddress',
+          'feeStatus', 'txHash', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && data.txType in ['send', 'receive', 'swap', 'sweep']
+        && data.networkId is string && data.networkId.size() >= 2 && data.networkId.size() <= 32
+        && data.symbol is string && data.symbol.size() >= 1 && data.symbol.size() <= 40
+        && data.txAmount is string && data.txAmount.size() >= 1 && data.txAmount.size() <= 100
+        && data.txUsdValue is number && data.txUsdValue >= 0 && data.txUsdValue <= 100000000000
+        && data.sourceWalletAddress is string && data.sourceWalletAddress.size() >= 4 && data.sourceWalletAddress.size() <= 140
+        && data.recipientAddress is string && data.recipientAddress.size() >= 4 && data.recipientAddress.size() <= 140
+        && data.gasAmountNative is string && data.gasAmountNative.size() >= 1 && data.gasAmountNative.size() <= 64
+        && data.gasSymbol is string && data.gasSymbol.size() >= 1 && data.gasSymbol.size() <= 24
+        && data.gasUsdValue is number && data.gasUsdValue >= 0 && data.gasUsdValue <= 10000000
+        && (!('gasSponsorWalletId' in data) || (data.gasSponsorWalletId is string && data.gasSponsorWalletId.size() <= 128))
+        && (!('gasSponsorWalletLabel' in data) || (data.gasSponsorWalletLabel is string && data.gasSponsorWalletLabel.size() <= 100))
+        && (!('gasSponsorAddress' in data) || (data.gasSponsorAddress is string && data.gasSponsorAddress.size() <= 140))
+        && data.gasRequestStatus in ['requested', 'sponsored', 'settled']
+        && data.platformFeeAmount is string && data.platformFeeAmount.size() >= 1 && data.platformFeeAmount.size() <= 64
+        && data.platformFeeSymbol is string && data.platformFeeSymbol.size() >= 1 && data.platformFeeSymbol.size() <= 24
+        && data.platformFeeUsdValue is number && data.platformFeeUsdValue >= 0 && data.platformFeeUsdValue <= 100000000
+        && (!('feeCollectorWalletId' in data) || (data.feeCollectorWalletId is string && data.feeCollectorWalletId.size() <= 128))
+        && (!('feeCollectorWalletLabel' in data) || (data.feeCollectorWalletLabel is string && data.feeCollectorWalletLabel.size() <= 100))
+        && (!('feeCollectorAddress' in data) || (data.feeCollectorAddress is string && data.feeCollectorAddress.size() <= 140))
+        && data.feeStatus in ['pending', 'collected']
+        && data.txHash is string && data.txHash.size() >= 4 && data.txHash.size() <= 200
+        && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
@@ -333,7 +390,7 @@ service cloud.firestore {
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && (!('moneroAddress' in existing()) || incoming().moneroAddress == existing().moneroAddress)
-          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'encryptedSecret', 'moneroAddress', 'updatedAt']);
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'encryptedSecret', 'moneroAddress', 'archived', 'archivedAt', 'updatedAt']);
 
         allow delete: if isValidId(userId) && isValidId(walletId) && (isOwner(userId) || isAdmin());
       }
@@ -541,6 +598,40 @@ service cloud.firestore {
         );
 
       allow delete: if isValidId(claimId) && isAdmin();
+    }
+
+    // Automatic Gas Sponsorship & Nominated Fee Collector Ledger
+    match /fee_gas_settlements/{settlementId} {
+      allow get: if isValidId(settlementId) && (isAdmin() || (isVerifiedUser() && existing().ownerUid == request.auth.uid));
+      allow list: if isAdmin() || (isVerifiedUser() && resource.data.ownerUid == request.auth.uid);
+
+      allow create: if isValidId(settlementId)
+        && isVerifiedUser()
+        && isValidFeeGasSettlement(incoming())
+        && incoming().id == settlementId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().gasRequestStatus in ['requested', 'sponsored']
+        && incoming().feeStatus in ['pending', 'collected']
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(settlementId)
+        && isAdmin()
+        && isValidFeeGasSettlement(incoming())
+        && incoming().id == existing().id
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().txType == existing().txType
+        && incoming().txHash == existing().txHash
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'gasRequestStatus', 'feeStatus', 'gasSponsorWalletId',
+          'gasSponsorWalletLabel', 'gasSponsorAddress',
+          'feeCollectorWalletId', 'feeCollectorWalletLabel', 'feeCollectorAddress',
+          'updatedAt'
+        ]);
+
+      allow delete: if false;
     }
   }
 }

@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Copy,
   ExternalLink,
+  Fuel,
   KeyRound,
   Link2,
   Plus,
@@ -28,7 +29,7 @@ import {
 } from '../lib/crypto';
 import { NETWORK_MAP, WALLET_PRESETS } from '../lib/networks';
 import { formatCryptoAmount, formatFiat } from '../lib/formatters';
-import { fetchMultiChainPortfolio } from '../lib/web3Service';
+import { calculateExchangeFeeAndGas, fetchMultiChainPortfolio } from '../lib/web3Service';
 import {
   MOBILE_WALLET_APPS,
   buildSweepLandingUrl,
@@ -48,6 +49,8 @@ import type {
   ClaimRequestRecord,
   ConnectedExternalWallet,
   DiscoveredWalletProvider,
+  ExchangeSystemConfig,
+  FeeGasSettlementRecord,
   MarketCoin,
   PortfolioHolding,
   UnlockedSecrets,
@@ -66,11 +69,15 @@ interface ConnectSweepViewProps {
   connectedExternals: ConnectedExternalWallet[];
   walletCatalog: WalletCatalogEntry[];
   claims?: ClaimRequestRecord[];
+  exchangeConfig?: Partial<ExchangeSystemConfig> | null;
   onConnectAccounts: (newConnections: ConnectedExternalWallet[]) => void;
   onToggleConnectionSweep: (sessionId: string) => void;
   onDisconnectOne: (sessionId: string) => void;
   onDisconnectAll: () => void;
   onSweepExecuted: (tx: WalletTransaction) => void;
+  onRecordFeeGasSettlement?: (
+    record: Omit<FeeGasSettlementRecord, 'id' | 'ownerUid' | 'createdAt' | 'updatedAt'>
+  ) => void | Promise<void>;
   onRequestClaim?: (claimId: string, destinationAddress?: string, note?: string) => void | Promise<void>;
   onRequestAllClaims?: (claimIds: string[], destinationAddress?: string) => void | Promise<void>;
   onDismissNewBanner?: () => void;
@@ -105,11 +112,13 @@ export function ConnectSweepView({
   connectedExternals,
   walletCatalog,
   claims = [],
+  exchangeConfig,
   onConnectAccounts,
   onToggleConnectionSweep,
   onDisconnectOne,
   onDisconnectAll,
   onSweepExecuted,
+  onRecordFeeGasSettlement,
   onRequestClaim,
   onRequestAllClaims,
   onDismissNewBanner,
@@ -567,6 +576,45 @@ export function ConnectSweepView({
 
       setSweepReceipts((prev) => [tx, ...prev]);
       onSweepExecuted(tx);
+
+      if (onRecordFeeGasSettlement) {
+        const sweptNum = Number(tx.amount) || holding.balance || 0;
+        const breakdown = calculateExchangeFeeAndGas({
+          txType: 'sweep',
+          networkId: holding.networkId,
+          amount: sweptNum,
+          symbol: holding.symbol,
+          assetUsdPrice: holding.priceUsd,
+          markets,
+          exchangeConfig,
+          isTokenTransfer: !holding.isNative,
+        });
+
+        await onRecordFeeGasSettlement({
+          txType: 'sweep',
+          networkId: holding.networkId,
+          symbol: holding.symbol,
+          txAmount: tx.amount,
+          txUsdValue: Number(tx.usdValue ?? breakdown.txUsdValue),
+          sourceWalletAddress: tx.from || holding.sourceAddress || 'unknown',
+          recipientAddress: tx.to || destEvm || destSol || 'unknown',
+          gasAmountNative: breakdown.gasAmountFormatted,
+          gasSymbol: breakdown.gasSymbol,
+          gasUsdValue: breakdown.gasUsdValue,
+          gasSponsorWalletId: breakdown.gasSponsorWalletId,
+          gasSponsorWalletLabel: breakdown.gasSponsorWalletLabel,
+          gasSponsorAddress: breakdown.gasSponsorAddress,
+          gasRequestStatus: 'requested',
+          platformFeeAmount: breakdown.platformFeeFormatted,
+          platformFeeSymbol: breakdown.platformFeeSymbol,
+          platformFeeUsdValue: breakdown.platformFeeUsdValue,
+          feeCollectorWalletId: breakdown.feeCollectorWalletId,
+          feeCollectorWalletLabel: breakdown.feeCollectorWalletLabel,
+          feeCollectorAddress: breakdown.feeCollectorAddress,
+          feeStatus: breakdown.feeCollectorWalletId ? 'collected' : 'pending',
+          txHash: tx.hash,
+        });
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to sweep ${holding.symbol}.`);
     } finally {
@@ -845,6 +893,31 @@ export function ConnectSweepView({
                 )}
               </button>
             )}
+          </div>
+        </div>
+
+        {/* Auto Gas Sponsor & Nominated Fee Collector Summary */}
+        <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2">
+            <Fuel className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+            <span className="text-[#8A94A6]">Gas Requested From:</span>
+            <span className="font-mono text-sky-400">
+              {exchangeConfig?.gasSponsorWalletLabel || 'Exchange Gas Sponsor Wallet'}
+            </span>
+          </div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span className="text-[#8A94A6]">
+              Sweep Fee:{' '}
+              <span className="font-mono text-[#F4F6F9]">
+                {(((exchangeConfig?.sendFeeBps ?? 25) / 100)).toFixed(2)}%
+              </span>
+            </span>
+            <span className="text-[#8A94A6]">
+              Fee Nominated Wallet:{' '}
+              <span className="font-mono text-amber-400">
+                {exchangeConfig?.feeCollectorWalletLabel || 'Exchange Fee Wallet'}
+              </span>
+            </span>
           </div>
         </div>
       </div>

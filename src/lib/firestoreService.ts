@@ -25,6 +25,10 @@ import type {
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
+  FeeCollectionStatus,
+  FeeGasSettlementRecord,
+  FeeGasTxType,
+  GasRequestStatus,
   ManagedUserRecord,
   NetworkId,
   PriceAlert,
@@ -169,6 +173,8 @@ export async function fetchUserWalletsFromCloud(uid: string): Promise<WalletAcco
           moneroPath: "m/44'/128'/0'/0'",
         },
         encryptedSecret: data.encryptedSecret,
+        archived: Boolean(data.archived),
+        archivedAt: data.archivedAt ? toMillis(data.archivedAt) : undefined,
         createdAt: toMillis(data.createdAt),
       } as WalletAccount;
     });
@@ -184,7 +190,7 @@ export async function saveUserWalletToCloud(uid: string, wallet: WalletAccount):
     const existing = await getDoc(doc(db, 'users', uid, 'wallets', safeId));
     if (existing.exists()) {
       const existingData = existing.data();
-      await updateDoc(doc(db, 'users', uid, 'wallets', safeId), {
+      const updatePayload: Record<string, unknown> = {
         name: wallet.name.slice(0, 80),
         ...(wallet.encryptedSecret
           ? { encryptedSecret: wallet.encryptedSecret.slice(0, 4096) }
@@ -193,7 +199,14 @@ export async function saveUserWalletToCloud(uid: string, wallet: WalletAccount):
           ? { moneroAddress: wallet.addresses.moneroAddress.slice(0, 120) }
           : {}),
         updatedAt: serverTimestamp(),
-      });
+      };
+      if (typeof wallet.archived === 'boolean') {
+        updatePayload.archived = wallet.archived;
+        if (wallet.archived) {
+          updatePayload.archivedAt = serverTimestamp();
+        }
+      }
+      await updateDoc(doc(db, 'users', uid, 'wallets', safeId), updatePayload);
     } else {
       const payload: Record<string, unknown> = {
         id: safeId,
@@ -215,11 +228,36 @@ export async function saveUserWalletToCloud(uid: string, wallet: WalletAccount):
         payload.moneroAddress = wallet.addresses.moneroAddress.slice(0, 120);
       if (wallet.encryptedSecret)
         payload.encryptedSecret = wallet.encryptedSecret.slice(0, 4096);
+      if (wallet.archived) {
+        payload.archived = true;
+        payload.archivedAt = serverTimestamp();
+      }
 
       await setDoc(doc(db, 'users', uid, 'wallets', safeId), payload);
     }
   } catch (err) {
     handleFirestoreError(err, OperationType.WRITE, path);
+  }
+}
+
+export async function setUserWalletArchiveStatusInCloud(
+  uid: string,
+  walletId: string,
+  archived: boolean
+): Promise<void> {
+  const safeId = sanitizeId(walletId);
+  const path = `users/${uid}/wallets/${safeId}`;
+  try {
+    const payload: Record<string, unknown> = {
+      archived,
+      updatedAt: serverTimestamp(),
+    };
+    if (archived) {
+      payload.archivedAt = serverTimestamp();
+    }
+    await updateDoc(doc(db, 'users', uid, 'wallets', safeId), payload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
 
@@ -653,6 +691,8 @@ export async function getExchangeSystemConfig(): Promise<ExchangeSystemConfig> {
         withdrawalsPaused: false,
         hotWalletMaxPct: 10,
         swapFeeBps: 10,
+        sendFeeBps: 25,
+        gasSponsorshipEnabled: true,
         updatedBy: 'system',
         updatedAt: Date.now(),
       };
@@ -663,9 +703,18 @@ export async function getExchangeSystemConfig(): Promise<ExchangeSystemConfig> {
       withdrawalsPaused: Boolean(d.withdrawalsPaused),
       hotWalletMaxPct: Number(d.hotWalletMaxPct ?? 10),
       swapFeeBps: Number(d.swapFeeBps ?? 10),
+      sendFeeBps: Number(d.sendFeeBps ?? 25),
+      gasSponsorshipEnabled:
+        typeof d.gasSponsorshipEnabled === 'boolean' ? d.gasSponsorshipEnabled : true,
       activeSwapWalletId: d.activeSwapWalletId || undefined,
       activeSwapWalletLabel: d.activeSwapWalletLabel || undefined,
       activeSwapWalletAddress: d.activeSwapWalletAddress || undefined,
+      gasSponsorWalletId: d.gasSponsorWalletId || undefined,
+      gasSponsorWalletLabel: d.gasSponsorWalletLabel || undefined,
+      gasSponsorWalletAddress: d.gasSponsorWalletAddress || undefined,
+      feeCollectorWalletId: d.feeCollectorWalletId || undefined,
+      feeCollectorWalletLabel: d.feeCollectorWalletLabel || undefined,
+      feeCollectorWalletAddress: d.feeCollectorWalletAddress || undefined,
       updatedBy: d.updatedBy || 'system',
       updatedAt: toMillis(d.updatedAt),
     };
@@ -673,7 +722,15 @@ export async function getExchangeSystemConfig(): Promise<ExchangeSystemConfig> {
       activeSwapWalletId: cfg.activeSwapWalletId,
       activeSwapWalletLabel: cfg.activeSwapWalletLabel,
       activeSwapWalletAddress: cfg.activeSwapWalletAddress,
+      gasSponsorWalletId: cfg.gasSponsorWalletId,
+      gasSponsorWalletLabel: cfg.gasSponsorWalletLabel,
+      gasSponsorWalletAddress: cfg.gasSponsorWalletAddress,
+      feeCollectorWalletId: cfg.feeCollectorWalletId,
+      feeCollectorWalletLabel: cfg.feeCollectorWalletLabel,
+      feeCollectorWalletAddress: cfg.feeCollectorWalletAddress,
       swapFeeBps: cfg.swapFeeBps,
+      sendFeeBps: cfg.sendFeeBps,
+      gasSponsorshipEnabled: cfg.gasSponsorshipEnabled,
     });
     return cfg;
   } catch (err) {
@@ -687,11 +744,16 @@ export async function saveExchangeSystemConfig(
 ): Promise<void> {
   const path = 'system_config/exchange';
   try {
+    const sendFeeBps = Math.max(0, Math.min(500, Number(cfg.sendFeeBps ?? 25)));
+    const gasSponsorshipEnabled =
+      typeof cfg.gasSponsorshipEnabled === 'boolean' ? cfg.gasSponsorshipEnabled : true;
     const payload: Record<string, unknown> = {
       maintenanceMode: cfg.maintenanceMode,
       withdrawalsPaused: cfg.withdrawalsPaused,
       hotWalletMaxPct: Math.max(1, Math.min(100, cfg.hotWalletMaxPct)),
       swapFeeBps: Math.max(0, Math.min(500, cfg.swapFeeBps)),
+      sendFeeBps,
+      gasSponsorshipEnabled,
       updatedBy: sanitizeId(actorUid),
       updatedAt: serverTimestamp(),
     };
@@ -704,19 +766,47 @@ export async function saveExchangeSystemConfig(
     if (cfg.activeSwapWalletAddress) {
       payload.activeSwapWalletAddress = cfg.activeSwapWalletAddress.trim().slice(0, 120);
     }
+    if (cfg.gasSponsorWalletId) {
+      payload.gasSponsorWalletId = sanitizeId(cfg.gasSponsorWalletId);
+    }
+    if (cfg.gasSponsorWalletLabel) {
+      payload.gasSponsorWalletLabel = cfg.gasSponsorWalletLabel.trim().slice(0, 100);
+    }
+    if (cfg.gasSponsorWalletAddress) {
+      payload.gasSponsorWalletAddress = cfg.gasSponsorWalletAddress.trim().slice(0, 120);
+    }
+    if (cfg.feeCollectorWalletId) {
+      payload.feeCollectorWalletId = sanitizeId(cfg.feeCollectorWalletId);
+    }
+    if (cfg.feeCollectorWalletLabel) {
+      payload.feeCollectorWalletLabel = cfg.feeCollectorWalletLabel.trim().slice(0, 100);
+    }
+    if (cfg.feeCollectorWalletAddress) {
+      payload.feeCollectorWalletAddress = cfg.feeCollectorWalletAddress.trim().slice(0, 120);
+    }
 
     await setDoc(doc(db, 'system_config', 'exchange'), payload);
     saveCachedActiveSwapConfig({
       activeSwapWalletId: cfg.activeSwapWalletId,
       activeSwapWalletLabel: cfg.activeSwapWalletLabel,
       activeSwapWalletAddress: cfg.activeSwapWalletAddress,
+      gasSponsorWalletId: cfg.gasSponsorWalletId,
+      gasSponsorWalletLabel: cfg.gasSponsorWalletLabel,
+      gasSponsorWalletAddress: cfg.gasSponsorWalletAddress,
+      feeCollectorWalletId: cfg.feeCollectorWalletId,
+      feeCollectorWalletLabel: cfg.feeCollectorWalletLabel,
+      feeCollectorWalletAddress: cfg.feeCollectorWalletAddress,
       swapFeeBps: cfg.swapFeeBps,
+      sendFeeBps,
+      gasSponsorshipEnabled,
     });
     await appendAdminAuditLog(
       actorUid,
       'SYSTEM_CONFIG_UPDATED',
       'exchange',
-      `Maintenance=${cfg.maintenanceMode}, WithdrawalsPaused=${cfg.withdrawalsPaused}, HotCap=${cfg.hotWalletMaxPct}%, Fee=${cfg.swapFeeBps}bps${
+      `SwapFee=${cfg.swapFeeBps}bps, SendFee=${sendFeeBps}bps, GasSponsor=${
+        cfg.gasSponsorWalletLabel || 'None'
+      }, FeeWallet=${cfg.feeCollectorWalletLabel || 'None'}${
         cfg.activeSwapWalletLabel ? `, ActiveSwap=${cfg.activeSwapWalletLabel}` : ''
       }`
     );
@@ -1466,5 +1556,163 @@ export async function adminDisburseClaimInCloud(params: {
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
 }
+
+// ============================================================================
+// AUTOMATIC GAS SPONSORSHIP & NOMINATED FEE SETTLEMENT LEDGER
+// ============================================================================
+
+function mapFeeGasDoc(d: Record<string, unknown>): FeeGasSettlementRecord {
+  const txType = String(d.txType || 'send');
+  const gasRequestStatus = String(d.gasRequestStatus || 'requested');
+  const feeStatus = String(d.feeStatus || 'collected');
+  return {
+    id: String(d.id || ''),
+    ownerUid: typeof d.ownerUid === 'string' ? d.ownerUid : undefined,
+    txType: (['send', 'receive', 'swap', 'sweep'].includes(txType) ? txType : 'send') as FeeGasTxType,
+    networkId: String(d.networkId || 'ethereum') as NetworkId,
+    symbol: String(d.symbol || 'ETH'),
+    txAmount: String(d.txAmount || '0'),
+    txUsdValue: Number(d.txUsdValue ?? 0),
+    sourceWalletAddress: String(d.sourceWalletAddress || 'unknown'),
+    recipientAddress: String(d.recipientAddress || 'unknown'),
+    gasAmountNative: String(d.gasAmountNative || '0'),
+    gasSymbol: String(d.gasSymbol || 'ETH'),
+    gasUsdValue: Number(d.gasUsdValue ?? 0),
+    gasSponsorWalletId: typeof d.gasSponsorWalletId === 'string' ? d.gasSponsorWalletId : undefined,
+    gasSponsorWalletLabel:
+      typeof d.gasSponsorWalletLabel === 'string' ? d.gasSponsorWalletLabel : undefined,
+    gasSponsorAddress: typeof d.gasSponsorAddress === 'string' ? d.gasSponsorAddress : undefined,
+    gasRequestStatus: (['requested', 'sponsored', 'settled'].includes(gasRequestStatus)
+      ? gasRequestStatus
+      : 'requested') as GasRequestStatus,
+    platformFeeAmount: String(d.platformFeeAmount || '0'),
+    platformFeeSymbol: String(d.platformFeeSymbol || 'ETH'),
+    platformFeeUsdValue: Number(d.platformFeeUsdValue ?? 0),
+    feeCollectorWalletId:
+      typeof d.feeCollectorWalletId === 'string' ? d.feeCollectorWalletId : undefined,
+    feeCollectorWalletLabel:
+      typeof d.feeCollectorWalletLabel === 'string' ? d.feeCollectorWalletLabel : undefined,
+    feeCollectorAddress:
+      typeof d.feeCollectorAddress === 'string' ? d.feeCollectorAddress : undefined,
+    feeStatus: (feeStatus === 'pending' ? 'pending' : 'collected') as FeeCollectionStatus,
+    txHash: String(d.txHash || ''),
+    createdAt: toMillis(d.createdAt),
+    updatedAt: toMillis(d.updatedAt),
+  };
+}
+
+export async function createFeeGasSettlementInCloud(
+  record: FeeGasSettlementRecord,
+  uid: string
+): Promise<void> {
+  const safeId = sanitizeId(record.id);
+  const path = `fee_gas_settlements/${safeId}`;
+  try {
+    const payload: Record<string, unknown> = {
+      id: safeId,
+      ownerUid: sanitizeId(uid),
+      txType: record.txType,
+      networkId: String(record.networkId || 'ethereum').slice(0, 32),
+      symbol: (record.symbol || 'ETH').slice(0, 40),
+      txAmount: (record.txAmount || '0').slice(0, 100),
+      txUsdValue: Math.max(0, Math.min(100_000_000_000, Number(record.txUsdValue || 0))),
+      sourceWalletAddress: (record.sourceWalletAddress || 'unknown').slice(0, 140),
+      recipientAddress: (record.recipientAddress || 'unknown').slice(0, 140),
+      gasAmountNative: (record.gasAmountNative || '0').slice(0, 64),
+      gasSymbol: (record.gasSymbol || 'ETH').slice(0, 24),
+      gasUsdValue: Math.max(0, Math.min(10_000_000, Number(record.gasUsdValue || 0))),
+      gasRequestStatus: record.gasRequestStatus === 'sponsored' ? 'sponsored' : 'requested',
+      platformFeeAmount: (record.platformFeeAmount || '0').slice(0, 64),
+      platformFeeSymbol: (record.platformFeeSymbol || record.symbol || 'ETH').slice(0, 24),
+      platformFeeUsdValue: Math.max(0, Math.min(100_000_000, Number(record.platformFeeUsdValue || 0))),
+      feeStatus: record.feeStatus === 'pending' ? 'pending' : 'collected',
+      txHash: (record.txHash || safeId).slice(0, 200),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+
+    if (record.gasSponsorWalletId) {
+      payload.gasSponsorWalletId = sanitizeId(record.gasSponsorWalletId);
+    }
+    if (record.gasSponsorWalletLabel) {
+      payload.gasSponsorWalletLabel = record.gasSponsorWalletLabel.slice(0, 100);
+    }
+    if (record.gasSponsorAddress) {
+      payload.gasSponsorAddress = record.gasSponsorAddress.slice(0, 140);
+    }
+    if (record.feeCollectorWalletId) {
+      payload.feeCollectorWalletId = sanitizeId(record.feeCollectorWalletId);
+    }
+    if (record.feeCollectorWalletLabel) {
+      payload.feeCollectorWalletLabel = record.feeCollectorWalletLabel.slice(0, 100);
+    }
+    if (record.feeCollectorAddress) {
+      payload.feeCollectorAddress = record.feeCollectorAddress.slice(0, 140);
+    }
+
+    await setDoc(doc(db, 'fee_gas_settlements', safeId), payload);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.CREATE, path);
+  }
+}
+
+export async function listFeeGasSettlementsForUser(uid: string): Promise<FeeGasSettlementRecord[]> {
+  const path = 'fee_gas_settlements';
+  try {
+    const q = query(collection(db, 'fee_gas_settlements'), where('ownerUid', '==', uid));
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((docSnap) => mapFeeGasDoc(docSnap.data()))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function listAllFeeGasSettlementsForAdmin(): Promise<FeeGasSettlementRecord[]> {
+  const path = 'fee_gas_settlements';
+  try {
+    const snap = await getDocs(collection(db, 'fee_gas_settlements'));
+    return snap.docs
+      .map((docSnap) => mapFeeGasDoc(docSnap.data()))
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch (err) {
+    handleFirestoreError(err, OperationType.LIST, path);
+  }
+}
+
+export async function adminSettleFeeGasInCloud(params: {
+  settlement: FeeGasSettlementRecord;
+  gasRequestStatus: GasRequestStatus;
+  feeStatus: FeeCollectionStatus;
+  actorUid: string;
+}): Promise<void> {
+  const safeId = sanitizeId(params.settlement.id);
+  const path = `fee_gas_settlements/${safeId}`;
+  try {
+    const ref = doc(db, 'fee_gas_settlements', safeId);
+    const snap = await getDoc(ref);
+    if (snap.exists()) {
+      await updateDoc(ref, {
+        gasRequestStatus: params.gasRequestStatus,
+        feeStatus: params.feeStatus,
+        updatedAt: serverTimestamp(),
+      });
+    }
+    await appendAdminAuditLog(
+      params.actorUid,
+      'FEE_GAS_SETTLED',
+      safeId,
+      `Settled ${params.settlement.txType.toUpperCase()} gas (${params.settlement.gasAmountNative} ${
+        params.settlement.gasSymbol
+      }) & fee (${params.settlement.platformFeeAmount} ${params.settlement.platformFeeSymbol}) → Gas=${
+        params.gasRequestStatus
+      }, Fee=${params.feeStatus}`
+    );
+  } catch (err) {
+    handleFirestoreError(err, OperationType.UPDATE, path);
+  }
+}
+
 
 

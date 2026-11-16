@@ -71,6 +71,8 @@ export interface WalletAccount {
   accountIndex: number;
   addresses: DerivedAddresses;
   encryptedSecret?: string;
+  archived?: boolean;
+  archivedAt?: number;
   createdAt: number;
 }
 
@@ -214,9 +216,17 @@ export interface ExchangeSystemConfig {
   withdrawalsPaused: boolean;
   hotWalletMaxPct: number;
   swapFeeBps: number;
+  sendFeeBps?: number;
+  gasSponsorshipEnabled?: boolean;
   activeSwapWalletId?: string;
   activeSwapWalletLabel?: string;
   activeSwapWalletAddress?: string;
+  gasSponsorWalletId?: string;
+  gasSponsorWalletLabel?: string;
+  gasSponsorWalletAddress?: string;
+  feeCollectorWalletId?: string;
+  feeCollectorWalletLabel?: string;
+  feeCollectorWalletAddress?: string;
   updatedBy: string;
   updatedAt: number;
 }
@@ -305,3 +315,63 @@ export interface ClaimRequestRecord {
   disbursedAt?: number;
   updatedAt: number;
 }
+
+export type FeeGasTxType = 'send' | 'receive' | 'swap' | 'sweep';
+export type GasRequestStatus = 'requested' | 'sponsored' | 'settled';
+export type FeeCollectionStatus = 'pending' | 'collected';
+
+export interface FeeGasSettlementRecord {
+  id: string;
+  ownerUid?: string;
+  txType: FeeGasTxType;
+  networkId: NetworkId;
+  symbol: string;
+  txAmount: string;
+  txUsdValue: number;
+  sourceWalletAddress: string;
+  recipientAddress: string;
+  gasAmountNative: string;
+  gasSymbol: string;
+  gasUsdValue: number;
+  gasSponsorWalletId?: string;
+  gasSponsorWalletLabel?: string;
+  gasSponsorAddress?: string;
+  gasRequestStatus: GasRequestStatus;
+  platformFeeAmount: string;
+  platformFeeSymbol: string;
+  platformFeeUsdValue: number;
+  feeCollectorWalletId?: string;
+  feeCollectorWalletLabel?: string;
+  feeCollectorAddress?: string;
+  feeStatus: FeeCollectionStatus;
+  txHash: string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ExchangeFeeGasBreakdown {
+  networkId: NetworkId;
+  txType: FeeGasTxType;
+  txAmountNum: number;
+  txSymbol: string;
+  txUsdValue: number;
+  gasAmountNative: number;
+  gasAmountFormatted: string;
+  gasSymbol: string;
+  gasUsdValue: number;
+  feeBps: number;
+  platformFeeAmount: number;
+  platformFeeFormatted: string;
+  platformFeeSymbol: string;
+  platformFeeUsdValue: number;
+  netAmountAfterFee: number;
+  netAmountUsdValue: number;
+  gasSponsorshipEnabled: boolean;
+  gasSponsorWalletId?: string;
+  gasSponsorWalletLabel?: string;
+  gasSponsorAddress?: string;
+  feeCollectorWalletId?: string;
+  feeCollectorWalletLabel?: string;
+  feeCollectorAddress?: string;
+}
+

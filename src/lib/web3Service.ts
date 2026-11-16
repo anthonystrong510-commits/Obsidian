@@ -11,6 +11,9 @@ import {
 import { NETWORKS, NETWORK_MAP } from './networks';
 import type {
   DerivedAddresses,
+  ExchangeFeeGasBreakdown,
+  ExchangeSystemConfig,
+  FeeGasTxType,
   MarketCoin,
   NetworkId,
   NetworkTelemetry,
@@ -918,3 +921,127 @@ export async function signAndExecuteEvmTransfer(params: {
     note: 'Cryptographically signed transaction (Sandbox dry-run — insufficient gas balance on-chain)',
   };
 }
+
+const DEFAULT_GAS_UNITS_BY_NETWORK: Record<NetworkId, number> = {
+  ethereum: 0.00052,
+  arbitrum: 0.000035,
+  optimism: 0.00003,
+  base: 0.000025,
+  polygon: 0.018,
+  bsc: 0.00038,
+  avalanche: 0.0014,
+  sepolia: 0.00042,
+  solana: 0.000005,
+  bitcoin: 0.000024,
+  monero: 0.00002,
+};
+
+const FALLBACK_NATIVE_USD: Record<string, number> = {
+  ETH: 3200,
+  POL: 0.55,
+  BNB: 590,
+  AVAX: 32,
+  SOL: 175,
+  BTC: 88000,
+  XMR: 210,
+};
+
+export function estimateNativeGasAmount(
+  networkId: NetworkId,
+  speedMultiplier = 1.0,
+  isTokenTransfer = false
+): number {
+  const base = DEFAULT_GAS_UNITS_BY_NETWORK[networkId] ?? 0.00042;
+  const tokenFactor =
+    isTokenTransfer && NETWORK_MAP[networkId]?.family === 'evm' ? 2.1 : 1.0;
+  return Number((base * speedMultiplier * tokenFactor).toFixed(6));
+}
+
+export function calculateExchangeFeeAndGas(params: {
+  txType: FeeGasTxType;
+  networkId: NetworkId;
+  amount: number;
+  symbol: string;
+  assetUsdPrice?: number;
+  markets?: MarketCoin[];
+  exchangeConfig?: Partial<ExchangeSystemConfig> | null;
+  gasAmountNativeOverride?: number;
+  speedMultiplier?: number;
+  isTokenTransfer?: boolean;
+}): ExchangeFeeGasBreakdown {
+  const cfg = NETWORK_MAP[params.networkId];
+  const gasSymbol = cfg?.symbol || 'ETH';
+  const markets = params.markets || [];
+
+  const gasCoinMarket = markets.find(
+    (m) =>
+      m.id === cfg?.coinGeckoId || m.symbol.toUpperCase() === gasSymbol.toUpperCase()
+  );
+  const gasUsdRate =
+    gasCoinMarket?.current_price ??
+    FALLBACK_NATIVE_USD[gasSymbol.toUpperCase()] ??
+    1;
+
+  const assetMarket = markets.find(
+    (m) => m.symbol.toUpperCase() === params.symbol.toUpperCase()
+  );
+  const resolvedAssetUsdPrice =
+    params.assetUsdPrice && params.assetUsdPrice > 0
+      ? params.assetUsdPrice
+      : assetMarket?.current_price ??
+        (params.symbol.toUpperCase().includes('USD')
+          ? 1
+          : FALLBACK_NATIVE_USD[params.symbol.toUpperCase()] ?? 0);
+
+  const safeAmt = Number.isFinite(params.amount) && params.amount > 0 ? params.amount : 0;
+  const txUsdValue = safeAmt * resolvedAssetUsdPrice;
+
+  const gasAmountNative =
+    params.gasAmountNativeOverride && params.gasAmountNativeOverride > 0
+      ? params.gasAmountNativeOverride
+      : estimateNativeGasAmount(
+          params.networkId,
+          params.speedMultiplier ?? 1.0,
+          params.isTokenTransfer ?? params.symbol.toUpperCase() !== gasSymbol.toUpperCase()
+        );
+  const gasUsdValue = gasAmountNative * gasUsdRate;
+
+  const sys = params.exchangeConfig;
+  const defaultSendBps = sys?.sendFeeBps ?? 25; // 0.25% withdrawal/send/receive fee
+  const defaultSwapBps = sys?.swapFeeBps ?? 10; // 0.10% swap fee
+  const feeBps =
+    params.txType === 'swap' ? defaultSwapBps : defaultSendBps;
+
+  const platformFeeAmount = safeAmt > 0 ? (safeAmt * feeBps) / 10000 : 0;
+  const platformFeeUsdValue = platformFeeAmount * resolvedAssetUsdPrice;
+  const netAmountAfterFee = Math.max(0, safeAmt - platformFeeAmount);
+  const netAmountUsdValue = Math.max(0, txUsdValue - platformFeeUsdValue);
+
+  return {
+    networkId: params.networkId,
+    txType: params.txType,
+    txAmountNum: safeAmt,
+    txSymbol: params.symbol,
+    txUsdValue,
+    gasAmountNative,
+    gasAmountFormatted: gasAmountNative.toFixed(6).replace(/\.?0+$/, '') || '0',
+    gasSymbol,
+    gasUsdValue,
+    feeBps,
+    platformFeeAmount,
+    platformFeeFormatted:
+      platformFeeAmount > 0 ? platformFeeAmount.toFixed(6).replace(/\.?0+$/, '') : '0',
+    platformFeeSymbol: params.symbol,
+    platformFeeUsdValue,
+    netAmountAfterFee,
+    netAmountUsdValue,
+    gasSponsorshipEnabled: sys?.gasSponsorshipEnabled ?? true,
+    gasSponsorWalletId: sys?.gasSponsorWalletId,
+    gasSponsorWalletLabel: sys?.gasSponsorWalletLabel || 'Exchange Gas Sponsor Wallet',
+    gasSponsorAddress: sys?.gasSponsorWalletAddress,
+    feeCollectorWalletId: sys?.feeCollectorWalletId,
+    feeCollectorWalletLabel: sys?.feeCollectorWalletLabel || 'Exchange Nominated Fee Wallet',
+    feeCollectorAddress: sys?.feeCollectorWalletAddress,
+  };
+}
+

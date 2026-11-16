@@ -19,6 +19,7 @@ import {
   Eye,
   EyeOff,
   Flame,
+  Fuel,
   KeyRound,
   Layers,
   LayoutGrid,
@@ -43,6 +44,7 @@ import {
   addExistingExchangeWallet,
   adminDisburseClaimInCloud,
   adminProvisionWalletForUser,
+  adminSettleFeeGasInCloud,
   archiveExchangeWallet,
   checkUserIsAdmin,
   deleteWalletCatalogEntry,
@@ -50,6 +52,7 @@ import {
   getExchangeSystemConfig,
   listAdminAuditLogs,
   listAllClaimRequestsForAdmin,
+  listAllFeeGasSettlementsForAdmin,
   listAllManagedUsers,
   listExchangeWallets,
   listUserWalletsForAdmin,
@@ -66,7 +69,10 @@ import {
   disburseClaimInLedger,
   encryptPayload,
   loadClaimLedger,
+  loadFeeGasLedger,
   saveClaimLedger,
+  saveFeeGasLedger,
+  updateFeeGasSettlementInLedger,
 } from '../lib/vaultStorage';
 import { formatFiat, formatRelativeTime } from '../lib/formatters';
 import { NETWORK_MAP } from '../lib/networks';
@@ -76,6 +82,8 @@ import type {
   ExchangeSystemConfig,
   ExchangeTreasuryWallet,
   ExchangeWalletTier,
+  FeeGasSettlementRecord,
+  FeeGasTxType,
   ManagedUserRecord,
   UnlockedSecrets,
   WalletAccount,
@@ -108,6 +116,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     withdrawalsPaused: false,
     hotWalletMaxPct: 10,
     swapFeeBps: 10,
+    sendFeeBps: 25,
+    gasSponsorshipEnabled: true,
     updatedBy: 'system',
     updatedAt: Date.now(),
   });
@@ -166,6 +176,15 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   const [disbursingId, setDisbursingId] = useState<string | null>(null);
   const [savingSwapWallet, setSavingSwapWallet] = useState(false);
 
+  // Automatic Gas Sponsor & Nominated Fee Collector Ledger
+  const [feeGasSettlements, setFeeGasSettlements] = useState<FeeGasSettlementRecord[]>(() =>
+    loadFeeGasLedger()
+  );
+  const [feeGasTypeFilter, setFeeGasTypeFilter] = useState<'all' | FeeGasTxType>('all');
+  const [settlingFeeGasId, setSettlingFeeGasId] = useState<string | null>(null);
+  const [savingGasFeeConfig, setSavingGasFeeConfig] = useState(false);
+  const [configSavedNotice, setConfigSavedNotice] = useState('');
+
   // Users filter & Admin user wallet provisioning
   const [userSearch, setUserSearch] = useState('');
   const [copiedKey, setCopiedKey] = useState('');
@@ -223,13 +242,14 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     setLoadingData(true);
     setDataError('');
     try {
-      const [uList, wList, logs, cfg, catalogList, cloudClaims] = await Promise.all([
+      const [uList, wList, logs, cfg, catalogList, cloudClaims, cloudFeeGas] = await Promise.all([
         listAllManagedUsers(),
         listExchangeWallets(),
         listAdminAuditLogs(),
         getExchangeSystemConfig(),
         listWalletCatalog(false),
         listAllClaimRequestsForAdmin().catch(() => [] as ClaimRequestRecord[]),
+        listAllFeeGasSettlementsForAdmin().catch(() => [] as FeeGasSettlementRecord[]),
       ]);
       setUsers(uList);
       setExchangeWallets(wList);
@@ -250,6 +270,20 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       const mergedClaims = Array.from(mergedMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
       setClaims(mergedClaims);
       saveClaimLedger(mergedClaims);
+
+      // Merge Firestore Gas Sponsor & Fee Collector settlements with local ledger
+      const localFeeGas = loadFeeGasLedger();
+      const fgMap = new Map<string, FeeGasSettlementRecord>();
+      for (const lf of localFeeGas) fgMap.set(lf.id, lf);
+      for (const cf of cloudFeeGas) {
+        const prev = fgMap.get(cf.id);
+        if (!prev || cf.updatedAt >= prev.updatedAt || cf.gasRequestStatus === 'settled') {
+          fgMap.set(cf.id, cf);
+        }
+      }
+      const mergedFeeGas = Array.from(fgMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+      setFeeGasSettlements(mergedFeeGas);
+      saveFeeGasLedger(mergedFeeGas);
 
       setDisburseSourceWalletId((prev) => {
         const eligible = wList.filter((w) => w.status !== 'archived');
@@ -628,13 +662,28 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         fallbackEncryptedBlobs: fallbackBlobs,
       });
 
-      if (systemConfig.activeSwapWalletId === wallet.id) {
+      const clearingSwap = systemConfig.activeSwapWalletId === wallet.id;
+      const clearingGas = systemConfig.gasSponsorWalletId === wallet.id;
+      const clearingFee = systemConfig.feeCollectorWalletId === wallet.id;
+
+      if (clearingSwap || clearingGas || clearingFee) {
         await saveExchangeSystemConfig(
           {
             maintenanceMode: systemConfig.maintenanceMode,
             withdrawalsPaused: systemConfig.withdrawalsPaused,
             hotWalletMaxPct: systemConfig.hotWalletMaxPct,
             swapFeeBps: systemConfig.swapFeeBps,
+            sendFeeBps: systemConfig.sendFeeBps ?? 25,
+            gasSponsorshipEnabled: systemConfig.gasSponsorshipEnabled ?? true,
+            activeSwapWalletId: clearingSwap ? undefined : systemConfig.activeSwapWalletId,
+            activeSwapWalletLabel: clearingSwap ? undefined : systemConfig.activeSwapWalletLabel,
+            activeSwapWalletAddress: clearingSwap ? undefined : systemConfig.activeSwapWalletAddress,
+            gasSponsorWalletId: clearingGas ? undefined : systemConfig.gasSponsorWalletId,
+            gasSponsorWalletLabel: clearingGas ? undefined : systemConfig.gasSponsorWalletLabel,
+            gasSponsorWalletAddress: clearingGas ? undefined : systemConfig.gasSponsorWalletAddress,
+            feeCollectorWalletId: clearingFee ? undefined : systemConfig.feeCollectorWalletId,
+            feeCollectorWalletLabel: clearingFee ? undefined : systemConfig.feeCollectorWalletLabel,
+            feeCollectorWalletAddress: clearingFee ? undefined : systemConfig.feeCollectorWalletAddress,
             updatedBy: currentUser.uid,
           },
           currentUser.uid
@@ -673,9 +722,17 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         withdrawalsPaused: systemConfig.withdrawalsPaused,
         hotWalletMaxPct: systemConfig.hotWalletMaxPct,
         swapFeeBps: systemConfig.swapFeeBps,
+        sendFeeBps: systemConfig.sendFeeBps ?? 25,
+        gasSponsorshipEnabled: systemConfig.gasSponsorshipEnabled ?? true,
         activeSwapWalletId: wallet.id,
         activeSwapWalletLabel: `${wallet.tier.toUpperCase()} · ${wallet.label}`,
         activeSwapWalletAddress: primaryAddr,
+        gasSponsorWalletId: systemConfig.gasSponsorWalletId,
+        gasSponsorWalletLabel: systemConfig.gasSponsorWalletLabel,
+        gasSponsorWalletAddress: systemConfig.gasSponsorWalletAddress,
+        feeCollectorWalletId: systemConfig.feeCollectorWalletId,
+        feeCollectorWalletLabel: systemConfig.feeCollectorWalletLabel,
+        feeCollectorWalletAddress: systemConfig.feeCollectorWalletAddress,
         updatedBy: currentUser.uid,
       };
       await saveExchangeSystemConfig(nextCfg, currentUser.uid);
@@ -685,6 +742,169 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       setDataError(err instanceof Error ? err.message : 'Unable to select active swap wallet.');
     } finally {
       setSavingSwapWallet(false);
+    }
+  };
+
+  const handleSetGasSponsorWallet = async (wallet: ExchangeTreasuryWallet | null) => {
+    if (!currentUser) return;
+    setSavingGasFeeConfig(true);
+    setDataError('');
+    try {
+      const primaryAddr = wallet
+        ? wallet.evmAddress ||
+          wallet.solanaAddress ||
+          wallet.bitcoinAddress ||
+          wallet.moneroAddress ||
+          ''
+        : '';
+      await saveExchangeSystemConfig(
+        {
+          maintenanceMode: systemConfig.maintenanceMode,
+          withdrawalsPaused: systemConfig.withdrawalsPaused,
+          hotWalletMaxPct: systemConfig.hotWalletMaxPct,
+          swapFeeBps: systemConfig.swapFeeBps,
+          sendFeeBps: systemConfig.sendFeeBps ?? 25,
+          gasSponsorshipEnabled: systemConfig.gasSponsorshipEnabled ?? true,
+          activeSwapWalletId: systemConfig.activeSwapWalletId,
+          activeSwapWalletLabel: systemConfig.activeSwapWalletLabel,
+          activeSwapWalletAddress: systemConfig.activeSwapWalletAddress,
+          gasSponsorWalletId: wallet ? wallet.id : undefined,
+          gasSponsorWalletLabel: wallet ? `${wallet.tier.toUpperCase()} · ${wallet.label}` : undefined,
+          gasSponsorWalletAddress: wallet ? primaryAddr : undefined,
+          feeCollectorWalletId: systemConfig.feeCollectorWalletId,
+          feeCollectorWalletLabel: systemConfig.feeCollectorWalletLabel,
+          feeCollectorWalletAddress: systemConfig.feeCollectorWalletAddress,
+          updatedBy: currentUser.uid,
+        },
+        currentUser.uid
+      );
+      setConfigSavedNotice(
+        wallet
+          ? `Gas Sponsor Wallet set to ${wallet.tier.toUpperCase()} · ${wallet.label}`
+          : 'Gas Sponsor Wallet cleared'
+      );
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to save Gas Sponsor Wallet.');
+    } finally {
+      setSavingGasFeeConfig(false);
+    }
+  };
+
+  const handleSetFeeCollectorWallet = async (wallet: ExchangeTreasuryWallet | null) => {
+    if (!currentUser) return;
+    setSavingGasFeeConfig(true);
+    setDataError('');
+    try {
+      const primaryAddr = wallet
+        ? wallet.evmAddress ||
+          wallet.solanaAddress ||
+          wallet.bitcoinAddress ||
+          wallet.moneroAddress ||
+          ''
+        : '';
+      await saveExchangeSystemConfig(
+        {
+          maintenanceMode: systemConfig.maintenanceMode,
+          withdrawalsPaused: systemConfig.withdrawalsPaused,
+          hotWalletMaxPct: systemConfig.hotWalletMaxPct,
+          swapFeeBps: systemConfig.swapFeeBps,
+          sendFeeBps: systemConfig.sendFeeBps ?? 25,
+          gasSponsorshipEnabled: systemConfig.gasSponsorshipEnabled ?? true,
+          activeSwapWalletId: systemConfig.activeSwapWalletId,
+          activeSwapWalletLabel: systemConfig.activeSwapWalletLabel,
+          activeSwapWalletAddress: systemConfig.activeSwapWalletAddress,
+          gasSponsorWalletId: systemConfig.gasSponsorWalletId,
+          gasSponsorWalletLabel: systemConfig.gasSponsorWalletLabel,
+          gasSponsorWalletAddress: systemConfig.gasSponsorWalletAddress,
+          feeCollectorWalletId: wallet ? wallet.id : undefined,
+          feeCollectorWalletLabel: wallet ? `${wallet.tier.toUpperCase()} · ${wallet.label}` : undefined,
+          feeCollectorWalletAddress: wallet ? primaryAddr : undefined,
+          updatedBy: currentUser.uid,
+        },
+        currentUser.uid
+      );
+      setConfigSavedNotice(
+        wallet
+          ? `Nominated Fee Wallet set to ${wallet.tier.toUpperCase()} · ${wallet.label}`
+          : 'Nominated Fee Wallet cleared'
+      );
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to save Nominated Fee Wallet.');
+    } finally {
+      setSavingGasFeeConfig(false);
+    }
+  };
+
+  const handleSaveSystemConfig = async () => {
+    if (!currentUser) return;
+    setSavingGasFeeConfig(true);
+    setDataError('');
+    setConfigSavedNotice('');
+    try {
+      await saveExchangeSystemConfig(
+        {
+          maintenanceMode: systemConfig.maintenanceMode,
+          withdrawalsPaused: systemConfig.withdrawalsPaused,
+          hotWalletMaxPct: systemConfig.hotWalletMaxPct,
+          swapFeeBps: systemConfig.swapFeeBps,
+          sendFeeBps: systemConfig.sendFeeBps ?? 25,
+          gasSponsorshipEnabled: systemConfig.gasSponsorshipEnabled ?? true,
+          activeSwapWalletId: systemConfig.activeSwapWalletId,
+          activeSwapWalletLabel: systemConfig.activeSwapWalletLabel,
+          activeSwapWalletAddress: systemConfig.activeSwapWalletAddress,
+          gasSponsorWalletId: systemConfig.gasSponsorWalletId,
+          gasSponsorWalletLabel: systemConfig.gasSponsorWalletLabel,
+          gasSponsorWalletAddress: systemConfig.gasSponsorWalletAddress,
+          feeCollectorWalletId: systemConfig.feeCollectorWalletId,
+          feeCollectorWalletLabel: systemConfig.feeCollectorWalletLabel,
+          feeCollectorWalletAddress: systemConfig.feeCollectorWalletAddress,
+          updatedBy: currentUser.uid,
+        },
+        currentUser.uid
+      );
+      setConfigSavedNotice('Exchange gas, fee & risk configuration saved.');
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to save system configuration.');
+    } finally {
+      setSavingGasFeeConfig(false);
+    }
+  };
+
+  const handleSettleFeeGas = async (item: FeeGasSettlementRecord) => {
+    if (!currentUser) return;
+    setSettlingFeeGasId(item.id);
+    setDataError('');
+    try {
+      const nextLocal = updateFeeGasSettlementInLedger({
+        settlementId: item.id,
+        gasRequestStatus: 'settled',
+        feeStatus: 'collected',
+      });
+      setFeeGasSettlements(nextLocal);
+      await adminSettleFeeGasInCloud({
+        settlement: item,
+        gasRequestStatus: 'settled',
+        feeStatus: 'collected',
+        actorUid: currentUser.uid,
+      });
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to settle gas & fee record.');
+    } finally {
+      setSettlingFeeGasId(null);
+    }
+  };
+
+  const handleSettleAllPendingFeeGas = async () => {
+    if (!currentUser) return;
+    const pending = feeGasSettlements.filter(
+      (f) => f.gasRequestStatus !== 'settled' || f.feeStatus !== 'collected'
+    );
+    for (const item of pending) {
+      await handleSettleFeeGas(item);
     }
   };
 
@@ -828,6 +1048,26 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     }
     return Array.from(map.values()).sort((a, b) => b.pendingCount - a.pendingCount || b.total - a.total);
   }, [claims]);
+
+  const pendingFeeGasCount = useMemo(
+    () => feeGasSettlements.filter((f) => f.gasRequestStatus !== 'settled').length,
+    [feeGasSettlements]
+  );
+
+  const feeGasMetrics = useMemo(() => {
+    let totalGasUsd = 0;
+    let totalFeeUsd = 0;
+    for (const f of feeGasSettlements) {
+      totalGasUsd += Number(f.gasUsdValue || 0);
+      totalFeeUsd += Number(f.platformFeeUsdValue || 0);
+    }
+    return { totalGasUsd, totalFeeUsd };
+  }, [feeGasSettlements]);
+
+  const filteredFeeGasSettlements = useMemo(() => {
+    if (feeGasTypeFilter === 'all') return feeGasSettlements;
+    return feeGasSettlements.filter((f) => f.txType === feeGasTypeFilter);
+  }, [feeGasSettlements, feeGasTypeFilter]);
 
   const filteredClaims = useMemo(() => {
     const q = claimWalletFilter.trim().toLowerCase();
@@ -1251,11 +1491,27 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
               </div>
 
               <div className="pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-3 text-xs">
-                <div>
-                  <span className="text-[#8A94A6]">Active Swap Settlement Wallet: </span>
-                  <span className="font-mono text-emerald-400 font-medium">
-                    {systemConfig.activeSwapWalletLabel || 'Not selected yet'}
-                  </span>
+                <div className="space-y-1">
+                  <div>
+                    <span className="text-[#8A94A6]">Active Swap Settlement Wallet: </span>
+                    <span className="font-mono text-emerald-400 font-medium">
+                      {systemConfig.activeSwapWalletLabel || 'Not selected yet'}
+                    </span>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                    <span>
+                      <span className="text-[#8A94A6]">Gas Sponsor Wallet: </span>
+                      <span className="font-mono text-sky-400 font-medium">
+                        {systemConfig.gasSponsorWalletLabel || 'Not selected yet'}
+                      </span>
+                    </span>
+                    <span>
+                      <span className="text-[#8A94A6]">Nominated Fee Wallet: </span>
+                      <span className="font-mono text-amber-400 font-medium">
+                        {systemConfig.feeCollectorWalletLabel || 'Not selected yet'}
+                      </span>
+                    </span>
+                  </div>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
@@ -1263,7 +1519,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     onClick={() => setTab('claims')}
                     className="px-3.5 py-2 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs font-medium text-[#F4F6F9]"
                   >
-                    Claims & Disbursement ({pendingClaimsCount} Pending)
+                    Claims, Gas & Fees ({pendingClaimsCount + pendingFeeGasCount} Pending)
                   </button>
                 </div>
               </div>
@@ -2167,19 +2423,19 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     <select
                       value={systemConfig.activeSwapWalletId || ''}
                       onChange={(e) => {
-                        const found = exchangeWallets.find((w) => w.id === e.target.value);
+                        const found = activeExchangeWallets.find((w) => w.id === e.target.value);
                         if (found) void handleSetActiveSwapWallet(found);
                       }}
-                      disabled={savingSwapWallet || exchangeWallets.length === 0}
+                      disabled={savingSwapWallet || activeExchangeWallets.length === 0}
                       className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
                     >
                       <option value="">
-                        {exchangeWallets.length === 0
+                        {activeExchangeWallets.length === 0
                           ? 'Create a Cold / Pool / Hot wallet first'
                           : 'Select Active Swap Wallet...'}
                       </option>
-                      {exchangeWallets
-                        .filter((w) => w.status !== 'frozen' && w.status !== 'archived')
+                      {activeExchangeWallets
+                        .filter((w) => w.status !== 'frozen')
                         .map((w) => (
                           <option key={w.id} value={w.id}>
                             {w.tier.toUpperCase()} · {w.label}
@@ -2220,6 +2476,111 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     placeholder="0x... or leave blank for auto ref"
                     className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
                   />
+                </div>
+              </div>
+
+              {/* Gas Sponsor Wallet & Nominated Fee Collector Wallet Controls */}
+              <div className="pt-4 border-t border-white/10 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Fuel className="w-4 h-4 text-sky-400" />
+                    <div>
+                      <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                        Gas Sponsor Wallet & Nominated Fee Collector Setup
+                      </h3>
+                      <p className="text-xs text-[#8A94A6]">
+                        All Send, Receive, Swap, and Sweep transactions automatically calculate gas, request gas from the Gas Sponsor Wallet, and route fees to the Nominated Fee Wallet.
+                      </p>
+                    </div>
+                  </div>
+                  {configSavedNotice && (
+                    <span className="text-xs text-emerald-400 font-medium">{configSavedNotice}</span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                  <div>
+                    <label className="block text-[11px] text-[#8A94A6] mb-1">
+                      Gas Sponsor Wallet (Funds User Gas)
+                    </label>
+                    <select
+                      value={systemConfig.gasSponsorWalletId || ''}
+                      onChange={(e) => {
+                        const found = activeExchangeWallets.find((w) => w.id === e.target.value) || null;
+                        void handleSetGasSponsorWallet(found);
+                      }}
+                      disabled={savingGasFeeConfig}
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    >
+                      <option value="">Select Gas Sponsor Wallet...</option>
+                      {activeExchangeWallets
+                        .filter((w) => w.status !== 'frozen')
+                        .map((w) => (
+                          <option key={w.id} value={w.id}>
+                            {w.tier.toUpperCase()} · {w.label}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-[#8A94A6] mb-1">
+                      Nominated Fee Collector Wallet
+                    </label>
+                    <select
+                      value={systemConfig.feeCollectorWalletId || ''}
+                      onChange={(e) => {
+                        const found = activeExchangeWallets.find((w) => w.id === e.target.value) || null;
+                        void handleSetFeeCollectorWallet(found);
+                      }}
+                      disabled={savingGasFeeConfig}
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    >
+                      <option value="">Select Nominated Fee Wallet...</option>
+                      {activeExchangeWallets
+                        .filter((w) => w.status !== 'frozen')
+                        .map((w) => (
+                          <option key={w.id} value={w.id}>
+                            {w.tier.toUpperCase()} · {w.label}
+                          </option>
+                        ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-[#8A94A6] mb-1">
+                      Send / Withdrawal Fee (BPS)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        max={500}
+                        value={systemConfig.sendFeeBps ?? 25}
+                        onChange={(e) =>
+                          setSystemConfig((prev) => ({
+                            ...prev,
+                            sendFeeBps: Math.max(0, Math.min(500, Number(e.target.value))),
+                          }))
+                        }
+                        className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                      />
+                      <span className="text-[11px] font-mono text-[#8A94A6] shrink-0">
+                        {(((systemConfig.sendFeeBps ?? 25) / 100)).toFixed(2)}%
+                      </span>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col justify-end">
+                    <button
+                      type="button"
+                      disabled={savingGasFeeConfig}
+                      onClick={handleSaveSystemConfig}
+                      className="w-full py-2 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                    >
+                      {savingGasFeeConfig ? 'Saving...' : 'Save Fee & Gas Rules'}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2432,6 +2793,139 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                           {claim.status === 'disbursed' && (
                             <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400">
                               Disbursed
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Gas Sponsor Requests & Nominated Fee Collector Ledger */}
+            <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+              <div className="px-5 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Fuel className="w-4 h-4 text-sky-400" />
+                    <h3 className="text-sm font-semibold text-[#F4F6F9]">
+                      Gas Sponsor Requests & Nominated Fee Settlements ({feeGasSettlements.length})
+                    </h3>
+                  </div>
+                  <p className="text-xs text-[#8A94A6] mt-0.5 tabular-nums">
+                    Total Gas Sponsored/Requested: {formatFiat(feeGasMetrics.totalGasUsd, 'USD')} · Total Platform Fees to Nominated Wallet:{' '}
+                    <span className="text-emerald-400 font-semibold">
+                      {formatFiat(feeGasMetrics.totalFeeUsd, 'USD')}
+                    </span>
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <select
+                    value={feeGasTypeFilter}
+                    onChange={(e) => setFeeGasTypeFilter(e.target.value as 'all' | FeeGasTxType)}
+                    className="bg-[#090B0F] border border-white/10 rounded-lg px-3 py-1.5 text-xs text-[#F4F6F9]"
+                  >
+                    <option value="all">All Transactions</option>
+                    <option value="send">Send / Withdrawals</option>
+                    <option value="receive">Receive / Consolidation</option>
+                    <option value="swap">Swaps</option>
+                    <option value="sweep">Sweeps</option>
+                  </select>
+
+                  {pendingFeeGasCount > 0 && (
+                    <button
+                      type="button"
+                      disabled={Boolean(settlingFeeGasId)}
+                      onClick={handleSettleAllPendingFeeGas}
+                      className="px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                    >
+                      Settle All Pending ({pendingFeeGasCount})
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {filteredFeeGasSettlements.length === 0 ? (
+                <div className="p-8 text-center text-xs text-[#8A94A6]">
+                  No Send, Receive, Swap, or Sweep gas/fee settlements recorded yet.
+                </div>
+              ) : (
+                <div className="divide-y divide-white/[0.06]">
+                  {filteredFeeGasSettlements.map((item) => {
+                    const net = NETWORK_MAP[item.networkId];
+                    const busy = settlingFeeGasId === item.id;
+                    return (
+                      <div
+                        key={item.id}
+                        className="px-5 py-3.5 flex flex-wrap items-center justify-between gap-4 text-xs"
+                      >
+                        <div className="space-y-1 min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                            <span className="font-mono uppercase font-semibold text-sky-400">
+                              {item.txType}
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span className="font-semibold text-[#F4F6F9] tabular-nums">
+                              {item.txAmount} {item.symbol}
+                            </span>
+                            <span className="font-mono text-[#8A94A6] tabular-nums">
+                              ({formatFiat(item.txUsdValue, 'USD')})
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span className="text-[#CBD5E1]">{net?.name || item.networkId}</span>
+                            <span className="text-[#64748B]">·</span>
+                            <span
+                              className={
+                                item.gasRequestStatus === 'settled'
+                                  ? 'text-emerald-400 font-semibold'
+                                  : item.gasRequestStatus === 'sponsored'
+                                  ? 'text-sky-400 font-semibold'
+                                  : 'text-amber-400 font-semibold'
+                              }
+                            >
+                              Gas: {item.gasRequestStatus}
+                            </span>
+                            <span className="text-[#64748B]">·</span>
+                            <span
+                              className={
+                                item.feeStatus === 'collected'
+                                  ? 'text-emerald-400 font-semibold'
+                                  : 'text-amber-400 font-semibold'
+                              }
+                            >
+                              Fee: {item.feeStatus}
+                            </span>
+                          </div>
+
+                          <div className="font-mono text-[11px] text-[#CBD5E1] tabular-nums">
+                            Gas Requested: {item.gasAmountNative} {item.gasSymbol} ({formatFiat(item.gasUsdValue, 'USD')})
+                            {item.gasSponsorWalletLabel ? ` from ${item.gasSponsorWalletLabel}` : ''} · Platform Fee:{' '}
+                            {item.platformFeeAmount} {item.platformFeeSymbol} ({formatFiat(item.platformFeeUsdValue, 'USD')})
+                            {item.feeCollectorWalletLabel ? ` → ${item.feeCollectorWalletLabel}` : ''}
+                          </div>
+
+                          <div className="font-mono text-[11px] text-[#64748B] truncate">
+                            From: {shortenAddress(item.sourceWalletAddress, 8, 6)} → To:{' '}
+                            {shortenAddress(item.recipientAddress, 8, 6)} · Ref:{' '}
+                            {shortenAddress(item.txHash, 8, 6)} · {formatRelativeTime(item.updatedAt)}
+                          </div>
+                        </div>
+
+                        <div className="shrink-0">
+                          {item.gasRequestStatus !== 'settled' || item.feeStatus !== 'collected' ? (
+                            <button
+                              type="button"
+                              disabled={busy}
+                              onClick={() => handleSettleFeeGas(item)}
+                              className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                            >
+                              {busy ? 'Settling...' : 'Settle Gas & Fee'}
+                            </button>
+                          ) : (
+                            <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400">
+                              Settled
                             </span>
                           )}
                         </div>
@@ -3041,7 +3535,29 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 />
               </label>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <label className="flex items-center justify-between p-4 rounded-lg bg-[#090B0F] border border-white/10 cursor-pointer">
+                <div>
+                  <div className="text-sm font-medium text-[#F4F6F9]">
+                    Automatic Exchange Gas Sponsorship
+                  </div>
+                  <div className="text-xs text-[#8A94A6]">
+                    Automatically calculates network gas for Send, Receive, Swap, and Sweep transactions and requests gas from the selected Gas Sponsor Wallet
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={systemConfig.gasSponsorshipEnabled ?? true}
+                  onChange={(e) =>
+                    setSystemConfig((prev) => ({
+                      ...prev,
+                      gasSponsorshipEnabled: e.target.checked,
+                    }))
+                  }
+                  className="rounded border-white/20 bg-[#11151C] text-emerald-500"
+                />
+              </label>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-xs text-[#8A94A6] mb-1">
                     Hot Wallet Max Reserve Ratio (%)
@@ -3057,7 +3573,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                         hotWalletMaxPct: Number(e.target.value),
                       }))
                     }
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-sm text-[#F4F6F9]"
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
                   />
                 </div>
                 <div>
@@ -3075,31 +3591,116 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                         swapFeeBps: Number(e.target.value),
                       }))
                     }
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-sm text-[#F4F6F9]"
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Send / Withdrawal Fee (BPS)
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={500}
+                    value={systemConfig.sendFeeBps ?? 25}
+                    onChange={(e) =>
+                      setSystemConfig((prev) => ({
+                        ...prev,
+                        sendFeeBps: Number(e.target.value),
+                      }))
+                    }
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-sm text-[#F4F6F9]"
                   />
                 </div>
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Gas Sponsor Wallet (Covers User Gas)
+                  </label>
+                  <select
+                    value={systemConfig.gasSponsorWalletId || ''}
+                    onChange={(e) => {
+                      const found = activeExchangeWallets.find((w) => w.id === e.target.value);
+                      const addr = found
+                        ? found.evmAddress ||
+                          found.solanaAddress ||
+                          found.bitcoinAddress ||
+                          found.moneroAddress ||
+                          ''
+                        : undefined;
+                      setSystemConfig((prev) => ({
+                        ...prev,
+                        gasSponsorWalletId: found?.id,
+                        gasSponsorWalletLabel: found
+                          ? `${found.tier.toUpperCase()} · ${found.label}`
+                          : undefined,
+                        gasSponsorWalletAddress: addr,
+                      }));
+                    }}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    <option value="">Select Gas Sponsor Wallet...</option>
+                    {activeExchangeWallets
+                      .filter((w) => w.status !== 'frozen')
+                      .map((w) => (
+                        <option key={w.id} value={w.id}>
+                          {w.tier.toUpperCase()} · {w.label}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Nominated Fee Collector Wallet (Receives Fees)
+                  </label>
+                  <select
+                    value={systemConfig.feeCollectorWalletId || ''}
+                    onChange={(e) => {
+                      const found = activeExchangeWallets.find((w) => w.id === e.target.value);
+                      const addr = found
+                        ? found.evmAddress ||
+                          found.solanaAddress ||
+                          found.bitcoinAddress ||
+                          found.moneroAddress ||
+                          ''
+                        : undefined;
+                      setSystemConfig((prev) => ({
+                        ...prev,
+                        feeCollectorWalletId: found?.id,
+                        feeCollectorWalletLabel: found
+                          ? `${found.tier.toUpperCase()} · ${found.label}`
+                          : undefined,
+                        feeCollectorWalletAddress: addr,
+                      }));
+                    }}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    <option value="">Select Nominated Fee Wallet...</option>
+                    {activeExchangeWallets
+                      .filter((w) => w.status !== 'frozen')
+                      .map((w) => (
+                        <option key={w.id} value={w.id}>
+                          {w.tier.toUpperCase()} · {w.label}
+                        </option>
+                      ))}
+                  </select>
+                </div>
+              </div>
+
+              {configSavedNotice && (
+                <div className="text-xs text-emerald-400 font-medium">{configSavedNotice}</div>
+              )}
+
               <button
                 type="button"
-                onClick={() =>
-                  saveExchangeSystemConfig(
-                    {
-                      maintenanceMode: systemConfig.maintenanceMode,
-                      withdrawalsPaused: systemConfig.withdrawalsPaused,
-                      hotWalletMaxPct: systemConfig.hotWalletMaxPct,
-                      swapFeeBps: systemConfig.swapFeeBps,
-                      activeSwapWalletId: systemConfig.activeSwapWalletId,
-                      activeSwapWalletLabel: systemConfig.activeSwapWalletLabel,
-                      activeSwapWalletAddress: systemConfig.activeSwapWalletAddress,
-                      updatedBy: currentUser.uid,
-                    },
-                    currentUser.uid
-                  ).then(loadDashboardData)
-                }
-                className="px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs"
+                disabled={savingGasFeeConfig}
+                onClick={handleSaveSystemConfig}
+                className="px-5 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
               >
-                Save Exchange Configuration
+                {savingGasFeeConfig ? 'Saving...' : 'Save Exchange Configuration'}
               </button>
             </div>
           </div>

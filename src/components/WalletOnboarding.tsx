@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ClipboardEvent } from 'react';
+import { useEffect, useMemo, useRef, useState, type ClipboardEvent } from 'react';
 import {
   Check,
   ChevronRight,
@@ -47,10 +47,11 @@ import type {
   WalletPresetId,
 } from '../types/wallet';
 
-type OnboardingTab = 'create' | 'import-seed' | 'import-key' | 'watch';
+export type OnboardingTab = 'create' | 'import-seed' | 'import-key' | 'watch';
 
 interface WalletOnboardingProps {
   mode: 'fullPage' | 'modal';
+  initialTab?: OnboardingTab;
   existingPassword?: string;
   walletCatalog?: WalletCatalogEntry[];
   markets?: MarketCoin[];
@@ -69,6 +70,7 @@ interface WalletOnboardingProps {
 
 export function WalletOnboarding({
   mode,
+  initialTab = 'create',
   existingPassword,
   walletCatalog,
   markets,
@@ -77,7 +79,12 @@ export function WalletOnboarding({
   onCompleteBatch,
   onClose,
 }: WalletOnboardingProps) {
-  const [tab, setTab] = useState<OnboardingTab>('create');
+  const [tab, setTab] = useState<OnboardingTab>(initialTab);
+
+  useEffect(() => {
+    setTab(initialTab);
+    setError('');
+  }, [initialTab]);
 
   // Create Wallet State
   const [createWordCount, setCreateWordCount] = useState<12 | 18 | 24>(12);
@@ -94,7 +101,9 @@ export function WalletOnboarding({
   const [importPreset, setImportPreset] = useState<WalletPresetId>('metamask');
   const [importWordCount, setImportWordCount] = useState<12 | 18 | 24>(12);
   const [importWords, setImportWords] = useState<string[]>(() => Array(24).fill(''));
+  const [quickPhraseInput, setQuickPhraseInput] = useState('');
   const [focusedWordIndex, setFocusedWordIndex] = useState<number | null>(null);
+  const wordInputRefs = useRef<Array<HTMLInputElement | null>>([]);
   const [importWalletName, setImportWalletName] = useState('Imported Wallet');
   const [passphrase, setPassphrase] = useState('');
   const [accountIndex, setAccountIndex] = useState(0);
@@ -113,15 +122,12 @@ export function WalletOnboarding({
 
   // Vault Password State
   const vaultHasPassword = hasVaultPassword();
-  const [setNewPasswordOnImport, setSetNewPasswordOnImport] = useState<boolean>(
-    () => !vaultHasPassword || (mode === 'fullPage' && !existingPassword)
+  const hasActiveSessionPassword = Boolean(existingPassword && existingPassword.length >= 6);
+  const needsNewPassword = !vaultHasPassword || (mode === 'fullPage' && !hasActiveSessionPassword);
+  const [password, setPassword] = useState(hasActiveSessionPassword ? existingPassword || '' : '');
+  const [confirmPassword, setConfirmPassword] = useState(
+    hasActiveSessionPassword ? existingPassword || '' : ''
   );
-  const needsNewPassword =
-    !vaultHasPassword ||
-    (mode === 'fullPage' && !existingPassword) ||
-    (tab === 'import-seed' && setNewPasswordOnImport);
-  const [password, setPassword] = useState(existingPassword || '');
-  const [confirmPassword, setConfirmPassword] = useState(existingPassword || '');
   const [error, setError] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
@@ -169,15 +175,18 @@ export function WalletOnboarding({
   };
 
   const handleWordChange = (idx: number, val: string) => {
-    // Handle multi-word paste into input
-    const cleaned = val.trim().toLowerCase().split(/\s+/).filter(Boolean);
+    // Handle multi-word paste into individual word box (including numbered lists like "1. word")
+    const normalized = normalizePhrase(val);
+    const cleaned = normalized.split(/\s+/).filter(Boolean);
     if (cleaned.length > 1) {
       applyBulkPhrase(cleaned);
       return;
     }
+    const cleanSingle = (cleaned[0] || '').toLowerCase().replace(/[^a-z]/g, '');
     setImportWords((prev) => {
       const next = [...prev];
-      next[idx] = val.toLowerCase().replace(/[^a-z]/g, '');
+      next[idx] = cleanSingle;
+      setQuickPhraseInput(next.slice(0, importWordCount).filter(Boolean).join(' '));
       return next;
     });
   };
@@ -197,7 +206,35 @@ export function WalletOnboarding({
       }
       return next;
     });
+    setQuickPhraseInput(clean.slice(0, 24).join(' '));
     setFocusedWordIndex(null);
+  };
+
+  const handleQuickPhraseChange = (rawText: string) => {
+    setQuickPhraseInput(rawText);
+    const tokens = normalizePhrase(rawText)
+      .split(' ')
+      .map((w) => w.replace(/[^a-z]/g, ''))
+      .filter(Boolean);
+
+    if (tokens.length === 0) {
+      setImportWords(Array(24).fill(''));
+      return;
+    }
+
+    let targetCount: 12 | 18 | 24 = importWordCount;
+    if (tokens.length > 18) targetCount = 24;
+    else if (tokens.length > 12) targetCount = 18;
+    else if (tokens.length >= 2) targetCount = 12;
+
+    setImportWordCount(targetCount);
+    setImportWords(() => {
+      const next = Array(24).fill('');
+      for (let i = 0; i < Math.min(tokens.length, 24); i++) {
+        next[i] = tokens[i];
+      }
+      return next;
+    });
   };
 
   const handleWordPaste = (e: ClipboardEvent<HTMLInputElement>, idx: number) => {
@@ -308,13 +345,17 @@ export function WalletOnboarding({
   }, [focusedWordIndex, importWords]);
 
   const validateAndPreparePassword = async (): Promise<string | null> => {
-    const creatingPassword = needsNewPassword;
-    const activePw = creatingPassword ? password : existingPassword || password;
+    const activePw = needsNewPassword
+      ? password
+      : hasActiveSessionPassword
+      ? (existingPassword as string)
+      : password;
+
     if (!activePw || activePw.length < 6) {
       setError('Vault password must be at least 6 characters.');
       return null;
     }
-    if (creatingPassword) {
+    if (needsNewPassword) {
       if (password !== confirmPassword) {
         setError('Passwords do not match.');
         return null;
@@ -323,7 +364,7 @@ export function WalletOnboarding({
     } else {
       const ok = await verifyVaultPassword(activePw);
       if (!ok) {
-        setError('Vault password is incorrect.');
+        setError('Existing Vault password did not match.');
         return null;
       }
     }
@@ -864,12 +905,37 @@ export function WalletOnboarding({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setImportWords(Array(24).fill(''))}
+                    onClick={() => {
+                      setImportWords(Array(24).fill(''));
+                      setQuickPhraseInput('');
+                    }}
                     className="px-3 py-2 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9] whitespace-nowrap"
                   >
                     Clear
                   </button>
                 </div>
+              </div>
+
+              {/* Quick Full-Phrase Paste Input */}
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <label className="text-[#CBD5E1] font-medium">
+                    Paste Entire Recovery Phrase (12, 18, or 24 words)
+                  </label>
+                  <span className="text-[11px] text-[#64748B]">
+                    Auto-fills boxes below (supports numbered phrases)
+                  </span>
+                </div>
+                <textarea
+                  rows={2}
+                  value={quickPhraseInput}
+                  onChange={(e) => handleQuickPhraseChange(e.target.value)}
+                  placeholder="Paste your 12, 18, or 24-word phrase separated by spaces or line breaks..."
+                  spellCheck={false}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3.5 py-2.5 font-mono text-base sm:text-xs text-[#F4F6F9] placeholder-[#525D70] focus:outline-none focus:border-emerald-500/60"
+                />
               </div>
 
               {/* Word Grid with Smart Paste & BIP-39 Autocomplete */}
@@ -895,16 +961,29 @@ export function WalletOnboarding({
                           {String(idx + 1).padStart(2, '0')}
                         </span>
                         <input
+                          ref={(el) => {
+                            wordInputRefs.current[idx] = el;
+                          }}
                           type="text"
                           value={word}
                           onFocus={() => setFocusedWordIndex(idx)}
                           onBlur={() => setTimeout(() => setFocusedWordIndex(null), 150)}
                           onChange={(e) => handleWordChange(idx, e.target.value)}
+                          onKeyDown={(e) => {
+                            if ((e.key === ' ' || e.key === 'Enter') && idx + 1 < importWordCount) {
+                              e.preventDefault();
+                              wordInputRefs.current[idx + 1]?.focus();
+                            } else if (e.key === 'Backspace' && !word && idx > 0) {
+                              wordInputRefs.current[idx - 1]?.focus();
+                            }
+                          }}
                           onPaste={(e) => handleWordPaste(e, idx)}
                           placeholder="word"
                           autoComplete="off"
+                          autoCapitalize="none"
+                          autoCorrect="off"
                           spellCheck={false}
-                          className="w-full bg-transparent font-mono text-xs text-[#F4F6F9] placeholder-[#3B4454] focus:outline-none"
+                          className="w-full bg-transparent font-mono text-base sm:text-xs text-[#F4F6F9] placeholder-[#3B4454] focus:outline-none"
                         />
                       </div>
                     );
@@ -921,8 +1000,13 @@ export function WalletOnboarding({
                         type="button"
                         onMouseDown={(e) => {
                           e.preventDefault();
-                          handleWordChange(focusedWordIndex, suggestion);
-                          setFocusedWordIndex(null);
+                          const currIdx = focusedWordIndex;
+                          handleWordChange(currIdx, suggestion);
+                          if (currIdx + 1 < importWordCount) {
+                            setTimeout(() => wordInputRefs.current[currIdx + 1]?.focus(), 10);
+                          } else {
+                            setFocusedWordIndex(null);
+                          }
                         }}
                         className="px-2.5 py-1 rounded bg-[#1A2130] hover:bg-emerald-500 hover:text-[#090B0F] font-mono text-xs text-[#F4F6F9] transition-colors"
                       >
@@ -1211,28 +1295,6 @@ export function WalletOnboarding({
 
           {/* Vault Password Section */}
           <div className="pt-4 border-t border-white/10 space-y-3">
-            {tab === 'import-seed' && existingPassword && (
-              <label className="flex items-center gap-2 text-xs text-[#CBD5E1] cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={setNewPasswordOnImport}
-                  onChange={(e) => {
-                    const checked = e.target.checked;
-                    setSetNewPasswordOnImport(checked);
-                    if (checked) {
-                      setPassword('');
-                      setConfirmPassword('');
-                    } else {
-                      setPassword(existingPassword);
-                      setConfirmPassword(existingPassword);
-                    }
-                  }}
-                  className="rounded border-white/20 bg-[#090B0F] text-emerald-500 focus:ring-emerald-500"
-                />
-                <span>Create a new Vault Password for this seed import</span>
-              </label>
-            )}
-
             {needsNewPassword ? (
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
@@ -1244,7 +1306,7 @@ export function WalletOnboarding({
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     placeholder="Encrypts seeds in browser"
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
                   />
                 </div>
                 <div>
@@ -1256,24 +1318,29 @@ export function WalletOnboarding({
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     placeholder="Repeat password"
-                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
                   />
                 </div>
               </div>
-            ) : !existingPassword ? (
+            ) : !hasActiveSessionPassword ? (
               <div>
                 <label className="block text-xs text-[#8A94A6] mb-1">
-                  Vault Password (to encrypt new wallet)
+                  Vault Password (to encrypt wallet)
                 </label>
                 <input
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   placeholder="Enter your existing vault password"
-                  className="w-full max-w-sm bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+                  className="w-full max-w-sm bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-sm text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
                 />
               </div>
-            ) : null}
+            ) : (
+              <div className="text-xs text-emerald-400/90 flex items-center gap-1.5">
+                <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                <span>Encrypts automatically using your active Vault Password</span>
+              </div>
+            )}
 
             {error && (
               <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 rounded-lg px-3 py-2">

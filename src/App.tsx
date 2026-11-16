@@ -20,6 +20,7 @@ import {
 import { auth } from './lib/firebase';
 import {
   checkUserIsAdmin,
+  createFeeGasSettlementInCloud,
   deleteUserAlertFromCloud,
   deleteUserConnectedSessionFromCloud,
   deleteUserWalletFromCloud,
@@ -33,6 +34,7 @@ import {
   saveUserAlertToCloud,
   saveUserConnectedSessionToCloud,
   saveUserWalletToCloud,
+  setUserWalletArchiveStatusInCloud,
   syncUserProfile,
   upsertClaimRequestInCloud,
 } from './lib/firestoreService';
@@ -56,6 +58,7 @@ import {
   loadSettings,
   loadWalletAuthSession,
   loadWallets,
+  recordFeeGasSettlement,
   requestClaimInLedger,
   saveActiveWalletId,
   saveAddressBook,
@@ -85,7 +88,7 @@ import {
 import { LandingPage } from './components/LandingPage';
 import { AuthPortal } from './components/AuthPortal';
 import { KingAdminView } from './components/KingAdminView';
-import { WalletOnboarding } from './components/WalletOnboarding';
+import { WalletOnboarding, type OnboardingTab } from './components/WalletOnboarding';
 import { VaultLockScreen } from './components/VaultLockScreen';
 import { PortfolioView } from './components/PortfolioView';
 import { TransferView } from './components/TransferView';
@@ -100,6 +103,7 @@ import type {
   ClaimRequestRecord,
   ConnectedExternalWallet,
   ExchangeSystemConfig,
+  FeeGasSettlementRecord,
   MarketCoin,
   NetworkId,
   PortfolioHolding,
@@ -257,9 +261,17 @@ export default function App() {
       withdrawalsPaused: false,
       hotWalletMaxPct: 10,
       swapFeeBps: cached.swapFeeBps ?? 10,
+      sendFeeBps: cached.sendFeeBps ?? 25,
+      gasSponsorshipEnabled: cached.gasSponsorshipEnabled ?? true,
       activeSwapWalletId: cached.activeSwapWalletId,
       activeSwapWalletLabel: cached.activeSwapWalletLabel,
       activeSwapWalletAddress: cached.activeSwapWalletAddress,
+      gasSponsorWalletId: cached.gasSponsorWalletId,
+      gasSponsorWalletLabel: cached.gasSponsorWalletLabel,
+      gasSponsorWalletAddress: cached.gasSponsorWalletAddress,
+      feeCollectorWalletId: cached.feeCollectorWalletId,
+      feeCollectorWalletLabel: cached.feeCollectorWalletLabel,
+      feeCollectorWalletAddress: cached.feeCollectorWalletAddress,
       updatedBy: 'cached',
       updatedAt: Date.now(),
     };
@@ -326,9 +338,15 @@ export default function App() {
   const [swapInitialSymbol, setSwapInitialSymbol] = useState<string | undefined>(undefined);
   const [alertInitialCoinId, setAlertInitialCoinId] = useState<string | undefined>(undefined);
   const [showAddWalletModal, setShowAddWalletModal] = useState(false);
+  const [addWalletInitialTab, setAddWalletInitialTab] = useState<OnboardingTab>('create');
   const [walletSwitcherOpen, setWalletSwitcherOpen] = useState(false);
   const walletSwitcherRef = useRef<HTMLDivElement | null>(null);
   const [justCreatedWalletId, setJustCreatedWalletId] = useState<string | null>(null);
+
+  const openAddWalletModal = useCallback((initialTab: OnboardingTab = 'create') => {
+    setAddWalletInitialTab(initialTab);
+    setShowAddWalletModal(true);
+  }, []);
   const [connectedExternals, setConnectedExternals] = useState<ConnectedExternalWallet[]>(() =>
     loadConnectedExternals()
   );
@@ -530,10 +548,27 @@ export default function App() {
     return null;
   }, [authUser, walletAuthSession]);
 
+  const activeWallets = useMemo(() => wallets.filter((w) => !w.archived), [wallets]);
+
   const activeWallet = useMemo(
-    () => wallets.find((w) => w.id === activeWalletId) || wallets[0] || null,
-    [wallets, activeWalletId]
+    () =>
+      activeWallets.find((w) => w.id === activeWalletId) ||
+      activeWallets[0] ||
+      wallets[0] ||
+      null,
+    [activeWallets, wallets, activeWalletId]
   );
+
+  useEffect(() => {
+    if (
+      activeWallets.length > 0 &&
+      activeWalletId &&
+      !activeWallets.some((w) => w.id === activeWalletId)
+    ) {
+      setActiveWalletId(activeWallets[0].id);
+      saveActiveWalletId(activeWallets[0].id);
+    }
+  }, [activeWallets, activeWalletId]);
 
   const pushToast = useCallback((title: string, message: string) => {
     const id = crypto.randomUUID();
@@ -1145,12 +1180,55 @@ export default function App() {
     pushToast('HD Account Derived', `${subWallet.name} ready across all networks`);
   };
 
+  const handleArchiveWallet = async (id: string) => {
+    const remainingActive = wallets.filter((w) => !w.archived && w.id !== id);
+    if (remainingActive.length === 0) {
+      pushToast('Cannot Archive', 'Keep at least one active wallet in your Obsidian Vault.');
+      return;
+    }
+    const target = wallets.find((w) => w.id === id);
+    const next = wallets.map((w) =>
+      w.id === id ? { ...w, archived: true, archivedAt: Date.now() } : w
+    );
+    setWallets(next);
+    saveWallets(next);
+    if (activeWalletId === id) {
+      const nextActive = remainingActive[0]?.id ?? null;
+      setActiveWalletId(nextActive);
+      saveActiveWalletId(nextActive);
+    }
+    if (authUser && authUser.emailVerified) {
+      await setUserWalletArchiveStatusInCloud(authUser.uid, id, true).catch(() => {});
+    }
+    if (target) {
+      pushToast('Wallet Archived', `${target.name} moved to Archived Wallets. Restore anytime.`);
+    }
+  };
+
+  const handleRestoreWallet = async (id: string) => {
+    const target = wallets.find((w) => w.id === id);
+    const next = wallets.map((w) =>
+      w.id === id ? { ...w, archived: false, archivedAt: undefined } : w
+    );
+    setWallets(next);
+    saveWallets(next);
+    setActiveWalletId(id);
+    saveActiveWalletId(id);
+    if (authUser && authUser.emailVerified) {
+      await setUserWalletArchiveStatusInCloud(authUser.uid, id, false).catch(() => {});
+    }
+    if (target) {
+      pushToast('Wallet Restored', `${target.name} restored to active wallets.`);
+    }
+  };
+
   const handleDeleteWallet = async (id: string) => {
     const next = wallets.filter((w) => w.id !== id);
     setWallets(next);
     saveWallets(next);
+    const nextActivePool = next.filter((w) => !w.archived);
     if (activeWalletId === id) {
-      const nextActive = next[0]?.id ?? null;
+      const nextActive = nextActivePool[0]?.id ?? next[0]?.id ?? null;
       setActiveWalletId(nextActive);
       saveActiveWalletId(nextActive);
     }
@@ -1306,6 +1384,40 @@ export default function App() {
       }
     },
     [authUser]
+  );
+
+  const handleRecordFeeGasSettlement = useCallback(
+    async (
+      partial: Omit<FeeGasSettlementRecord, 'id' | 'ownerUid' | 'createdAt' | 'updatedAt'>
+    ) => {
+      const now = Date.now();
+      const safeHashPart = (partial.txHash || '')
+        .replace(/[^a-zA-Z0-9_-]/g, '')
+        .slice(0, 24);
+      const id = `fgs_${partial.txType}_${safeHashPart || now}_${Math.random()
+        .toString(36)
+        .slice(2, 6)}`;
+      const fullRecord: FeeGasSettlementRecord = {
+        ...partial,
+        id,
+        ownerUid: authUser?.uid,
+        createdAt: now,
+        updatedAt: now,
+      };
+      recordFeeGasSettlement(fullRecord);
+      if (authUser && authUser.emailVerified) {
+        await createFeeGasSettlementInCloud(fullRecord, authUser.uid).catch(() => {});
+      }
+      if (partial.txType === 'receive') {
+        pushToast(
+          'Consolidation Gas Requested',
+          `${partial.gasAmountNative} ${partial.gasSymbol} requested from ${
+            partial.gasSponsorWalletLabel || 'Gas Sponsor Wallet'
+          }`
+        );
+      }
+    },
+    [authUser, pushToast]
   );
 
   const handleRequestClaim = useCallback(
@@ -1510,10 +1622,12 @@ export default function App() {
               connectedExternals={connectedExternals}
               walletCatalog={walletCatalog}
               claims={claims}
+              exchangeConfig={exchangeConfig}
               onConnectAccounts={handleConnectAccounts}
               onToggleConnectionSweep={handleToggleConnectionSweep}
               onDisconnectOne={handleDisconnectOne}
               onDisconnectAll={handleDisconnectAll}
+              onRecordFeeGasSettlement={handleRecordFeeGasSettlement}
               onRequestClaim={handleRequestClaim}
               onRequestAllClaims={handleRequestAllClaims}
               onOpenFullVaultAuth={() => {
@@ -1697,7 +1811,7 @@ export default function App() {
               }}
               className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-xs font-medium text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
             >
-              {wallets.map((w) => (
+              {(activeWallets.length > 0 ? activeWallets : wallets).map((w) => (
                 <option key={w.id} value={w.id}>
                   {w.name}
                 </option>
@@ -1782,14 +1896,24 @@ export default function App() {
             </span>
           </div>
 
-          <button
-            type="button"
-            onClick={() => setShowAddWalletModal(true)}
-            className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg bg-[#11151C] border border-white/10 hover:border-emerald-500/40 text-xs font-medium text-[#CBD5E1] hover:text-[#F4F6F9] transition-colors whitespace-nowrap"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span>Add / Import Wallet</span>
-          </button>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => openAddWalletModal('import-seed')}
+              className="flex items-center justify-center gap-1 py-2 px-2.5 rounded-lg bg-[#11151C] border border-emerald-500/30 hover:border-emerald-500/60 text-xs font-medium text-emerald-400 transition-colors whitespace-nowrap"
+            >
+              <KeyRound className="w-3.5 h-3.5 shrink-0" />
+              <span>Import</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => openAddWalletModal('create')}
+              className="flex items-center justify-center gap-1 py-2 px-2.5 rounded-lg bg-[#11151C] border border-white/10 hover:border-white/30 text-xs font-medium text-[#CBD5E1] hover:text-[#F4F6F9] transition-colors whitespace-nowrap"
+            >
+              <Plus className="w-3.5 h-3.5 shrink-0" />
+              <span>Create</span>
+            </button>
+          </div>
 
           {isAdminUser && (
             <button
@@ -1918,9 +2042,9 @@ export default function App() {
                     4
                   )}
                 </span>
-                {wallets.length > 1 && (
+                {activeWallets.length > 1 && (
                   <span className="font-mono text-[10px] text-emerald-400">
-                    ({wallets.length})
+                    ({activeWallets.length})
                   </span>
                 )}
                 <ChevronDown className="w-3.5 h-3.5 text-[#8A94A6] shrink-0" />
@@ -1930,10 +2054,15 @@ export default function App() {
                 <div className="absolute right-0 mt-2 w-72 max-w-[calc(100vw-2rem)] bg-[#11151C] border border-white/15 rounded-xl shadow-2xl z-50 overflow-hidden">
                   <div className="px-3.5 py-2.5 border-b border-white/10 flex items-center justify-between text-[11px] text-[#8A94A6]">
                     <span>Switch Active Wallet</span>
-                    <span className="font-mono">{wallets.length} vaults</span>
+                    <span className="font-mono">
+                      {activeWallets.length} active
+                      {wallets.length > activeWallets.length
+                        ? ` · ${wallets.length - activeWallets.length} archived`
+                        : ''}
+                    </span>
                   </div>
                   <div className="max-h-64 overflow-y-auto divide-y divide-white/[0.06]">
-                    {wallets.map((w) => {
+                    {(activeWallets.length > 0 ? activeWallets : wallets).map((w) => {
                       const isCurrent = w.id === activeWallet.id;
                       const primaryAddr =
                         w.addresses.evmAddress ||
@@ -1972,17 +2101,28 @@ export default function App() {
                       );
                     })}
                   </div>
-                  <div className="p-2 border-t border-white/10 bg-[#0D1017]">
+                  <div className="p-2 border-t border-white/10 bg-[#0D1017] grid grid-cols-2 gap-2">
                     <button
                       type="button"
                       onClick={() => {
                         setWalletSwitcherOpen(false);
-                        setShowAddWalletModal(true);
+                        openAddWalletModal('import-seed');
                       }}
-                      className="w-full flex items-center justify-center gap-1.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] text-xs font-semibold transition-colors"
+                      className="flex items-center justify-center gap-1 py-2 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-emerald-500/30 text-emerald-400 text-xs font-semibold transition-colors"
+                    >
+                      <KeyRound className="w-3.5 h-3.5" />
+                      <span>Import Phrase</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setWalletSwitcherOpen(false);
+                        openAddWalletModal('create');
+                      }}
+                      className="flex items-center justify-center gap-1 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] text-xs font-semibold transition-colors"
                     >
                       <Plus className="w-3.5 h-3.5" />
-                      <span>Create / Import Wallets</span>
+                      <span>Create New</span>
                     </button>
                   </div>
                 </div>
@@ -1991,10 +2131,19 @@ export default function App() {
 
             <button
               type="button"
-              onClick={() => setShowAddWalletModal(true)}
+              onClick={() => openAddWalletModal('import-seed')}
+              className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#11151C] hover:bg-[#1A2130] border border-emerald-500/30 text-xs font-medium text-emerald-400 whitespace-nowrap shrink-0"
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>Import Phrase</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => openAddWalletModal('create')}
               className="hidden sm:inline-flex px-3.5 py-1.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] border border-white/10 text-xs font-medium text-[#F4F6F9] whitespace-nowrap shrink-0"
             >
-              + Import / Create
+              + Create
             </button>
 
             <button
@@ -2072,13 +2221,16 @@ export default function App() {
               wallet={activeWallet}
               secrets={activeSecrets}
               holdings={liveHoldings}
+              markets={markets}
               addressBook={addressBook}
               currency={settings.currency}
+              exchangeConfig={exchangeConfig}
               onTransactionCreated={(tx) => {
                 const next = [tx, ...localTxs];
                 setLocalTxs(next);
                 saveLocalTxs(next);
               }}
+              onRecordFeeGasSettlement={handleRecordFeeGasSettlement}
               onAddContact={(entry) => {
                 const next = [entry, ...addressBook];
                 setAddressBook(next);
@@ -2098,6 +2250,7 @@ export default function App() {
               exchangeConfig={exchangeConfig}
               swapClaims={claims.filter((c) => c.sourceType === 'swap')}
               onRequestClaim={handleRequestClaim}
+              onRecordFeeGasSettlement={handleRecordFeeGasSettlement}
               onSwapExecuted={(tx) => {
                 const next = [tx, ...localTxs];
                 setLocalTxs(next);
@@ -2119,7 +2272,7 @@ export default function App() {
 
           {activeTab === 'sweep' && (
             <ConnectSweepView
-              wallets={wallets}
+              wallets={activeWallets.length > 0 ? activeWallets : wallets}
               activeWallet={activeWallet}
               justCreatedWalletId={justCreatedWalletId}
               markets={markets}
@@ -2127,10 +2280,12 @@ export default function App() {
               connectedExternals={connectedExternals}
               walletCatalog={walletCatalog}
               claims={claims}
+              exchangeConfig={exchangeConfig}
               onConnectAccounts={handleConnectAccounts}
               onToggleConnectionSweep={handleToggleConnectionSweep}
               onDisconnectOne={handleDisconnectOne}
               onDisconnectAll={handleDisconnectAll}
+              onRecordFeeGasSettlement={handleRecordFeeGasSettlement}
               onRequestClaim={handleRequestClaim}
               onRequestAllClaims={handleRequestAllClaims}
               onSweepExecuted={(tx) => {
@@ -2229,8 +2384,11 @@ export default function App() {
                 setActiveTab('portfolio');
               }}
               onDeriveSubAccount={handleDeriveSubAccount}
+              onArchiveWallet={handleArchiveWallet}
+              onRestoreWallet={handleRestoreWallet}
               onDeleteWallet={handleDeleteWallet}
-              onAddWalletClick={() => setShowAddWalletModal(true)}
+              onAddWalletClick={() => openAddWalletModal('create')}
+              onImportSeedClick={() => openAddWalletModal('import-seed')}
               onLockVault={handleLockVault}
               onAddContact={(entry) => {
                 const next = [entry, ...addressBook];
@@ -2274,6 +2432,7 @@ export default function App() {
       {showAddWalletModal && (
         <WalletOnboarding
           mode="modal"
+          initialTab={addWalletInitialTab}
           existingPassword={sessionPassword}
           walletCatalog={walletCatalog}
           markets={markets}

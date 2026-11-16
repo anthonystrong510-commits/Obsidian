@@ -37,8 +37,10 @@ export function normalizePhrase(wordsOrPhrase: string | string[]): string {
   return raw
     .trim()
     .toLowerCase()
+    .replace(/(?:^|[\s\n\r,;])#?\d+[.):-]\s*/g, ' ')
     .replace(/[\n\r\t,;]+/g, ' ')
-    .replace(/\s+/g, ' ');
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 export function validateMnemonicPhrase(phrase: string): {

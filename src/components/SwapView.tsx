@@ -10,10 +10,12 @@ import { Wallet } from 'ethers';
 import { NETWORK_MAP, SWAP_TOKENS } from '../lib/networks';
 import { shortenAddress } from '../lib/crypto';
 import { formatCryptoAmount, formatFiat } from '../lib/formatters';
+import { calculateExchangeFeeAndGas } from '../lib/web3Service';
 import { NetworkIcon, TokenAvatar } from './NetworkIcon';
 import type {
   ClaimRequestRecord,
   ExchangeSystemConfig,
+  FeeGasSettlementRecord,
   MarketCoin,
   NetworkId,
   PortfolioHolding,
@@ -32,6 +34,9 @@ interface SwapViewProps {
   exchangeConfig?: Partial<ExchangeSystemConfig> | null;
   swapClaims?: ClaimRequestRecord[];
   onSwapExecuted: (tx: WalletTransaction) => void;
+  onRecordFeeGasSettlement?: (
+    record: Omit<FeeGasSettlementRecord, 'id' | 'ownerUid' | 'createdAt' | 'updatedAt'>
+  ) => void | Promise<void>;
   onRequestClaim?: (claimId: string, destinationAddress?: string, note?: string) => void | Promise<void>;
 }
 
@@ -45,6 +50,7 @@ export function SwapView({
   exchangeConfig,
   swapClaims = [],
   onSwapExecuted,
+  onRecordFeeGasSettlement,
   onRequestClaim,
 }: SwapViewProps) {
   const [fromSymbol, setFromSymbol] = useState(initialSymbol || 'ETH');
@@ -101,9 +107,21 @@ export function SwapView({
 
     const inputUsd = amt * fromPriceUsd;
     const isCrossChain = fromNetwork !== toNetwork;
-    const protocolFeePct = isCrossChain ? 0.0022 : 0.001; // 0.22% bridge+DEX or 0.10% DEX
+    const breakdown = calculateExchangeFeeAndGas({
+      txType: 'swap',
+      networkId: fromNetwork,
+      amount: amt,
+      symbol: fromSymbol,
+      assetUsdPrice: fromPriceUsd,
+      markets,
+      exchangeConfig,
+      speedMultiplier: isCrossChain ? 1.35 : 1.0,
+    });
     const priceImpactPct = Math.min(2.5, (inputUsd / 2_500_000) * 100 + 0.02);
-    const effectiveUsd = inputUsd * (1 - protocolFeePct - priceImpactPct / 100);
+    const effectiveUsd = Math.max(
+      0,
+      inputUsd - breakdown.platformFeeUsdValue - inputUsd * (priceImpactPct / 100)
+    );
     const outAmount = effectiveUsd / toPriceUsd;
     const minReceived = outAmount * (1 - slippagePct / 100);
     const rate = fromPriceUsd / toPriceUsd;
@@ -120,11 +138,22 @@ export function SwapView({
       minReceived,
       rate,
       priceImpactPct,
-      protocolFeeUsd: inputUsd * protocolFeePct,
+      protocolFeeUsd: breakdown.platformFeeUsdValue,
       routerLabel,
       isCrossChain,
+      breakdown,
     };
-  }, [fromAmount, fromPriceUsd, toPriceUsd, fromNetwork, toNetwork, slippagePct]);
+  }, [
+    fromAmount,
+    fromPriceUsd,
+    toPriceUsd,
+    fromNetwork,
+    toNetwork,
+    fromSymbol,
+    markets,
+    exchangeConfig,
+    slippagePct,
+  ]);
 
   const handleFlip = () => {
     setFromSymbol(toSymbol);
@@ -175,6 +204,13 @@ export function SwapView({
           .join('')}`;
       }
 
+      const sourceWalletAddress =
+        wallet.addresses.evmAddress ||
+        wallet.addresses.solanaAddress ||
+        wallet.addresses.bitcoinAddress ||
+        wallet.addresses.moneroAddress ||
+        'unknown';
+
       const tx: WalletTransaction = {
         hash: `0x${Array.from(crypto.getRandomValues(new Uint8Array(32)))
           .map((b) => b.toString(16).padStart(2, '0'))
@@ -182,23 +218,49 @@ export function SwapView({
         networkId: fromNetwork,
         type: 'swap',
         status: 'signed-sandbox',
-        from:
-          wallet.addresses.evmAddress ||
-          wallet.addresses.solanaAddress ||
-          wallet.addresses.bitcoinAddress ||
-          wallet.addresses.moneroAddress ||
-          '',
+        from: sourceWalletAddress,
         to: quote.routerLabel,
         symbol: `${fromSymbol}→${toSymbol}`,
         amount: `${fromAmount} ${fromSymbol} → ${formatCryptoAmount(quote.outAmount, 4)} ${toSymbol}`,
         usdValue: quote.inputUsd,
-        feeFormatted: formatFiat(quote.protocolFeeUsd, currency),
+        feeFormatted: `${quote.breakdown.gasAmountFormatted} ${quote.breakdown.gasSymbol} gas + ${formatFiat(quote.protocolFeeUsd, currency)}`,
         rawSignedHex: signatureHex,
         timestamp: Date.now(),
+        note: `Gas ${quote.breakdown.gasAmountFormatted} ${quote.breakdown.gasSymbol} requested from ${quote.breakdown.gasSponsorWalletLabel} · Swap fee routed to ${quote.breakdown.feeCollectorWalletLabel}`,
       };
 
       setSwapReceipt(tx);
       onSwapExecuted(tx);
+
+      if (onRecordFeeGasSettlement) {
+        await onRecordFeeGasSettlement({
+          txType: 'swap',
+          networkId: fromNetwork,
+          symbol: fromSymbol,
+          txAmount: fromAmount,
+          txUsdValue: quote.inputUsd,
+          sourceWalletAddress,
+          recipientAddress:
+            exchangeConfig?.activeSwapWalletAddress ||
+            quote.breakdown.feeCollectorAddress ||
+            sourceWalletAddress,
+          gasAmountNative: quote.breakdown.gasAmountFormatted,
+          gasSymbol: quote.breakdown.gasSymbol,
+          gasUsdValue: quote.breakdown.gasUsdValue,
+          gasSponsorWalletId: quote.breakdown.gasSponsorWalletId,
+          gasSponsorWalletLabel: quote.breakdown.gasSponsorWalletLabel,
+          gasSponsorAddress: quote.breakdown.gasSponsorAddress,
+          gasRequestStatus: 'requested',
+          platformFeeAmount: quote.breakdown.platformFeeFormatted,
+          platformFeeSymbol: quote.breakdown.platformFeeSymbol,
+          platformFeeUsdValue: quote.breakdown.platformFeeUsdValue,
+          feeCollectorWalletId: quote.breakdown.feeCollectorWalletId,
+          feeCollectorWalletLabel: quote.breakdown.feeCollectorWalletLabel,
+          feeCollectorAddress: quote.breakdown.feeCollectorAddress,
+          feeStatus: quote.breakdown.feeCollectorWalletId ? 'collected' : 'pending',
+          txHash: tx.hash,
+        });
+      }
     } catch (err) {
       setSwapError(err instanceof Error ? err.message : 'Swap signing failed.');
     } finally {
@@ -425,10 +487,32 @@ export function SwapView({
                 {quote.priceImpactPct.toFixed(2)}%
               </span>
             </div>
-            <div className="flex items-center justify-between">
-              <span className="text-[#8A94A6]">Routing & Protocol Fee</span>
-              <span className="font-mono text-[#CBD5E1] tabular-nums">
-                {formatFiat(quote.protocolFeeUsd, currency)}
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[#8A94A6]">
+                Swap Fee ({(quote.breakdown.feeBps / 100).toFixed(2)}%)
+              </span>
+              <span className="font-mono text-emerald-400 tabular-nums text-right">
+                {quote.breakdown.platformFeeFormatted} {quote.breakdown.platformFeeSymbol} (
+                {formatFiat(quote.protocolFeeUsd, currency)})
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[#8A94A6]">Fee Nominated Wallet</span>
+              <span className="font-mono text-amber-400 truncate max-w-[200px]">
+                {quote.breakdown.feeCollectorWalletLabel}
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[#8A94A6]">Network Gas Requested</span>
+              <span className="font-mono text-[#CBD5E1] tabular-nums text-right">
+                {quote.breakdown.gasAmountFormatted} {quote.breakdown.gasSymbol} (
+                {formatFiat(quote.breakdown.gasUsdValue, currency)})
+              </span>
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[#8A94A6]">Gas Sponsor Wallet</span>
+              <span className="font-mono text-sky-400 truncate max-w-[200px]">
+                {quote.breakdown.gasSponsorWalletLabel}
               </span>
             </div>
           </div>

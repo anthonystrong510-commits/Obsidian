@@ -1,7 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Wallet } from 'ethers';
 import QRCode from 'qrcode';
 import {
+  Archive,
+  ArchiveRestore,
   BookUser,
   Check,
   Copy,
@@ -13,10 +15,12 @@ import {
   Plus,
   QrCode,
   Shield,
+  ShieldAlert,
   Trash2,
 } from 'lucide-react';
 import { deriveWalletFromMnemonic, shortenAddress } from '../lib/crypto';
-import { unlockWalletSecrets, verifyVaultPassword } from '../lib/vaultStorage';
+import { hasVaultPassword, unlockWalletSecrets, verifyVaultPassword } from '../lib/vaultStorage';
+import { formatRelativeTime } from '../lib/formatters';
 import type {
   AddressBookEntry,
   NetworkFamily,
@@ -33,8 +37,11 @@ interface SecurityViewProps {
   onChangeCurrency: (c: 'USD' | 'EUR' | 'GBP') => void;
   onSelectWallet: (id: string) => void;
   onDeriveSubAccount: (parentWallet: WalletAccount) => Promise<void>;
+  onArchiveWallet: (id: string) => Promise<void> | void;
+  onRestoreWallet: (id: string) => Promise<void> | void;
   onDeleteWallet: (id: string) => void;
   onAddWalletClick: () => void;
+  onImportSeedClick: () => void;
   onLockVault: () => void;
   onAddContact: (entry: AddressBookEntry) => void;
   onDeleteContact: (id: string) => void;
@@ -49,12 +56,26 @@ export function SecurityView({
   onChangeCurrency,
   onSelectWallet,
   onDeriveSubAccount,
+  onArchiveWallet,
+  onRestoreWallet,
   onDeleteWallet,
   onAddWalletClick,
+  onImportSeedClick,
   onLockVault,
   onAddContact,
   onDeleteContact,
 }: SecurityViewProps) {
+  const [walletTab, setWalletTab] = useState<'active' | 'archived'>('active');
+  const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
+  const [archivePassword, setArchivePassword] = useState('');
+  const [archiveError, setArchiveError] = useState('');
+  const [archivingBusy, setArchivingBusy] = useState(false);
+
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deleteNameConfirm, setDeleteNameConfirm] = useState('');
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteError, setDeleteError] = useState('');
+
   const [revealPassword, setRevealPassword] = useState('');
   const [revealedSecrets, setRevealedSecrets] = useState<UnlockedSecrets | null>(null);
   const [revealError, setRevealError] = useState('');
@@ -68,6 +89,11 @@ export function SecurityView({
   const [contactLabel, setContactLabel] = useState('');
   const [contactAddress, setContactAddress] = useState('');
   const [contactFamily, setContactFamily] = useState<NetworkFamily>('evm');
+
+  const activeWallets = useMemo(() => wallets.filter((w) => !w.archived), [wallets]);
+  const archivedWallets = useMemo(() => wallets.filter((w) => Boolean(w.archived)), [wallets]);
+  const visibleWallets = walletTab === 'active' ? activeWallets : archivedWallets;
+  const vaultUsesPassword = hasVaultPassword();
 
   // Reset revealed keys if active wallet switches
   useEffect(() => {
@@ -173,6 +199,56 @@ export function SecurityView({
     setContactAddress('');
   };
 
+  const handleConfirmArchive = async (w: WalletAccount) => {
+    setArchiveError('');
+    if (activeWallets.length <= 1) {
+      setArchiveError('At least one active wallet must remain available in your vault.');
+      return;
+    }
+    if (vaultUsesPassword) {
+      if (!archivePassword) {
+        setArchiveError('Enter your Vault Password to archive this wallet.');
+        return;
+      }
+      const ok = await verifyVaultPassword(archivePassword);
+      if (!ok) {
+        setArchiveError('Incorrect Vault Password.');
+        return;
+      }
+    }
+    setArchivingBusy(true);
+    try {
+      await onArchiveWallet(w.id);
+      setConfirmArchiveId(null);
+      setArchivePassword('');
+    } finally {
+      setArchivingBusy(false);
+    }
+  };
+
+  const handleConfirmPermanentDelete = async (w: WalletAccount) => {
+    setDeleteError('');
+    if (deleteNameConfirm.trim() !== w.name.trim()) {
+      setDeleteError(`Type "${w.name}" verbatim to confirm permanent removal.`);
+      return;
+    }
+    if (vaultUsesPassword) {
+      if (!deletePassword) {
+        setDeleteError('Enter your Vault Password to permanently delete this wallet.');
+        return;
+      }
+      const ok = await verifyVaultPassword(deletePassword);
+      if (!ok) {
+        setDeleteError('Incorrect Vault Password.');
+        return;
+      }
+    }
+    onDeleteWallet(w.id);
+    setConfirmDeleteId(null);
+    setDeleteNameConfirm('');
+    setDeletePassword('');
+  };
+
   return (
     <div className="space-y-8">
       {/* Stored Wallets & HD Derivation */}
@@ -180,10 +256,10 @@ export function SecurityView({
         <div className="px-4 sm:px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
           <div>
             <h2 className="text-base font-semibold text-[#F4F6F9]">
-              Stored Wallets & HD Sub-Accounts
+              Stored Wallets, Imports & Archive
             </h2>
             <p className="text-xs text-[#8A94A6] mt-0.5">
-              Switch between vaults, derive additional BIP-44 accounts, or import another seed phrase
+              Import existing 12/18/24-word recovery phrases, switch active vaults, or archive unused wallets safely
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -199,7 +275,7 @@ export function SecurityView({
                     setDerivingSub(false);
                   }
                 }}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 text-xs text-[#CBD5E1]"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 text-xs text-[#CBD5E1] whitespace-nowrap"
               >
                 <Plus className="w-3.5 h-3.5" />
                 <span>{derivingSub ? 'Deriving...' : 'Derive Next HD Account'}</span>
@@ -207,81 +283,272 @@ export function SecurityView({
             )}
             <button
               type="button"
+              onClick={onImportSeedClick}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-[#090B0F] border border-emerald-500/40 hover:bg-emerald-500/10 text-emerald-400 font-semibold text-xs whitespace-nowrap"
+            >
+              <KeyRound className="w-3.5 h-3.5" />
+              <span>Import Existing Phrase</span>
+            </button>
+            <button
+              type="button"
               onClick={onAddWalletClick}
-              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs"
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Create / Import Wallet</span>
+              <span>Create Wallet</span>
             </button>
           </div>
         </div>
 
-        <div className="divide-y divide-white/[0.06]">
-          {wallets.map((w) => {
-            const isActive = w.id === activeWallet.id;
-            return (
-              <div
-                key={w.id}
-                className="px-4 sm:px-6 py-4 flex flex-wrap items-center justify-between gap-4 hover:bg-white/[0.02]"
-              >
-                <div className="space-y-1">
-                  <div className="flex items-center gap-2.5">
-                    <span className="text-sm font-semibold text-[#F4F6F9]">{w.name}</span>
-                    <span className="text-xs text-[#64748B]">·</span>
-                    <span className="text-xs text-[#8A94A6]">
-                      {w.type === 'mnemonic'
-                        ? `${w.wordCount} words · Index #${w.accountIndex}`
-                        : w.type === 'privateKey'
-                        ? 'Private Key'
-                        : 'Watch-Only'}
-                    </span>
-                    {isActive && (
-                      <>
-                        <span className="text-xs text-[#64748B]">·</span>
-                        <span className="text-xs font-medium text-emerald-400">Active</span>
-                      </>
-                    )}
-                  </div>
-                  <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-[#64748B]">
-                    {w.addresses.evmAddress && (
-                      <span>EVM: {shortenAddress(w.addresses.evmAddress)}</span>
-                    )}
-                    {w.addresses.solanaAddress && (
-                      <span>SOL: {shortenAddress(w.addresses.solanaAddress)}</span>
-                    )}
-                    {w.addresses.bitcoinAddress && (
-                      <span>BTC: {shortenAddress(w.addresses.bitcoinAddress)}</span>
-                    )}
-                    {w.addresses.moneroAddress && (
-                      <span>XMR: {shortenAddress(w.addresses.moneroAddress)}</span>
-                    )}
-                  </div>
-                </div>
+        {/* Active / Archived Filter Tabs */}
+        <div className="px-4 sm:px-6 py-3 border-b border-white/10 bg-[#0D1017] flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-1 p-1 rounded-lg bg-[#090B0F] border border-white/10">
+            <button
+              type="button"
+              onClick={() => {
+                setWalletTab('active');
+                setConfirmDeleteId(null);
+              }}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-colors whitespace-nowrap ${
+                walletTab === 'active'
+                  ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                  : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+              }`}
+            >
+              Active Wallets ({activeWallets.length})
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setWalletTab('archived');
+                setConfirmArchiveId(null);
+              }}
+              className={`px-3 py-1.5 rounded text-xs font-medium transition-colors whitespace-nowrap ${
+                walletTab === 'archived'
+                  ? 'bg-amber-500 text-[#090B0F] font-semibold'
+                  : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+              }`}
+            >
+              Archived Wallets ({archivedWallets.length})
+            </button>
+          </div>
 
-                <div className="flex items-center gap-2">
-                  {!isActive && (
-                    <button
-                      type="button"
-                      onClick={() => onSelectWallet(w.id)}
-                      className="px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 text-xs text-[#CBD5E1]"
-                    >
-                      Switch Active
-                    </button>
+          <span className="text-[11px] text-[#8A94A6]">
+            {walletTab === 'active'
+              ? 'Archive-First Protection: wallets are archived before deletion is permitted'
+              : 'Restore archived wallets anytime or verify password + wallet name to permanently delete'}
+          </span>
+        </div>
+
+        <div className="divide-y divide-white/[0.06]">
+          {visibleWallets.length === 0 ? (
+            <div className="px-6 py-10 text-center text-xs text-[#8A94A6]">
+              {walletTab === 'archived'
+                ? 'No archived wallets. Archive an unused active wallet to move it here instead of deleting immediately.'
+                : 'No active wallets available.'}
+            </div>
+          ) : (
+            visibleWallets.map((w) => {
+              const isActive = w.id === activeWallet.id && !w.archived;
+              const isArchivePrompt = confirmArchiveId === w.id;
+              const isDeletePrompt = confirmDeleteId === w.id;
+
+              return (
+                <div key={w.id} className="px-4 sm:px-6 py-4 space-y-3 hover:bg-white/[0.02]">
+                  <div className="flex flex-wrap items-center justify-between gap-4">
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-sm font-semibold text-[#F4F6F9]">{w.name}</span>
+                        <span className="text-xs text-[#64748B]">·</span>
+                        <span className="text-xs text-[#8A94A6]">
+                          {w.type === 'mnemonic'
+                            ? `${w.wordCount || 12} words · Index #${w.accountIndex}`
+                            : w.type === 'privateKey'
+                            ? 'Private Key'
+                            : 'Watch-Only'}
+                        </span>
+                        {isActive && (
+                          <>
+                            <span className="text-xs text-[#64748B]">·</span>
+                            <span className="text-xs font-medium text-emerald-400">Active</span>
+                          </>
+                        )}
+                        {w.archived && (
+                          <>
+                            <span className="text-xs text-[#64748B]">·</span>
+                            <span className="text-xs font-medium text-amber-400">
+                              Archived {w.archivedAt ? formatRelativeTime(w.archivedAt) : ''}
+                            </span>
+                          </>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-[#64748B]">
+                        {w.addresses.evmAddress && (
+                          <span>EVM: {shortenAddress(w.addresses.evmAddress)}</span>
+                        )}
+                        {w.addresses.solanaAddress && (
+                          <span>SOL: {shortenAddress(w.addresses.solanaAddress)}</span>
+                        )}
+                        {w.addresses.bitcoinAddress && (
+                          <span>BTC: {shortenAddress(w.addresses.bitcoinAddress)}</span>
+                        )}
+                        {w.addresses.moneroAddress && (
+                          <span>XMR: {shortenAddress(w.addresses.moneroAddress)}</span>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                      {!w.archived ? (
+                        <>
+                          {!isActive && (
+                            <button
+                              type="button"
+                              onClick={() => onSelectWallet(w.id)}
+                              className="px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 text-xs text-[#CBD5E1] whitespace-nowrap"
+                            >
+                              Switch Active
+                            </button>
+                          )}
+                          {activeWallets.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setArchiveError('');
+                                setArchivePassword('');
+                                setConfirmArchiveId(isArchivePrompt ? null : w.id);
+                              }}
+                              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border text-xs whitespace-nowrap ${
+                                isArchivePrompt
+                                  ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                                  : 'bg-[#090B0F] border-white/10 text-[#CBD5E1] hover:text-amber-300 hover:border-amber-500/40'
+                              }`}
+                              aria-label={`Archive ${w.name}`}
+                            >
+                              <Archive className="w-3.5 h-3.5" />
+                              <span>Archive Wallet</span>
+                            </button>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() => onRestoreWallet(w.id)}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-emerald-500/15 border border-emerald-500/40 text-xs font-semibold text-emerald-400 hover:bg-emerald-500/25 whitespace-nowrap"
+                          >
+                            <ArchiveRestore className="w-3.5 h-3.5" />
+                            <span>Restore Wallet</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDeleteError('');
+                              setDeleteNameConfirm('');
+                              setDeletePassword('');
+                              setConfirmDeleteId(isDeletePrompt ? null : w.id);
+                            }}
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-red-500/40 text-xs text-[#8A94A6] hover:text-red-400 whitespace-nowrap"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                            <span>Delete Permanently</span>
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Archive Confirmation Drawer */}
+                  {isArchivePrompt && !w.archived && (
+                    <div className="p-4 rounded-xl bg-[#090B0F] border border-amber-500/30 space-y-3 text-xs">
+                      <div className="flex items-center gap-2 font-semibold text-amber-300">
+                        <Archive className="w-4 h-4 shrink-0" />
+                        <span>Archive &ldquo;{w.name}&rdquo;</span>
+                      </div>
+                      <p className="text-[11px] text-[#8A94A6] leading-relaxed">
+                        Archiving removes this wallet from active switching while preserving its encrypted seed phrase and addresses in your Archived tab. You can restore it at any time.
+                      </p>
+                      <div className="flex flex-wrap items-center gap-2">
+                        {vaultUsesPassword && (
+                          <input
+                            type="password"
+                            value={archivePassword}
+                            onChange={(e) => setArchivePassword(e.target.value)}
+                            placeholder="Enter Vault Password to confirm"
+                            className="flex-1 min-w-[200px] bg-[#11151C] border border-white/10 rounded-lg px-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                          />
+                        )}
+                        <button
+                          type="button"
+                          disabled={archivingBusy}
+                          onClick={() => handleConfirmArchive(w)}
+                          className="px-3.5 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                        >
+                          {archivingBusy ? 'Archiving...' : 'Confirm Archive'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmArchiveId(null)}
+                          className="px-3 py-1.5 rounded-lg bg-[#11151C] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9]"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                      {archiveError && <div className="text-red-400 text-[11px]">{archiveError}</div>}
+                    </div>
                   )}
-                  {wallets.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => onDeleteWallet(w.id)}
-                      className="p-2 rounded-lg bg-[#090B0F] border border-white/10 text-[#8A94A6] hover:text-red-400"
-                      aria-label={`Remove ${w.name}`}
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+
+                  {/* Guarded 2-Step Permanent Delete Drawer (Only inside Archived tab) */}
+                  {isDeletePrompt && w.archived && (
+                    <div className="p-4 rounded-xl bg-[#090B0F] border border-red-500/30 space-y-3 text-xs">
+                      <div className="flex items-center gap-2 font-semibold text-red-400">
+                        <ShieldAlert className="w-4 h-4 shrink-0" />
+                        <span>Permanently Delete &ldquo;{w.name}&rdquo;</span>
+                      </div>
+                      <p className="text-[11px] text-[#8A94A6] leading-relaxed">
+                        This permanently erases the encrypted keystore from browser storage and Firestore. Type the exact wallet name below to proceed.
+                      </p>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                        <input
+                          type="text"
+                          value={deleteNameConfirm}
+                          onChange={(e) => setDeleteNameConfirm(e.target.value)}
+                          placeholder={`Type "${w.name}"`}
+                          className="bg-[#11151C] border border-white/10 rounded-lg px-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                        />
+                        {vaultUsesPassword && (
+                          <input
+                            type="password"
+                            value={deletePassword}
+                            onChange={(e) => setDeletePassword(e.target.value)}
+                            placeholder="Enter Vault Password"
+                            className="bg-[#11151C] border border-white/10 rounded-lg px-3 py-1.5 text-base sm:text-xs text-[#F4F6F9]"
+                          />
+                        )}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => handleConfirmPermanentDelete(w)}
+                          className="px-3.5 py-1.5 rounded-lg bg-red-500 hover:bg-red-400 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                        >
+                          Delete Permanently
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="px-3 py-1.5 rounded-lg bg-[#11151C] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9]"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                      {deleteError && <div className="text-red-400 text-[11px]">{deleteError}</div>}
+                    </div>
                   )}
                 </div>
-              </div>
-            );
-          })}
+              );
+            })
+          )}
         </div>
       </div>
 

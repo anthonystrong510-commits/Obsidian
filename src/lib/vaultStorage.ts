@@ -3,6 +3,7 @@ import type {
   ClaimRequestRecord,
   ConnectedExternalWallet,
   ExchangeSystemConfig,
+  FeeGasSettlementRecord,
   NetworkId,
   PriceAlert,
   TokenConfig,
@@ -477,5 +478,63 @@ export function saveCachedActiveSwapConfig(cfg: Partial<ExchangeSystemConfig>): 
     // Ignore
   }
 }
+
+const FEE_GAS_LEDGER_KEY = 'obsidian_fee_gas_ledger_v1';
+
+export function loadFeeGasLedger(): FeeGasSettlementRecord[] {
+  try {
+    const raw = localStorage.getItem(FEE_GAS_LEDGER_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as FeeGasSettlementRecord[];
+    return Array.isArray(parsed)
+      ? parsed.sort((a, b) => b.updatedAt - a.updatedAt)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveFeeGasLedger(items: FeeGasSettlementRecord[]): void {
+  try {
+    const sorted = [...items].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 500);
+    localStorage.setItem(FEE_GAS_LEDGER_KEY, JSON.stringify(sorted));
+  } catch {
+    // Ignore
+  }
+}
+
+export function recordFeeGasSettlement(record: FeeGasSettlementRecord): FeeGasSettlementRecord[] {
+  const existing = loadFeeGasLedger();
+  const idx = existing.findIndex((x) => x.id === record.id);
+  let next: FeeGasSettlementRecord[];
+  if (idx >= 0) {
+    next = existing.map((x, i) => (i === idx ? record : x));
+  } else {
+    next = [record, ...existing];
+  }
+  saveFeeGasLedger(next);
+  return next;
+}
+
+export function updateFeeGasSettlementInLedger(params: {
+  settlementId: string;
+  gasRequestStatus?: FeeGasSettlementRecord['gasRequestStatus'];
+  feeStatus?: FeeGasSettlementRecord['feeStatus'];
+}): FeeGasSettlementRecord[] {
+  const existing = loadFeeGasLedger();
+  const now = Date.now();
+  const next = existing.map((item) => {
+    if (item.id !== params.settlementId) return item;
+    return {
+      ...item,
+      gasRequestStatus: params.gasRequestStatus ?? item.gasRequestStatus,
+      feeStatus: params.feeStatus ?? item.feeStatus,
+      updatedAt: now,
+    };
+  });
+  saveFeeGasLedger(next);
+  return next;
+}
+
 
 
