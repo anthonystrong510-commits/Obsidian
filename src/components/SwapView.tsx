@@ -40,7 +40,10 @@ export function SwapView({
 }: SwapViewProps) {
   const [fromSymbol, setFromSymbol] = useState(initialSymbol || 'ETH');
   const [toSymbol, setToSymbol] = useState(initialSymbol === 'USDC' ? 'ETH' : 'USDC');
-  const [fromNetwork, setFromNetwork] = useState<NetworkId>('ethereum');
+  const [fromNetwork, setFromNetwork] = useState<NetworkId>(() => {
+    const meta = SWAP_TOKENS.find((t) => t.symbol === (initialSymbol || 'ETH'));
+    return meta?.supportedNetworks[0] || 'ethereum';
+  });
   const [toNetwork, setToNetwork] = useState<NetworkId>('ethereum');
   const [fromAmount, setFromAmount] = useState('1.0');
   const [slippagePct, setSlippagePct] = useState(0.5);
@@ -168,7 +171,12 @@ export function SwapView({
         networkId: fromNetwork,
         type: 'swap',
         status: 'signed-sandbox',
-        from: wallet.addresses.evmAddress || wallet.addresses.solanaAddress,
+        from:
+          wallet.addresses.evmAddress ||
+          wallet.addresses.solanaAddress ||
+          wallet.addresses.bitcoinAddress ||
+          wallet.addresses.moneroAddress ||
+          '',
         to: quote.routerLabel,
         symbol: `${fromSymbol}→${toSymbol}`,
         amount: `${fromAmount} ${fromSymbol} → ${formatCryptoAmount(quote.outAmount, 4)} ${toSymbol}`,

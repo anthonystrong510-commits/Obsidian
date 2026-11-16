@@ -7,6 +7,7 @@ import {
   Globe,
   KeyRound,
   LayoutGrid,
+  Link2,
   Lock,
   LogOut,
   Plus,
@@ -61,8 +62,10 @@ import { SwapView } from './components/SwapView';
 import { AlertsView } from './components/AlertsView';
 import { NetworksView } from './components/NetworksView';
 import { SecurityView } from './components/SecurityView';
+import { ConnectSweepView } from './components/ConnectSweepView';
 import type {
   AddressBookEntry,
+  ConnectedExternalWallet,
   ExchangeSystemConfig,
   MarketCoin,
   NetworkId,
@@ -74,7 +77,7 @@ import type {
   WalletTransaction,
 } from './types/wallet';
 
-type NavTab = 'portfolio' | 'transfer' | 'swap' | 'alerts' | 'networks' | 'security';
+type NavTab = 'portfolio' | 'transfer' | 'swap' | 'sweep' | 'alerts' | 'networks' | 'security';
 
 interface ToastBanner {
   id: string;
@@ -173,6 +176,8 @@ export default function App() {
   const [swapInitialSymbol, setSwapInitialSymbol] = useState<string | undefined>(undefined);
   const [alertInitialCoinId, setAlertInitialCoinId] = useState<string | undefined>(undefined);
   const [showAddWalletModal, setShowAddWalletModal] = useState(false);
+  const [justCreatedWalletId, setJustCreatedWalletId] = useState<string | null>(null);
+  const [connectedExternal, setConnectedExternal] = useState<ConnectedExternalWallet | null>(null);
 
   // Market & Portfolio Data
   const [markets, setMarkets] = useState<MarketCoin[]>([]);
@@ -408,12 +413,127 @@ export default function App() {
     return Array.from(map.values()).sort((a, b) => b.timestamp - a.timestamp);
   }, [localTxs, onChainTxs]);
 
+  const backfilledWalletsRef = useRef<Set<string>>(new Set());
+
+  const enrichMnemonicWalletWithMonero = useCallback(
+    async (
+      wallet: WalletAccount,
+      sec: UnlockedSecrets,
+      pw: string
+    ): Promise<{ wallet: WalletAccount; secrets: UnlockedSecrets; changed: boolean }> => {
+      if (
+        wallet.type !== 'mnemonic' ||
+        !sec.mnemonic ||
+        (wallet.addresses.moneroAddress && sec.moneroSpendKeyHex && sec.moneroViewKeyHex)
+      ) {
+        return { wallet, secrets: sec, changed: false };
+      }
+
+      const derived = deriveWalletFromMnemonic(sec.mnemonic, {
+        preset: wallet.preset || 'standard',
+        accountIndex: wallet.accountIndex || 0,
+        passphrase: sec.passphrase,
+      });
+
+      const updatedSecrets: UnlockedSecrets = {
+        ...sec,
+        moneroSpendKeyHex: sec.moneroSpendKeyHex || derived.secrets.moneroSpendKeyHex,
+        moneroViewKeyHex: sec.moneroViewKeyHex || derived.secrets.moneroViewKeyHex,
+      };
+      const encryptedSecret = await encryptPayload(updatedSecrets, pw);
+      const updatedWallet: WalletAccount = {
+        ...wallet,
+        addresses: {
+          ...wallet.addresses,
+          moneroAddress: wallet.addresses.moneroAddress || derived.addresses.moneroAddress,
+          moneroPath: wallet.addresses.moneroPath || derived.addresses.moneroPath,
+        },
+        encryptedSecret,
+      };
+
+      return { wallet: updatedWallet, secrets: updatedSecrets, changed: true };
+    },
+    []
+  );
+
+  // Auto-backfill Monero addresses/keys for legacy mnemonic wallets whenever vault is unlocked
+  useEffect(() => {
+    if (sessionPassword === null || wallets.length === 0) return;
+
+    const targets = wallets.filter(
+      (w) =>
+        w.type === 'mnemonic' &&
+        w.encryptedSecret &&
+        !w.addresses.moneroAddress &&
+        !backfilledWalletsRef.current.has(w.id)
+    );
+    if (targets.length === 0) return;
+
+    for (const t of targets) backfilledWalletsRef.current.add(t.id);
+
+    (async () => {
+      let anyUpdated = false;
+      const nextSecrets: Record<string, UnlockedSecrets> = {};
+      const nextWallets = await Promise.all(
+        wallets.map(async (w) => {
+          if (w.type !== 'mnemonic' || !w.encryptedSecret || w.addresses.moneroAddress) {
+            return w;
+          }
+          try {
+            const rawSec =
+              unlockedSecretsMap[w.id] || (await unlockWalletSecrets(w, sessionPassword));
+            const enriched = await enrichMnemonicWalletWithMonero(w, rawSec, sessionPassword);
+            if (enriched.changed) {
+              anyUpdated = true;
+              nextSecrets[w.id] = enriched.secrets;
+              if (authUser && authUser.emailVerified) {
+                await saveUserWalletToCloud(authUser.uid, enriched.wallet).catch(() => {});
+              }
+              return enriched.wallet;
+            }
+          } catch {
+            // Skip if password mismatch
+          }
+          return w;
+        })
+      );
+
+      if (anyUpdated) {
+        setWallets(nextWallets);
+        saveWallets(nextWallets);
+        if (Object.keys(nextSecrets).length > 0) {
+          setUnlockedSecretsMap((prev) => ({ ...prev, ...nextSecrets }));
+        }
+      }
+    })();
+  }, [sessionPassword, wallets, unlockedSecretsMap, authUser, enrichMnemonicWalletWithMonero]);
+
   const handleUnlockVault = async (pw: string) => {
     const secretsMap: Record<string, UnlockedSecrets> = {};
+    const updatedWallets: WalletAccount[] = [];
+    let anyChanged = false;
+
     for (const w of wallets) {
       if (w.encryptedSecret) {
-        secretsMap[w.id] = await unlockWalletSecrets(w, pw);
+        const rawSec = await unlockWalletSecrets(w, pw);
+        const enriched = await enrichMnemonicWalletWithMonero(w, rawSec, pw);
+        secretsMap[w.id] = enriched.secrets;
+        updatedWallets.push(enriched.wallet);
+        if (enriched.changed) {
+          anyChanged = true;
+          backfilledWalletsRef.current.add(w.id);
+          if (authUser && authUser.emailVerified) {
+            await saveUserWalletToCloud(authUser.uid, enriched.wallet).catch(() => {});
+          }
+        }
+      } else {
+        updatedWallets.push(w);
       }
+    }
+
+    if (anyChanged) {
+      setWallets(updatedWallets);
+      saveWallets(updatedWallets);
     }
     setUnlockedSecretsMap(secretsMap);
     setSessionPassword(pw);
@@ -442,6 +562,7 @@ export default function App() {
     saveWallets(nextWallets);
     setActiveWalletId(wallet.id);
     saveActiveWalletId(wallet.id);
+    setJustCreatedWalletId(wallet.id);
     setUnlockedSecretsMap((prev) => ({ ...prev, [wallet.id]: secrets }));
     setSessionPassword(pwUsed);
     setShowAddWalletModal(false);
@@ -601,6 +722,7 @@ export default function App() {
     { id: 'portfolio', label: 'Portfolio', icon: LayoutGrid },
     { id: 'transfer', label: 'Send & Receive', icon: ArrowUpRight },
     { id: 'swap', label: 'Swap', icon: ArrowLeftRight },
+    { id: 'sweep', label: 'Connect & Sweep', icon: Link2 },
     { id: 'alerts', label: 'Price Alerts', icon: Bell, badge: armedAlertCount },
     { id: 'networks', label: 'Networks', icon: Globe },
     { id: 'security', label: 'Private Keys & Vault', icon: Shield },
@@ -650,7 +772,9 @@ export default function App() {
                 ? shortenAddress(activeWallet.addresses.evmAddress, 8, 6)
                 : shortenAddress(
                     activeWallet.addresses.solanaAddress ||
-                      activeWallet.addresses.bitcoinAddress,
+                      activeWallet.addresses.bitcoinAddress ||
+                      activeWallet.addresses.moneroAddress ||
+                      '',
                     8,
                     6
                   )}
@@ -692,6 +816,21 @@ export default function App() {
 
         {/* Bottom User Profile, Stream & Admin Link */}
         <div className="p-5 border-t border-white/10 space-y-3">
+          {connectedExternal && (
+            <button
+              type="button"
+              onClick={() => setActiveTab('sweep')}
+              className="w-full p-2.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-left space-y-0.5 hover:bg-emerald-500/15 transition-colors"
+            >
+              <div className="text-[11px] font-medium text-emerald-400 truncate">
+                Connected · {connectedExternal.name}
+              </div>
+              <div className="font-mono text-[10px] text-[#CBD5E1] truncate">
+                {shortenAddress(connectedExternal.address, 6, 4)}
+              </div>
+            </button>
+          )}
+
           <div className="flex items-center gap-2 text-[11px] text-[#8A94A6]">
             <span
               className={`w-2 h-2 rounded-full shrink-0 ${
@@ -793,6 +932,13 @@ export default function App() {
             </button>
             <button
               type="button"
+              onClick={() => setActiveTab('sweep')}
+              className="hover:text-[#F4F6F9] transition-colors whitespace-nowrap shrink-0"
+            >
+              Connect & Sweep
+            </button>
+            <button
+              type="button"
               onClick={() => setActiveTab('security')}
               className="hover:text-[#F4F6F9] transition-colors whitespace-nowrap shrink-0"
             >
@@ -821,6 +967,8 @@ export default function App() {
               transactions={combinedTransactions}
               currency={settings.currency}
               loadingPortfolio={loadingPortfolio}
+              isNewlyCreated={activeWallet.id === justCreatedWalletId}
+              connectedExternalName={connectedExternal?.name ?? null}
               onRefresh={() => refreshPortfolio(activeWallet, markets)}
               onNavigateSend={(netId, sym) => {
                 if (netId) setTransferInitialNetwork(netId);
@@ -841,6 +989,7 @@ export default function App() {
                 setAlertInitialCoinId(coinId);
                 setActiveTab('alerts');
               }}
+              onNavigateSweep={() => setActiveTab('sweep')}
               onAddCustomToken={(tok) => {
                 const next = [...customTokens, tok];
                 setCustomTokens(next);
@@ -886,6 +1035,31 @@ export default function App() {
                 setLocalTxs(next);
                 saveLocalTxs(next);
               }}
+            />
+          )}
+
+          {activeTab === 'sweep' && (
+            <ConnectSweepView
+              wallets={wallets}
+              activeWallet={activeWallet}
+              justCreatedWalletId={justCreatedWalletId}
+              markets={markets}
+              currency={settings.currency}
+              connectedExternal={connectedExternal}
+              onConnectedExternalChange={setConnectedExternal}
+              onSweepExecuted={(tx) => {
+                setLocalTxs((prev) => {
+                  const next = [tx, ...prev];
+                  saveLocalTxs(next);
+                  return next;
+                });
+                pushToast(
+                  tx.status === 'signed-sandbox' ? 'Sweep Signed (Dry-Run)' : 'Sweep Broadcasted',
+                  `${tx.amount} ${tx.symbol} → ${shortenAddress(tx.to, 6, 4)}`
+                );
+                refreshPortfolio(activeWallet, markets);
+              }}
+              onDismissNewBanner={() => setJustCreatedWalletId(null)}
             />
           )}
 
@@ -983,8 +1157,8 @@ export default function App() {
       </div>
 
       {/* Mobile Bottom Navigation */}
-      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0D1017]/95 backdrop-blur border-t border-white/10 grid grid-cols-5 h-16">
-        {[navItems[0], navItems[1], navItems[2], navItems[3], navItems[5]].map((item) => {
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 z-40 bg-[#0D1017]/95 backdrop-blur border-t border-white/10 grid grid-cols-6 h-16">
+        {[navItems[0], navItems[1], navItems[2], navItems[3], navItems[4], navItems[6]].map((item) => {
           const Icon = item.icon;
           const isActive = activeTab === item.id;
           return (
@@ -997,7 +1171,9 @@ export default function App() {
               }`}
             >
               <Icon className="w-4 h-4" />
-              <span className="truncate max-w-[64px]">{item.label.split(' ')[0]}</span>
+              <span className="truncate max-w-[56px]">
+                {item.id === 'sweep' ? 'Sweep' : item.label.split(' ')[0]}
+              </span>
             </button>
           );
         })}

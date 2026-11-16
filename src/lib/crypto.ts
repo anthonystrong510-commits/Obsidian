@@ -4,6 +4,7 @@ import {
   Wallet,
   getBytes,
   hexlify,
+  keccak256,
   randomBytes,
   wordlists,
 } from 'ethers';
@@ -134,6 +135,122 @@ function deriveBitcoinSegwitAddress(seed: Uint8Array, path: string): {
   };
 }
 
+// Monero Base58 block alphabet & Ed25519 scalar cryptography
+const XMR_B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const XMR_ENCODED_BLOCK_SIZES = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+
+function bytesToLeBigInt(bytes: Uint8Array): bigint {
+  let result = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) {
+    result = (result << 8n) | BigInt(bytes[i]);
+  }
+  return result;
+}
+
+function leBigIntToBytes32(n: bigint): Uint8Array {
+  const out = new Uint8Array(32);
+  let cur = n;
+  for (let i = 0; i < 32; i++) {
+    out[i] = Number(cur & 0xffn);
+    cur >>= 8n;
+  }
+  return out;
+}
+
+function moneroBase58EncodeBlock(data: Uint8Array): string {
+  let num = 0n;
+  for (let i = 0; i < data.length; i++) {
+    num = (num << 8n) | BigInt(data[i]);
+  }
+  const targetLen = XMR_ENCODED_BLOCK_SIZES[data.length];
+  let res = '';
+  while (num > 0n) {
+    const rem = Number(num % 58n);
+    num = num / 58n;
+    res = XMR_B58_ALPHABET[rem] + res;
+  }
+  return res.padStart(targetLen, '1');
+}
+
+function moneroBase58Encode(data: Uint8Array): string {
+  let out = '';
+  for (let i = 0; i < data.length; i += 8) {
+    out += moneroBase58EncodeBlock(data.subarray(i, Math.min(i + 8, data.length)));
+  }
+  return out;
+}
+
+function moneroBase58Decode(addr: string): Uint8Array | null {
+  const fullBlockSize = 11;
+  const bytes: number[] = [];
+  for (let i = 0; i < addr.length; i += fullBlockSize) {
+    const chunk = addr.slice(i, i + fullBlockSize);
+    const outBytesLen = XMR_ENCODED_BLOCK_SIZES.indexOf(chunk.length);
+    if (outBytesLen <= 0) return null;
+
+    let num = 0n;
+    for (let j = 0; j < chunk.length; j++) {
+      const idx = XMR_B58_ALPHABET.indexOf(chunk[j]);
+      if (idx < 0) return null;
+      num = num * 58n + BigInt(idx);
+    }
+
+    const block = new Uint8Array(outBytesLen);
+    for (let k = outBytesLen - 1; k >= 0; k--) {
+      block[k] = Number(num & 0xffn);
+      num >>= 8n;
+    }
+    if (num > 0n) return null;
+    for (let k = 0; k < outBytesLen; k++) bytes.push(block[k]);
+  }
+  return new Uint8Array(bytes);
+}
+
+function deriveMoneroFromSpendBytes(rawSeed: Uint8Array): {
+  address: string;
+  spendKeyHex: string;
+  viewKeyHex: string;
+} {
+  const curveOrder = ed25519.Point.CURVE().n;
+
+  let spendScalar = bytesToLeBigInt(rawSeed) % curveOrder;
+  if (spendScalar === 0n) spendScalar = 1n;
+  const spendBytes = leBigIntToBytes32(spendScalar);
+
+  const viewHash = getBytes(keccak256(spendBytes));
+  let viewScalar = bytesToLeBigInt(viewHash) % curveOrder;
+  if (viewScalar === 0n) viewScalar = 1n;
+  const viewBytes = leBigIntToBytes32(viewScalar);
+
+  const pubSpend = ed25519.Point.BASE.multiply(spendScalar).toBytes();
+  const pubView = ed25519.Point.BASE.multiply(viewScalar).toBytes();
+
+  const payload = new Uint8Array(65);
+  payload[0] = 0x12; // Monero Mainnet standard address prefix ('4...')
+  payload.set(pubSpend, 1);
+  payload.set(pubView, 33);
+
+  const checksum = getBytes(keccak256(payload)).slice(0, 4);
+  const full = new Uint8Array(69);
+  full.set(payload, 0);
+  full.set(checksum, 65);
+
+  return {
+    address: moneroBase58Encode(full),
+    spendKeyHex: hexlify(spendBytes).slice(2),
+    viewKeyHex: hexlify(viewBytes).slice(2),
+  };
+}
+
+function deriveMoneroWallet(seed: Uint8Array, path: string): {
+  address: string;
+  spendKeyHex: string;
+  viewKeyHex: string;
+} {
+  const rawSeed = deriveSlip10Ed25519(seed, path);
+  return deriveMoneroFromSpendBytes(rawSeed);
+}
+
 export function deriveWalletFromMnemonic(
   phrase: string,
   options: {
@@ -157,6 +274,7 @@ export function deriveWalletFromMnemonic(
   const evmPath = options.customEvmPath?.trim() || preset.evmPathTemplate(idx);
   const solanaPath = options.customSolanaPath?.trim() || preset.solanaPathTemplate(idx);
   const bitcoinPath = options.customBitcoinPath?.trim() || preset.bitcoinPathTemplate(idx);
+  const moneroPath = preset.moneroPathTemplate(idx);
 
   const mnemonic = Mnemonic.fromPhrase(normalized, passphrase);
   const seedBytes = getBytes(mnemonic.computeSeed());
@@ -176,6 +294,9 @@ export function deriveWalletFromMnemonic(
   // 3. Bitcoin BIP-84 Native SegWit Derivation
   const btc = deriveBitcoinSegwitAddress(seedBytes, bitcoinPath);
 
+  // 4. Monero (XMR) Dual-Key Derivation (Spend + View Ed25519)
+  const xmr = deriveMoneroWallet(seedBytes, moneroPath);
+
   return {
     addresses: {
       evmAddress: evmNode.address,
@@ -184,6 +305,8 @@ export function deriveWalletFromMnemonic(
       solanaPath,
       bitcoinAddress: btc.address,
       bitcoinPath,
+      moneroAddress: xmr.address,
+      moneroPath,
     },
     secrets: {
       mnemonic: normalized,
@@ -191,19 +314,51 @@ export function deriveWalletFromMnemonic(
       evmPrivateKey: evmNode.privateKey,
       solanaSecretBase58,
       bitcoinPrivateKeyHex: btc.privateKeyHex,
+      moneroSpendKeyHex: xmr.spendKeyHex,
+      moneroViewKeyHex: xmr.viewKeyHex,
     },
   };
 }
 
-export function deriveWalletFromPrivateKey(rawInput: string): {
-  family: 'evm' | 'solana';
+export function deriveWalletFromPrivateKey(
+  rawInput: string,
+  keyType: 'auto' | 'evm' | 'solana' | 'monero' = 'auto'
+): {
+  family: 'evm' | 'solana' | 'monero';
   addresses: DerivedAddresses;
   secrets: UnlockedSecrets;
 } {
   const trimmed = rawInput.trim();
 
+  // Check explicit Monero Private Spend Key (or xmr:<64-hex> prefix)
+  if (keyType === 'monero' || /^xmr:/i.test(trimmed)) {
+    const cleanHex = trimmed.replace(/^xmr:/i, '').replace(/^0x/i, '');
+    if (!/^[0-9a-fA-F]{64}$/.test(cleanHex)) {
+      throw new Error('Monero private spend key must be 64 hexadecimal characters (32 bytes).');
+    }
+    const spendBytes = getBytes(`0x${cleanHex}`);
+    const xmr = deriveMoneroFromSpendBytes(spendBytes);
+    return {
+      family: 'monero',
+      addresses: {
+        evmAddress: '',
+        evmPath: 'N/A',
+        solanaAddress: '',
+        solanaPath: 'N/A',
+        bitcoinAddress: '',
+        bitcoinPath: 'N/A',
+        moneroAddress: xmr.address,
+        moneroPath: 'Imported Monero Spend Key',
+      },
+      secrets: {
+        moneroSpendKeyHex: xmr.spendKeyHex,
+        moneroViewKeyHex: xmr.viewKeyHex,
+      },
+    };
+  }
+
   // Check EVM hex private key
-  if (/^(0x)?[0-9a-fA-F]{64}$/.test(trimmed)) {
+  if ((keyType === 'auto' || keyType === 'evm') && /^(0x)?[0-9a-fA-F]{64}$/.test(trimmed)) {
     const normalizedHex = trimmed.startsWith('0x') ? trimmed : `0x${trimmed}`;
     const wallet = new Wallet(normalizedHex);
     return {
@@ -215,6 +370,8 @@ export function deriveWalletFromPrivateKey(rawInput: string): {
         solanaPath: 'N/A',
         bitcoinAddress: '',
         bitcoinPath: 'N/A',
+        moneroAddress: '',
+        moneroPath: 'N/A',
       },
       secrets: {
         evmPrivateKey: wallet.privateKey,
@@ -223,34 +380,40 @@ export function deriveWalletFromPrivateKey(rawInput: string): {
   }
 
   // Check Solana Base58 private key (64-byte secret key or 32-byte seed)
-  try {
-    const decoded = bs58.decode(trimmed);
-    if (decoded.length === 64 || decoded.length === 32) {
-      const seed32 = decoded.slice(0, 32);
-      const pub = ed25519.getPublicKey(seed32);
-      const full64 = new Uint8Array(64);
-      full64.set(seed32, 0);
-      full64.set(pub, 32);
-      return {
-        family: 'solana',
-        addresses: {
-          evmAddress: '',
-          evmPath: 'N/A',
-          solanaAddress: bs58.encode(pub),
-          solanaPath: 'Imported Solana Key',
-          bitcoinAddress: '',
-          bitcoinPath: 'N/A',
-        },
-        secrets: {
-          solanaSecretBase58: bs58.encode(full64),
-        },
-      };
+  if (keyType === 'auto' || keyType === 'solana') {
+    try {
+      const decoded = bs58.decode(trimmed);
+      if (decoded.length === 64 || decoded.length === 32) {
+        const seed32 = decoded.slice(0, 32);
+        const pub = ed25519.getPublicKey(seed32);
+        const full64 = new Uint8Array(64);
+        full64.set(seed32, 0);
+        full64.set(pub, 32);
+        return {
+          family: 'solana',
+          addresses: {
+            evmAddress: '',
+            evmPath: 'N/A',
+            solanaAddress: bs58.encode(pub),
+            solanaPath: 'Imported Solana Key',
+            bitcoinAddress: '',
+            bitcoinPath: 'N/A',
+            moneroAddress: '',
+            moneroPath: 'N/A',
+          },
+          secrets: {
+            solanaSecretBase58: bs58.encode(full64),
+          },
+        };
+      }
+    } catch {
+      // Not valid base58
     }
-  } catch {
-    // Not valid base58
   }
 
-  throw new Error('Invalid private key. Enter a 64-char EVM hex key or Solana Base58 secret key.');
+  throw new Error(
+    'Invalid private key. Enter a 64-char EVM hex key, Solana Base58 secret key, or switch to Monero Private Spend Key.'
+  );
 }
 
 export function shortenAddress(addr: string, start = 6, end = 4): string {
@@ -273,4 +436,18 @@ export function isValidBitcoinAddress(address: string): boolean {
   if (/^(bc1|tb1)[a-zA-HJ-NP-Z0-9]{25,62}$/.test(trimmed)) return true;
   if (/^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$/.test(trimmed)) return true;
   return false;
+}
+
+export function isValidMoneroAddress(address: string): boolean {
+  const trimmed = address.trim();
+  if (trimmed.length !== 95 && trimmed.length !== 106) return false;
+  if (!/^[48][1-9A-HJ-NP-Za-km-z]+$/.test(trimmed)) return false;
+  const decoded = moneroBase58Decode(trimmed);
+  if (!decoded || (decoded.length !== 69 && decoded.length !== 77)) return false;
+  const prefix = decoded[0];
+  if (prefix !== 0x12 && prefix !== 0x2a && prefix !== 0x13) return false;
+  const payload = decoded.subarray(0, decoded.length - 4);
+  const checksum = decoded.subarray(decoded.length - 4);
+  const expected = getBytes(keccak256(payload)).slice(0, 4);
+  return checksum.every((b, idx) => b === expected[idx]);
 }

@@ -5,6 +5,7 @@ import {
   ArrowUpRight,
   BellPlus,
   ExternalLink,
+  Link2,
   Plus,
   RefreshCw,
   Search,
@@ -31,11 +32,14 @@ interface PortfolioViewProps {
   transactions: WalletTransaction[];
   currency: 'USD' | 'EUR' | 'GBP';
   loadingPortfolio: boolean;
+  isNewlyCreated?: boolean;
+  connectedExternalName?: string | null;
   onRefresh: () => void;
   onNavigateSend: (networkId?: NetworkId, symbol?: string) => void;
   onNavigateReceive: (networkId?: NetworkId) => void;
   onNavigateSwap: (symbol?: string) => void;
   onNavigateAlert: (coinId?: string) => void;
+  onNavigateSweep: () => void;
   onAddCustomToken: (token: TokenConfig) => void;
 }
 
@@ -48,11 +52,14 @@ export function PortfolioView({
   transactions,
   currency,
   loadingPortfolio,
+  isNewlyCreated,
+  connectedExternalName,
   onRefresh,
   onNavigateSend,
   onNavigateReceive,
   onNavigateSwap,
   onNavigateAlert,
+  onNavigateSweep,
   onAddCustomToken,
 }: PortfolioViewProps) {
   const [selectedNetwork, setSelectedNetwork] = useState<NetworkId | 'all'>('all');
@@ -223,39 +230,72 @@ export function PortfolioView({
           </div>
 
           {/* Primary Actions */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
-            <button
-              type="button"
-              onClick={() => onNavigateSend()}
-              className="flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs transition-colors whitespace-nowrap"
-            >
-              <ArrowUpRight className="w-4 h-4" />
-              <span>Send</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigateReceive()}
-              className="flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-[#F4F6F9] font-medium text-xs border border-white/10 transition-colors whitespace-nowrap"
-            >
-              <ArrowDownLeft className="w-4 h-4" />
-              <span>Receive</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigateSwap()}
-              className="flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-[#F4F6F9] font-medium text-xs border border-white/10 transition-colors whitespace-nowrap"
-            >
-              <ArrowLeftRight className="w-4 h-4" />
-              <span>Swap</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onNavigateAlert(chartCoinId)}
-              className="flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-[#F4F6F9] font-medium text-xs border border-white/10 transition-colors whitespace-nowrap"
-            >
-              <BellPlus className="w-4 h-4" />
-              <span>Alert</span>
-            </button>
+          <div className="space-y-2.5">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              <button
+                type="button"
+                onClick={() => onNavigateSend()}
+                className="flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-[#090B0F] font-semibold text-xs transition-colors whitespace-nowrap"
+              >
+                <ArrowUpRight className="w-4 h-4" />
+                <span>Send</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigateReceive()}
+                className="flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-[#F4F6F9] font-medium text-xs border border-white/10 transition-colors whitespace-nowrap"
+              >
+                <ArrowDownLeft className="w-4 h-4" />
+                <span>Receive</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigateSwap()}
+                className="flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-[#F4F6F9] font-medium text-xs border border-white/10 transition-colors whitespace-nowrap"
+              >
+                <ArrowLeftRight className="w-4 h-4" />
+                <span>Swap</span>
+              </button>
+              <button
+                type="button"
+                onClick={onNavigateSweep}
+                className="flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-emerald-400 font-medium text-xs border border-emerald-500/30 transition-colors whitespace-nowrap"
+              >
+                <Link2 className="w-4 h-4" />
+                <span>Sweep</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onNavigateAlert(chartCoinId)}
+                className="col-span-2 sm:col-span-1 flex items-center justify-center gap-1.5 py-2.5 px-2.5 rounded-lg bg-[#1A2130] hover:bg-[#232C3F] text-[#F4F6F9] font-medium text-xs border border-white/10 transition-colors whitespace-nowrap"
+              >
+                <BellPlus className="w-4 h-4" />
+                <span>Alert</span>
+              </button>
+            </div>
+
+            {(isNewlyCreated || connectedExternalName) && (
+              <div className="p-3 rounded-lg bg-[#090B0F] border border-emerald-500/30 flex items-center justify-between gap-3">
+                <div className="min-w-0 text-[11px] text-[#CBD5E1]">
+                  {connectedExternalName ? (
+                    <span>
+                      External wallet <strong className="text-emerald-400">{connectedExternalName}</strong> connected — sweep funds into {wallet.name}.
+                    </span>
+                  ) : (
+                    <span>
+                      <strong className="text-emerald-400">Vault ready</strong> — connect MetaMask/Phantom or sweep another seed phrase into this address.
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={onNavigateSweep}
+                  className="shrink-0 px-2.5 py-1 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-[11px] font-medium text-emerald-400 whitespace-nowrap"
+                >
+                  Connect & Sweep
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -269,7 +309,7 @@ export function PortfolioView({
                 aria-label="Select asset chart"
                 className="bg-[#090B0F] border border-white/10 rounded-lg px-2.5 py-1.5 text-xs font-medium text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
               >
-                {markets.slice(0, 10).map((m) => (
+                {markets.map((m) => (
                   <option key={m.id} value={m.id}>
                     {m.name} ({m.symbol})
                   </option>

@@ -74,7 +74,7 @@ service cloud.firestore {
         && data.keys().hasOnly([
           'id', 'ownerUid', 'name', 'walletType', 'wordCount', 'preset',
           'accountIndex', 'evmAddress', 'solanaAddress', 'bitcoinAddress',
-          'encryptedSecret', 'createdAt', 'updatedAt'
+          'moneroAddress', 'encryptedSecret', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && isValidId(data.ownerUid)
@@ -86,6 +86,7 @@ service cloud.firestore {
         && (!('evmAddress' in data) || (data.evmAddress is string && data.evmAddress.size() <= 100))
         && (!('solanaAddress' in data) || (data.solanaAddress is string && data.solanaAddress.size() <= 100))
         && (!('bitcoinAddress' in data) || (data.bitcoinAddress is string && data.bitcoinAddress.size() <= 100))
+        && (!('moneroAddress' in data) || (data.moneroAddress is string && data.moneroAddress.size() <= 120))
         && (!('encryptedSecret' in data) || (data.encryptedSecret is string && data.encryptedSecret.size() <= 4096))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
@@ -120,16 +121,17 @@ service cloud.firestore {
         ])
         && data.keys().hasOnly([
           'id', 'tier', 'label', 'networkFamily', 'evmAddress',
-          'solanaAddress', 'bitcoinAddress', 'quorum', 'allocationCapPct',
+          'solanaAddress', 'bitcoinAddress', 'moneroAddress', 'quorum', 'allocationCapPct',
           'status', 'encryptedVaultBlob', 'createdBy', 'createdAt', 'updatedAt'
         ])
         && isValidId(data.id)
         && data.tier in ['cold', 'pool', 'hot']
         && data.label is string && data.label.size() >= 1 && data.label.size() <= 100
-        && data.networkFamily in ['multi-chain', 'evm', 'solana', 'bitcoin']
+        && data.networkFamily in ['multi-chain', 'evm', 'solana', 'bitcoin', 'monero']
         && (!('evmAddress' in data) || (data.evmAddress is string && data.evmAddress.size() <= 100))
         && (!('solanaAddress' in data) || (data.solanaAddress is string && data.solanaAddress.size() <= 100))
         && (!('bitcoinAddress' in data) || (data.bitcoinAddress is string && data.bitcoinAddress.size() <= 100))
+        && (!('moneroAddress' in data) || (data.moneroAddress is string && data.moneroAddress.size() <= 120))
         && data.quorum is string && data.quorum.size() >= 1 && data.quorum.size() <= 32
         && data.allocationCapPct is number && data.allocationCapPct >= 0 && data.allocationCapPct <= 100
         && data.status in ['active', 'frozen', 'sweeping']
@@ -239,7 +241,8 @@ service cloud.firestore {
           && incoming().walletType == existing().walletType
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
-          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'encryptedSecret', 'updatedAt']);
+          && (!('moneroAddress' in existing()) || incoming().moneroAddress == existing().moneroAddress)
+          && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'encryptedSecret', 'moneroAddress', 'updatedAt']);
 
         allow delete: if isValidId(userId) && isValidId(walletId) && (isOwner(userId) || isAdmin());
       }

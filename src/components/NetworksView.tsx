@@ -33,6 +33,7 @@ export function NetworksView({ wallet, onNavigateTransfer }: NetworksViewProps) 
   const getAddressForFamily = (family: string) => {
     if (family === 'evm') return wallet.addresses.evmAddress;
     if (family === 'solana') return wallet.addresses.solanaAddress;
+    if (family === 'monero') return wallet.addresses.moneroAddress || '';
     return wallet.addresses.bitcoinAddress;
   };
 
@@ -132,7 +133,13 @@ export function NetworksView({ wallet, onNavigateTransfer }: NetworksViewProps) 
               <div className="flex items-center justify-between gap-2 text-xs pt-1">
                 <span className="font-mono text-[11px] text-[#8A94A6] tabular-nums">
                   {tel?.gasGwei !== null && tel?.gasGwei !== undefined
-                    ? `Fee: ${tel.gasGwei} ${net.family === 'solana' ? 'SOL' : 'Gwei'}`
+                    ? `Fee: ${tel.gasGwei} ${
+                        net.family === 'solana'
+                          ? 'SOL'
+                          : net.family === 'monero'
+                          ? 'XMR'
+                          : 'Gwei'
+                      }`
                     : 'Fee: Live Mempool'}
                 </span>
                 <div className="flex items-center gap-2">
@@ -152,7 +159,11 @@ export function NetworksView({ wallet, onNavigateTransfer }: NetworksViewProps) 
                   </button>
                   {address && (
                     <a
-                      href={`${net.explorerUrl}/address/${address}`}
+                      href={
+                        net.family === 'monero'
+                          ? net.explorerUrl
+                          : `${net.explorerUrl}/address/${address}`
+                      }
                       target="_blank"
                       rel="noreferrer"
                       className="p-1.5 rounded bg-[#090B0F] border border-white/10 text-[#8A94A6] hover:text-[#F4F6F9]"

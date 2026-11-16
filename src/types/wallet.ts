@@ -8,9 +8,10 @@ export type NetworkId =
   | 'avalanche'
   | 'solana'
   | 'bitcoin'
+  | 'monero'
   | 'sepolia';
 
-export type NetworkFamily = 'evm' | 'solana' | 'bitcoin';
+export type NetworkFamily = 'evm' | 'solana' | 'bitcoin' | 'monero';
 
 export type WalletPresetId =
   | 'standard'
@@ -57,6 +58,8 @@ export interface DerivedAddresses {
   bitcoinAddress: string;
   bitcoinPrivateKeyHex?: string;
   bitcoinPath: string;
+  moneroAddress: string;
+  moneroPath: string;
 }
 
 export interface WalletAccount {
@@ -77,6 +80,8 @@ export interface UnlockedSecrets {
   evmPrivateKey?: string;
   solanaSecretBase58?: string;
   bitcoinPrivateKeyHex?: string;
+  moneroSpendKeyHex?: string;
+  moneroViewKeyHex?: string;
 }
 
 export interface MarketCoin {
@@ -115,7 +120,7 @@ export interface PortfolioHolding {
 export interface WalletTransaction {
   hash: string;
   networkId: NetworkId;
-  type: 'send' | 'receive' | 'swap' | 'on-chain';
+  type: 'send' | 'receive' | 'swap' | 'sweep' | 'on-chain';
   status: 'confirmed' | 'pending' | 'signed-sandbox' | 'failed';
   from: string;
   to: string;
@@ -167,10 +172,11 @@ export interface ExchangeTreasuryWallet {
   id: string;
   tier: ExchangeWalletTier;
   label: string;
-  networkFamily: 'multi-chain' | 'evm' | 'solana' | 'bitcoin';
+  networkFamily: 'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero';
   evmAddress?: string;
   solanaAddress?: string;
   bitcoinAddress?: string;
+  moneroAddress?: string;
   quorum: string;
   allocationCapPct: number;
   status: 'active' | 'frozen' | 'sweeping';
@@ -208,4 +214,30 @@ export interface ExchangeSystemConfig {
   swapFeeBps: number;
   updatedBy: string;
   updatedAt: number;
+}
+
+export interface Eip1193Provider {
+  request: (args: { method: string; params?: unknown[] | Record<string, unknown> }) => Promise<unknown>;
+  on?: (event: string, listener: (...args: unknown[]) => void) => void;
+  removeListener?: (event: string, listener: (...args: unknown[]) => void) => void;
+}
+
+export interface DiscoveredWalletProvider {
+  uuid: string;
+  name: string;
+  icon?: string;
+  rdns?: string;
+  kind: 'evm' | 'solana';
+  provider?: Eip1193Provider;
+}
+
+export interface ConnectedExternalWallet {
+  id: string;
+  name: string;
+  icon?: string;
+  rdns?: string;
+  kind: 'evm' | 'solana';
+  address: string;
+  chainId?: number;
+  connectedAt: number;
 }

@@ -88,7 +88,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   // Generate Exchange Wallet Form
   const [genTier, setGenTier] = useState<ExchangeWalletTier>('cold');
   const [genLabel, setGenLabel] = useState('Cold Treasury Vault #01');
-  const [genFamily, setGenFamily] = useState<'multi-chain' | 'evm' | 'solana' | 'bitcoin'>('multi-chain');
+  const [genFamily, setGenFamily] = useState<'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero'>('multi-chain');
   const [genQuorum, setGenQuorum] = useState('3-of-5 Multi-Sig');
   const [genCapPct, setGenCapPct] = useState(85);
   const [genWordCount, setGenWordCount] = useState<12 | 24>(24);
@@ -101,6 +101,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     evmPrivateKey?: string;
     solanaSecretBase58?: string;
     bitcoinPrivateKeyHex?: string;
+    moneroSpendKeyHex?: string;
+    moneroViewKeyHex?: string;
   } | null>(null);
 
   // Decrypt Existing Exchange Wallet Modal/Inline
@@ -683,14 +685,17 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                   <select
                     value={genFamily}
                     onChange={(e) =>
-                      setGenFamily(e.target.value as 'multi-chain' | 'evm' | 'solana' | 'bitcoin')
+                      setGenFamily(
+                        e.target.value as 'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero'
+                      )
                     }
                     className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9]"
                   >
-                    <option value="multi-chain">Multi-Chain (EVM+SOL+BTC)</option>
+                    <option value="multi-chain">Multi-Chain (EVM+SOL+BTC+XMR)</option>
                     <option value="evm">EVM Only</option>
                     <option value="solana">Solana Only</option>
                     <option value="bitcoin">Bitcoin SegWit Only</option>
+                    <option value="monero">Monero (XMR) Only</option>
                   </select>
                 </div>
                 <div>
@@ -781,6 +786,22 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                       <div className="text-[11px] text-[#8A94A6]">EVM Private Key:</div>
                       <div className="font-mono text-[11px] text-[#F4F6F9] break-all">
                         {newlyGeneratedSecret.evmPrivateKey}
+                      </div>
+                    </div>
+                  )}
+                  {newlyGeneratedSecret.moneroSpendKeyHex && (
+                    <div>
+                      <div className="text-[11px] text-[#8A94A6]">Monero Private Spend Key:</div>
+                      <div className="font-mono text-[11px] text-[#FF6600] break-all">
+                        {newlyGeneratedSecret.moneroSpendKeyHex}
+                      </div>
+                    </div>
+                  )}
+                  {newlyGeneratedSecret.moneroViewKeyHex && (
+                    <div>
+                      <div className="text-[11px] text-[#8A94A6]">Monero Private View Key:</div>
+                      <div className="font-mono text-[11px] text-orange-300 break-all">
+                        {newlyGeneratedSecret.moneroViewKeyHex}
                       </div>
                     </div>
                   )}
@@ -888,7 +909,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                       </div>
                     </div>
 
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] font-mono">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 text-[11px] font-mono">
                       {ew.evmAddress && (
                         <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
                           <span className="truncate text-[#CBD5E1]">
@@ -936,6 +957,24 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                             className="text-[#8A94A6] hover:text-[#F4F6F9]"
                           >
                             {copiedKey === `${ew.id}-btc` ? (
+                              <Check className="w-3 h-3 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3 h-3" />
+                            )}
+                          </button>
+                        </div>
+                      )}
+                      {ew.moneroAddress && (
+                        <div className="p-2.5 rounded bg-[#090B0F] border border-white/10 flex items-center justify-between gap-2">
+                          <span className="truncate text-[#FF6600]">
+                            XMR: {shortenAddress(ew.moneroAddress, 8, 6)}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => handleCopy(`${ew.id}-xmr`, ew.moneroAddress!)}
+                            className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                          >
+                            {copiedKey === `${ew.id}-xmr` ? (
                               <Check className="w-3 h-3 text-emerald-400" />
                             ) : (
                               <Copy className="w-3 h-3" />
@@ -996,6 +1035,22 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                                 <span className="text-[#8A94A6]">BTC Key Hex: </span>
                                 <span className="text-amber-400">
                                   {inspectedSecrets.bitcoinPrivateKeyHex}
+                                </span>
+                              </div>
+                            )}
+                            {inspectedSecrets.moneroSpendKeyHex && (
+                              <div className="break-all">
+                                <span className="text-[#8A94A6]">XMR Spend Key: </span>
+                                <span className="text-[#FF6600]">
+                                  {inspectedSecrets.moneroSpendKeyHex}
+                                </span>
+                              </div>
+                            )}
+                            {inspectedSecrets.moneroViewKeyHex && (
+                              <div className="break-all">
+                                <span className="text-[#8A94A6]">XMR View Key: </span>
+                                <span className="text-orange-300">
+                                  {inspectedSecrets.moneroViewKeyHex}
                                 </span>
                               </div>
                             )}

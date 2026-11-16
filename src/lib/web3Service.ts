@@ -358,6 +358,30 @@ export async function fetchMultiChainPortfolio(
       tasks.push(fetchSolanaBalances(addresses.solanaAddress, allTokens, priceMap));
     } else if (net.family === 'bitcoin' && addresses.bitcoinAddress) {
       tasks.push(fetchBitcoinBalance(addresses.bitcoinAddress, priceMap));
+    } else if (net.family === 'monero' && addresses.moneroAddress) {
+      tasks.push(
+        (async (): Promise<PortfolioHolding[]> => {
+          const market = priceMap.get('monero');
+          return [
+            {
+              id: 'monero:native',
+              networkId: 'monero',
+              networkName: 'Monero',
+              symbol: 'XMR',
+              name: 'Monero',
+              address: 'native',
+              decimals: 12,
+              coinGeckoId: 'monero',
+              balance: 0,
+              balanceRaw: '0',
+              priceUsd: market?.current_price ?? 0,
+              change24h: market?.price_change_percentage_24h ?? 0,
+              valueUsd: 0,
+              isNative: true,
+            },
+          ];
+        })()
+      );
     }
   }
 
@@ -399,6 +423,17 @@ export async function fetchNetworkTelemetries(): Promise<NetworkTelemetry[]> {
             gasGwei: 0.000005,
             latencyMs: Math.round(performance.now() - start),
             healthy: Boolean(json.result),
+          };
+        }
+        if (net.family === 'monero') {
+          const resp = await fetch('/api/monero/info');
+          const json = (await resp.json()) as { height?: number | null; healthy?: boolean };
+          return {
+            networkId: net.id,
+            blockHeight: json.height ?? null,
+            gasGwei: 0.00002,
+            latencyMs: Math.round(performance.now() - start),
+            healthy: Boolean(json.healthy),
           };
         }
         // Bitcoin

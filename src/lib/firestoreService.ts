@@ -160,6 +160,8 @@ export async function fetchUserWalletsFromCloud(uid: string): Promise<WalletAcco
           solanaPath: "m/44'/501'/0'/0'",
           bitcoinAddress: data.bitcoinAddress || '',
           bitcoinPath: "m/84'/0'/0'/0/0",
+          moneroAddress: data.moneroAddress || '',
+          moneroPath: "m/44'/128'/0'/0'",
         },
         encryptedSecret: data.encryptedSecret,
         createdAt: toMillis(data.createdAt),
@@ -176,10 +178,14 @@ export async function saveUserWalletToCloud(uid: string, wallet: WalletAccount):
   try {
     const existing = await getDoc(doc(db, 'users', uid, 'wallets', safeId));
     if (existing.exists()) {
+      const existingData = existing.data();
       await updateDoc(doc(db, 'users', uid, 'wallets', safeId), {
         name: wallet.name.slice(0, 80),
         ...(wallet.encryptedSecret
           ? { encryptedSecret: wallet.encryptedSecret.slice(0, 4096) }
+          : {}),
+        ...(!existingData.moneroAddress && wallet.addresses.moneroAddress
+          ? { moneroAddress: wallet.addresses.moneroAddress.slice(0, 120) }
           : {}),
         updatedAt: serverTimestamp(),
       });
@@ -200,6 +206,8 @@ export async function saveUserWalletToCloud(uid: string, wallet: WalletAccount):
         payload.solanaAddress = wallet.addresses.solanaAddress.slice(0, 100);
       if (wallet.addresses.bitcoinAddress)
         payload.bitcoinAddress = wallet.addresses.bitcoinAddress.slice(0, 100);
+      if (wallet.addresses.moneroAddress)
+        payload.moneroAddress = wallet.addresses.moneroAddress.slice(0, 120);
       if (wallet.encryptedSecret)
         payload.encryptedSecret = wallet.encryptedSecret.slice(0, 4096);
 
@@ -401,6 +409,7 @@ export async function listExchangeWallets(): Promise<ExchangeTreasuryWallet[]> {
           evmAddress: data.evmAddress,
           solanaAddress: data.solanaAddress,
           bitcoinAddress: data.bitcoinAddress,
+          moneroAddress: data.moneroAddress,
           quorum: data.quorum,
           allocationCapPct: data.allocationCapPct,
           status: data.status,
@@ -419,7 +428,7 @@ export async function listExchangeWallets(): Promise<ExchangeTreasuryWallet[]> {
 export async function generateAndSaveExchangeWallet(params: {
   tier: ExchangeWalletTier;
   label: string;
-  networkFamily: 'multi-chain' | 'evm' | 'solana' | 'bitcoin';
+  networkFamily: 'multi-chain' | 'evm' | 'solana' | 'bitcoin' | 'monero';
   quorum: string;
   allocationCapPct: number;
   wordCount: 12 | 24;
@@ -461,6 +470,9 @@ export async function generateAndSaveExchangeWallet(params: {
   if (params.networkFamily === 'multi-chain' || params.networkFamily === 'bitcoin') {
     payload.bitcoinAddress = derived.addresses.bitcoinAddress;
   }
+  if (params.networkFamily === 'multi-chain' || params.networkFamily === 'monero') {
+    payload.moneroAddress = derived.addresses.moneroAddress;
+  }
 
   try {
     await setDoc(doc(db, 'exchange_wallets', id), payload);
@@ -483,6 +495,7 @@ export async function generateAndSaveExchangeWallet(params: {
       evmAddress: payload.evmAddress as string | undefined,
       solanaAddress: payload.solanaAddress as string | undefined,
       bitcoinAddress: payload.bitcoinAddress as string | undefined,
+      moneroAddress: payload.moneroAddress as string | undefined,
       quorum: params.quorum,
       allocationCapPct: params.allocationCapPct,
       status: 'active',
@@ -496,6 +509,8 @@ export async function generateAndSaveExchangeWallet(params: {
       evmPrivateKey: derived.secrets.evmPrivateKey,
       solanaSecretBase58: derived.secrets.solanaSecretBase58,
       bitcoinPrivateKeyHex: derived.secrets.bitcoinPrivateKeyHex,
+      moneroSpendKeyHex: derived.secrets.moneroSpendKeyHex,
+      moneroViewKeyHex: derived.secrets.moneroViewKeyHex,
     },
   };
 }

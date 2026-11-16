@@ -49,6 +49,7 @@ const TOKEN_COLORS: Record<string, string> = {
   LINK: '#375BD2',
   UNI: '#FF007A',
   AAVE: '#B6509E',
+  XMR: '#FF6600',
 };
 
 export function TokenAvatar({ symbol, size = 32 }: TokenAvatarProps) {

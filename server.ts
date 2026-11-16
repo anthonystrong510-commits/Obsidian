@@ -41,6 +41,7 @@ const TRACKED_COINS: Array<{ id: string; symbol: string; name: string }> = [
   { id: 'wrapped-bitcoin', symbol: 'WBTC', name: 'Wrapped Bitcoin' },
   { id: 'dai', symbol: 'DAI', name: 'Dai' },
   { id: 'tron', symbol: 'TRX', name: 'TRON' },
+  { id: 'monero', symbol: 'XMR', name: 'Monero' },
 ];
 
 const RPC_ENDPOINTS: Record<string, string[]> = {
@@ -373,6 +374,43 @@ async function startServer() {
     }
 
     res.status(502).json({ error: 'Unable to fetch Bitcoin address info' });
+  });
+
+  // Monero daemon info (live height & fee estimate)
+  app.get('/api/monero/info', async (_req: Request, res: Response) => {
+    const nodes = [
+      'https://xmr-node.cakewallet.com:18081/json_rpc',
+      'https://node.moneroworld.com:18089/json_rpc',
+    ];
+    for (const nodeUrl of nodes) {
+      try {
+        const resp = await fetchWithTimeout(
+          nodeUrl,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ jsonrpc: '2.0', id: '0', method: 'get_info' }),
+          },
+          6000
+        );
+        if (resp.ok) {
+          const json = (await resp.json()) as {
+            result?: { height?: number; target?: number; status?: string };
+          };
+          if (json.result?.height) {
+            res.json({
+              height: json.result.height,
+              healthy: true,
+              node: nodeUrl,
+            });
+            return;
+          }
+        }
+      } catch {
+        // try next public Monero daemon
+      }
+    }
+    res.json({ height: null, healthy: false });
   });
 
   // On-chain transaction history via Blockscout / Solana RPC

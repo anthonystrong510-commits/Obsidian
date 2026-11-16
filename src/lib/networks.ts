@@ -327,6 +327,28 @@ export const NETWORKS: NetworkConfig[] = [
     ],
   },
   {
+    id: 'monero',
+    name: 'Monero',
+    shortName: 'XMR',
+    family: 'monero',
+    symbol: 'XMR',
+    decimals: 12,
+    coinGeckoId: 'monero',
+    explorerUrl: 'https://xmrchain.net',
+    color: '#FF6600',
+    defaultDerivationPath: "m/44'/128'/0'/0'",
+    tokens: [
+      {
+        symbol: 'XMR',
+        name: 'Monero',
+        decimals: 12,
+        address: 'native',
+        coinGeckoId: 'monero',
+        networkId: 'monero',
+      },
+    ],
+  },
+  {
     id: 'sepolia',
     name: 'Sepolia Testnet',
     shortName: 'SEP',
@@ -364,6 +386,7 @@ export interface WalletPresetInfo {
   evmPathTemplate: (index: number) => string;
   solanaPathTemplate: (index: number) => string;
   bitcoinPathTemplate: (index: number) => string;
+  moneroPathTemplate: (index: number) => string;
 }
 
 export const WALLET_PRESETS: WalletPresetInfo[] = [
@@ -375,6 +398,7 @@ export const WALLET_PRESETS: WalletPresetInfo[] = [
     evmPathTemplate: (i) => `m/44'/60'/0'/0/${i}`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'/0'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/0'/0/${i}`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
   {
     id: 'metamask',
@@ -384,6 +408,7 @@ export const WALLET_PRESETS: WalletPresetInfo[] = [
     evmPathTemplate: (i) => `m/44'/60'/0'/0/${i}`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'/0'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/0'/0/${i}`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
   {
     id: 'phantom',
@@ -393,6 +418,7 @@ export const WALLET_PRESETS: WalletPresetInfo[] = [
     evmPathTemplate: (i) => `m/44'/60'/0'/0/${i}`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'/0'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/0'/0/${i}`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
   {
     id: 'ledger',
@@ -402,6 +428,7 @@ export const WALLET_PRESETS: WalletPresetInfo[] = [
     evmPathTemplate: (i) => `m/44'/60'/${i}'/0/0`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/${i}'/0/0`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
   {
     id: 'trust',
@@ -411,6 +438,7 @@ export const WALLET_PRESETS: WalletPresetInfo[] = [
     evmPathTemplate: (i) => `m/44'/60'/0'/0/${i}`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'/0'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/0'/0/${i}`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
   {
     id: 'coinbase',
@@ -420,15 +448,17 @@ export const WALLET_PRESETS: WalletPresetInfo[] = [
     evmPathTemplate: (i) => `m/44'/60'/0'/0/${i}`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'/0'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/0'/0/${i}`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
   {
     id: 'electrum',
-    name: 'Electrum / Coldcard BTC',
-    subtitle: 'Native SegWit bc1q BIP-84 focus',
+    name: 'Electrum / Coldcard / Cake',
+    subtitle: 'SegWit BTC & Monero XMR multi-chain',
     defaultWords: 24,
     evmPathTemplate: (i) => `m/44'/60'/0'/0/${i}`,
     solanaPathTemplate: (i) => `m/44'/501'/${i}'/0'`,
     bitcoinPathTemplate: (i) => `m/84'/0'/0'/0/${i}`,
+    moneroPathTemplate: (i) => `m/44'/128'/${i}'/0'`,
   },
 ];
 
@@ -443,6 +473,7 @@ export const SWAP_TOKENS: Array<{
   { symbol: 'USDC', name: 'USD Coin', coinGeckoId: 'usd-coin', decimals: 6, supportedNetworks: ['ethereum', 'arbitrum', 'base', 'optimism', 'polygon', 'avalanche', 'solana'] },
   { symbol: 'USDT', name: 'Tether USD', coinGeckoId: 'tether', decimals: 6, supportedNetworks: ['ethereum', 'bsc', 'arbitrum', 'polygon'] },
   { symbol: 'BTC', name: 'Bitcoin', coinGeckoId: 'bitcoin', decimals: 8, supportedNetworks: ['bitcoin'] },
+  { symbol: 'XMR', name: 'Monero', coinGeckoId: 'monero', decimals: 12, supportedNetworks: ['monero'] },
   { symbol: 'WBTC', name: 'Wrapped Bitcoin', coinGeckoId: 'wrapped-bitcoin', decimals: 8, supportedNetworks: ['ethereum', 'arbitrum', 'polygon'] },
   { symbol: 'SOL', name: 'Solana', coinGeckoId: 'solana', decimals: 9, supportedNetworks: ['solana'] },
   { symbol: 'BNB', name: 'BNB', coinGeckoId: 'binancecoin', decimals: 18, supportedNetworks: ['bsc'] },

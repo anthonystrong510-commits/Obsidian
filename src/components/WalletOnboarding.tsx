@@ -20,6 +20,7 @@ import {
   deriveWalletFromPrivateKey,
   generateMnemonicWords,
   isValidBitcoinAddress,
+  isValidMoneroAddress,
   isValidSolanaAddress,
   normalizePhrase,
   shortenAddress,
@@ -79,6 +80,7 @@ export function WalletOnboarding({
   const [customEvmPath, setCustomEvmPath] = useState('');
 
   // Import Private Key State
+  const [privateKeyType, setPrivateKeyType] = useState<'auto' | 'monero'>('auto');
   const [privateKeyInput, setPrivateKeyInput] = useState('');
   const [keyWalletName, setKeyWalletName] = useState('Imported Key');
 
@@ -309,7 +311,7 @@ export function WalletOnboarding({
     setError('');
     setSubmitting(true);
     try {
-      const derived = deriveWalletFromPrivateKey(privateKeyInput);
+      const derived = deriveWalletFromPrivateKey(privateKeyInput, privateKeyType);
       const pw = await validateAndPreparePassword();
       if (!pw) {
         setSubmitting(false);
@@ -337,7 +339,7 @@ export function WalletOnboarding({
     setError('');
     const target = (overrideInput ?? watchInput).trim();
     if (!target) {
-      setError('Enter an EVM address, ENS name (e.g. vitalik.eth), Solana, or Bitcoin address.');
+      setError('Enter an EVM address, ENS name (e.g. vitalik.eth), Solana, Bitcoin, or Monero (4...) address.');
       return;
     }
     setWatchResolving(true);
@@ -345,6 +347,7 @@ export function WalletOnboarding({
       let evmAddress = '';
       let solanaAddress = '';
       let bitcoinAddress = '';
+      let moneroAddress = '';
       let resolvedLabel = overrideName || watchName;
 
       if (target.includes('.')) {
@@ -362,8 +365,10 @@ export function WalletOnboarding({
         solanaAddress = target;
       } else if (isValidBitcoinAddress(target)) {
         bitcoinAddress = target;
+      } else if (isValidMoneroAddress(target)) {
+        moneroAddress = target;
       } else {
-        throw new Error('Unrecognized address format. Supports ENS, 0x EVM, Solana, or Bitcoin.');
+        throw new Error('Unrecognized address format. Supports ENS, 0x EVM, Solana, Bitcoin, or Monero (4.../8...).');
       }
 
       const pw = await validateAndPreparePassword();
@@ -384,6 +389,8 @@ export function WalletOnboarding({
           solanaPath: 'Watch-Only',
           bitcoinAddress,
           bitcoinPath: 'Watch-Only',
+          moneroAddress,
+          moneroPath: 'Watch-Only',
         },
         createdAt: Date.now(),
       };
@@ -416,7 +423,7 @@ export function WalletOnboarding({
             <p className="text-xs text-[#8A94A6]">
               <span>Non-custodial multi-chain derivation</span>
               <span className="mx-1.5 text-white/20">·</span>
-              <span>EVM, Solana & Bitcoin</span>
+              <span>EVM, Solana, Bitcoin & Monero</span>
             </p>
           </div>
         </div>
@@ -474,7 +481,7 @@ export function WalletOnboarding({
                     Generate Cryptographic Recovery Phrase
                   </h3>
                   <p className="text-xs text-[#8A94A6] mt-0.5">
-                    Select entropy strength. One phrase derives keys across all 10 networks.
+                    Select entropy strength. One phrase derives keys across all 11 networks including Monero (XMR).
                   </p>
                 </div>
                 <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
@@ -815,13 +822,39 @@ export function WalletOnboarding({
 
           {tab === 'import-key' && (
             <div className="space-y-4">
-              <div>
-                <h3 className="text-base font-semibold text-[#F4F6F9]">
-                  Import Raw Private Key
-                </h3>
-                <p className="text-xs text-[#8A94A6] mt-0.5">
-                  Supports 64-character EVM hex keys (Ethereum, Arbitrum, Base, Polygon, BSC) and Solana Base58 secret keys.
-                </p>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-semibold text-[#F4F6F9]">
+                    Import Raw Private Key
+                  </h3>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    Supports EVM hex keys, Solana Base58 secret keys, and Monero 64-char private spend keys.
+                  </p>
+                </div>
+                <div className="flex items-center gap-1 p-1 bg-[#090B0F] border border-white/10 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => setPrivateKeyType('auto')}
+                    className={`px-2.5 py-1 text-xs rounded transition-colors whitespace-nowrap ${
+                      privateKeyType === 'auto'
+                        ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                        : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                    }`}
+                  >
+                    EVM / Solana
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setPrivateKeyType('monero')}
+                    className={`px-2.5 py-1 text-xs rounded transition-colors whitespace-nowrap ${
+                      privateKeyType === 'monero'
+                        ? 'bg-[#FF6600] text-[#090B0F] font-semibold'
+                        : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                    }`}
+                  >
+                    Monero (XMR) Spend Key
+                  </button>
+                </div>
               </div>
               <div>
                 <label className="block text-xs text-[#8A94A6] mb-1.5">Wallet Label</label>
@@ -833,12 +866,20 @@ export function WalletOnboarding({
                 />
               </div>
               <div>
-                <label className="block text-xs text-[#8A94A6] mb-1.5">Private Key</label>
+                <label className="block text-xs text-[#8A94A6] mb-1.5">
+                  {privateKeyType === 'monero'
+                    ? 'Monero Private Spend Key (64-char Hex)'
+                    : 'Private Key'}
+                </label>
                 <textarea
                   rows={3}
                   value={privateKeyInput}
                   onChange={(e) => setPrivateKeyInput(e.target.value)}
-                  placeholder="0x... or Base58 Solana secret key"
+                  placeholder={
+                    privateKeyType === 'monero'
+                      ? '64-character hex Monero private spend key (automatically derives private view key & 4... address)'
+                      : '0x... EVM key, Base58 Solana secret key, or xmr:<hex>'
+                  }
                   spellCheck={false}
                   className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2.5 font-mono text-xs text-[#F4F6F9] placeholder-[#525D70] focus:outline-none focus:border-emerald-500/60"
                 />
@@ -874,7 +915,7 @@ export function WalletOnboarding({
                     type="text"
                     value={watchInput}
                     onChange={(e) => setWatchInput(e.target.value)}
-                    placeholder="vitalik.eth, 0x..., bc1q..., or Solana address"
+                    placeholder="vitalik.eth, 0x..., bc1q..., 4... (XMR), or Solana"
                     className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-xs text-[#F4F6F9] placeholder-[#525D70] focus:outline-none focus:border-emerald-500/60"
                   />
                 </div>
@@ -1038,8 +1079,8 @@ export function WalletOnboarding({
                 return (
                   <div className="p-4 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#64748B]">
                     {tab === 'import-seed'
-                      ? 'Complete all 12, 18, or 24 valid BIP-39 words to preview derived EVM, Solana, and Bitcoin addresses.'
-                      : 'Addresses are derived across Ethereum, Arbitrum, Base, Optimism, Polygon, BNB, Avalanche, Solana, and Bitcoin.'}
+                      ? 'Complete all 12, 18, or 24 valid BIP-39 words to preview derived EVM, Solana, Bitcoin, and Monero (XMR) addresses.'
+                      : 'Addresses are derived across Ethereum, Arbitrum, Base, Optimism, Polygon, BNB, Avalanche, Solana, Bitcoin, and Monero.'}
                   </div>
                 );
               }
@@ -1071,6 +1112,15 @@ export function WalletOnboarding({
                     </div>
                     <div className="font-mono text-xs text-amber-400 mt-1 truncate">
                       {shortenAddress(preview.bitcoinAddress, 10, 8)}
+                    </div>
+                  </div>
+                  <div className="p-3 rounded-lg bg-[#090B0F] border border-white/10">
+                    <div className="flex items-center justify-between text-[11px] text-[#8A94A6]">
+                      <span>Monero (CryptoNote XMR)</span>
+                      <span className="font-mono">{preview.moneroPath}</span>
+                    </div>
+                    <div className="font-mono text-xs text-[#FF6600] mt-1 truncate">
+                      {shortenAddress(preview.moneroAddress, 10, 8)}
                     </div>
                   </div>
                 </div>

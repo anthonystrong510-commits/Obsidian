@@ -13,7 +13,13 @@ import {
 } from 'lucide-react';
 import { isAddress } from 'ethers';
 import { NETWORKS, NETWORK_MAP } from '../lib/networks';
-import { isValidBitcoinAddress, isValidSolanaAddress, shortenAddress } from '../lib/crypto';
+import {
+  deriveWalletFromMnemonic,
+  isValidBitcoinAddress,
+  isValidMoneroAddress,
+  isValidSolanaAddress,
+  shortenAddress,
+} from '../lib/crypto';
 import { formatCryptoAmount, formatFiat } from '../lib/formatters';
 import {
   estimateEvmTransferFee,
@@ -119,17 +125,54 @@ export function TransferView({
     [networkHoldings, selectedSymbol]
   );
 
+  const fallbackMonero = useMemo(() => {
+    if (
+      activeNetwork.family !== 'monero' ||
+      wallet.addresses.moneroAddress ||
+      wallet.type !== 'mnemonic' ||
+      !secrets.mnemonic
+    ) {
+      return null;
+    }
+    try {
+      const derived = deriveWalletFromMnemonic(secrets.mnemonic, {
+        preset: wallet.preset || 'standard',
+        accountIndex: wallet.accountIndex || 0,
+        passphrase: secrets.passphrase,
+      });
+      return {
+        address: derived.addresses.moneroAddress,
+        path: derived.addresses.moneroPath,
+      };
+    } catch {
+      return null;
+    }
+  }, [activeNetwork.family, wallet, secrets]);
+
   const senderAddress = useMemo(() => {
     if (activeNetwork.family === 'evm') return wallet.addresses.evmAddress;
     if (activeNetwork.family === 'solana') return wallet.addresses.solanaAddress;
+    if (activeNetwork.family === 'monero') {
+      return wallet.addresses.moneroAddress || fallbackMonero?.address || '';
+    }
     return wallet.addresses.bitcoinAddress;
-  }, [activeNetwork.family, wallet.addresses]);
+  }, [activeNetwork.family, wallet.addresses, fallbackMonero]);
 
   const derivationPath = useMemo(() => {
     if (activeNetwork.family === 'evm') return wallet.addresses.evmPath;
     if (activeNetwork.family === 'solana') return wallet.addresses.solanaPath;
+    if (activeNetwork.family === 'monero') {
+      if (wallet.addresses.moneroAddress || fallbackMonero?.address) {
+        return wallet.addresses.moneroPath || fallbackMonero?.path || "m/44'/128'/0'/0'";
+      }
+      return wallet.type === 'privateKey'
+        ? 'Single-Chain Key'
+        : wallet.type === 'watchOnly'
+        ? 'Watch-Only'
+        : "m/44'/128'/0'/0'";
+    }
     return wallet.addresses.bitcoinPath;
-  }, [activeNetwork.family, wallet.addresses]);
+  }, [activeNetwork.family, wallet.addresses, wallet.type, fallbackMonero]);
 
   // ENS resolution when typing .eth
   useEffect(() => {
@@ -157,6 +200,7 @@ export function TransferView({
     if (!targetAddress) return false;
     if (activeNetwork.family === 'evm') return isAddress(targetAddress);
     if (activeNetwork.family === 'solana') return isValidSolanaAddress(targetAddress);
+    if (activeNetwork.family === 'monero') return isValidMoneroAddress(targetAddress);
     return isValidBitcoinAddress(targetAddress);
   }, [targetAddress, activeNetwork.family]);
 
@@ -201,6 +245,9 @@ export function TransferView({
     }
     if (activeNetwork.family === 'bitcoin') {
       return amt > 0 ? `bitcoin:${senderAddress}?amount=${amt}` : `bitcoin:${senderAddress}`;
+    }
+    if (activeNetwork.family === 'monero') {
+      return amt > 0 ? `monero:${senderAddress}?tx_amount=${amt}` : senderAddress;
     }
     return amt > 0 ? `solana:${senderAddress}?amount=${amt}` : senderAddress;
   }, [senderAddress, requestAmount, activeNetwork]);
@@ -286,7 +333,12 @@ export function TransferView({
           .map((b) => b.toString(16).padStart(2, '0'))
           .join('');
         const tx: WalletTransaction = {
-          hash: activeNetwork.family === 'solana' ? `sol_${mockSig.slice(0, 44)}` : mockSig,
+          hash:
+            activeNetwork.family === 'solana'
+              ? `sol_${mockSig.slice(0, 44)}`
+              : activeNetwork.family === 'monero'
+              ? `xmr_${mockSig.slice(0, 56)}`
+              : mockSig,
           networkId,
           type: 'send',
           status: 'signed-sandbox',
@@ -294,7 +346,12 @@ export function TransferView({
           to: targetAddress,
           symbol: activeNetwork.symbol,
           amount: amountInput,
-          feeFormatted: activeNetwork.family === 'solana' ? '0.000005 SOL' : '0.000024 BTC',
+          feeFormatted:
+            activeNetwork.family === 'solana'
+              ? '0.000005 SOL'
+              : activeNetwork.family === 'monero'
+              ? '0.00002 XMR'
+              : '0.000024 BTC',
           rawSignedHex: `0x${mockSig}`,
           timestamp: Date.now(),
           note: `${activeNetwork.name} transfer signed locally in sandbox mode`,
@@ -488,6 +545,8 @@ export function TransferView({
                     ? '0x... or vitalik.eth'
                     : activeNetwork.family === 'solana'
                     ? 'Solana Base58 address'
+                    : activeNetwork.family === 'monero'
+                    ? '4... Monero standard or 8... subaddress'
                     : 'bc1q... Bitcoin SegWit address'
                 }
                 spellCheck={false}
@@ -589,6 +648,8 @@ export function TransferView({
                       ? `${estimatedFeeNative} ${activeNetwork.symbol}`
                       : activeNetwork.family === 'solana'
                       ? '0.000005 SOL'
+                      : activeNetwork.family === 'monero'
+                      ? '0.00002 XMR'
                       : '0.000024 BTC'}
                   </span>
                 </div>
@@ -599,6 +660,8 @@ export function TransferView({
                       ? 'EIP-155'
                       : activeNetwork.family === 'solana'
                       ? 'Ed25519'
+                      : activeNetwork.family === 'monero'
+                      ? 'RingCT / CryptoNote'
                       : 'BIP-143 SegWit'}
                   </span>
                 </div>
@@ -685,7 +748,12 @@ export function TransferView({
               </label>
               <div className="flex items-center gap-2 bg-[#090B0F] border border-white/10 rounded-lg px-3.5 py-3">
                 <code className="text-xs text-[#F4F6F9] break-all flex-1">
-                  {senderAddress || 'Not available for this imported key type'}
+                  {senderAddress ||
+                    (wallet.type === 'privateKey'
+                      ? `Not available — this wallet uses a single-chain imported private key. Import a 12/18/24-word seed phrase or a Monero Private Spend Key to receive ${activeNetwork.symbol}.`
+                      : wallet.type === 'watchOnly'
+                      ? `Not available — this Watch-Only entry tracks a different chain address.`
+                      : `Lock and unlock your vault once to finish deriving your ${activeNetwork.name} address.`)}
                 </code>
                 <button
                   type="button"

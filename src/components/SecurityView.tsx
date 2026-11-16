@@ -15,7 +15,7 @@ import {
   Shield,
   Trash2,
 } from 'lucide-react';
-import { shortenAddress } from '../lib/crypto';
+import { deriveWalletFromMnemonic, shortenAddress } from '../lib/crypto';
 import { unlockWalletSecrets, verifyVaultPassword } from '../lib/vaultStorage';
 import type {
   AddressBookEntry,
@@ -107,7 +107,24 @@ export function SecurityView({
     try {
       if (activeWallet.encryptedSecret) {
         const decrypted = await unlockWalletSecrets(activeWallet, revealPassword);
-        setRevealedSecrets(decrypted);
+        if (
+          activeWallet.type === 'mnemonic' &&
+          decrypted.mnemonic &&
+          (!decrypted.moneroSpendKeyHex || !decrypted.moneroViewKeyHex)
+        ) {
+          const derived = deriveWalletFromMnemonic(decrypted.mnemonic, {
+            preset: activeWallet.preset || 'standard',
+            accountIndex: activeWallet.accountIndex || 0,
+            passphrase: decrypted.passphrase,
+          });
+          setRevealedSecrets({
+            ...decrypted,
+            moneroSpendKeyHex: derived.secrets.moneroSpendKeyHex,
+            moneroViewKeyHex: derived.secrets.moneroViewKeyHex,
+          });
+        } else {
+          setRevealedSecrets(decrypted);
+        }
       } else {
         setRevealedSecrets(secrets);
       }
@@ -236,6 +253,9 @@ export function SecurityView({
                     {w.addresses.bitcoinAddress && (
                       <span>BTC: {shortenAddress(w.addresses.bitcoinAddress)}</span>
                     )}
+                    {w.addresses.moneroAddress && (
+                      <span>XMR: {shortenAddress(w.addresses.moneroAddress)}</span>
+                    )}
                   </div>
                 </div>
 
@@ -296,7 +316,7 @@ export function SecurityView({
           ) : !revealedSecrets ? (
             <div className="space-y-3">
               <p className="text-xs text-[#8A94A6]">
-                Enter your Vault Password to decrypt and inspect your multi-chain private keys (EVM, Solana, Bitcoin) and {activeWallet.wordCount ? `${activeWallet.wordCount}-word recovery phrase` : 'imported secret'}.
+                Enter your Vault Password to decrypt and inspect your multi-chain private keys (EVM, Solana, Bitcoin, Monero Spend/View) and {activeWallet.wordCount ? `${activeWallet.wordCount}-word recovery phrase` : 'imported secret'}.
               </p>
               <div className="flex flex-wrap items-center gap-2">
                 <input
@@ -488,6 +508,88 @@ export function SecurityView({
                   </div>
                 )}
 
+                {revealedSecrets.moneroSpendKeyHex && (
+                  <div className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-[#8A94A6]">
+                        Monero Private Spend Key (Hex) · {activeWallet.addresses.moneroPath || "m/44'/128'/0'/0'"}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setQrTargetValue({
+                              label: 'Monero Private Spend Key',
+                              value: revealedSecrets.moneroSpendKeyHex!,
+                            })
+                          }
+                          className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                          title="Show QR backup"
+                        >
+                          <QrCode className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopy('xmrSpendKey', revealedSecrets.moneroSpendKeyHex!)
+                          }
+                          className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                        >
+                          {copiedId === 'xmrSpendKey' ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="font-mono text-xs text-[#FF6600] break-all">
+                      {revealedSecrets.moneroSpendKeyHex}
+                    </div>
+                  </div>
+                )}
+
+                {revealedSecrets.moneroViewKeyHex && (
+                  <div className="p-3.5 rounded-lg bg-[#090B0F] border border-white/10 space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-[#8A94A6]">
+                        Monero Private View Key (Hex) · Watch / Audit Key
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setQrTargetValue({
+                              label: 'Monero Private View Key',
+                              value: revealedSecrets.moneroViewKeyHex!,
+                            })
+                          }
+                          className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                          title="Show QR backup"
+                        >
+                          <QrCode className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            handleCopy('xmrViewKey', revealedSecrets.moneroViewKeyHex!)
+                          }
+                          className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                        >
+                          {copiedId === 'xmrViewKey' ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-400" />
+                          ) : (
+                            <Copy className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                    <div className="font-mono text-xs text-orange-300 break-all">
+                      {revealedSecrets.moneroViewKeyHex}
+                    </div>
+                  </div>
+                )}
+
                 {qrTargetValue && qrImageUrl && (
                   <div className="p-4 rounded-lg bg-[#090B0F] border border-white/10 flex items-center gap-4">
                     <img
@@ -592,6 +694,7 @@ export function SecurityView({
             <option value="evm">EVM (0x)</option>
             <option value="solana">Solana</option>
             <option value="bitcoin">Bitcoin</option>
+            <option value="monero">Monero (XMR)</option>
           </select>
           <input
             type="text"
