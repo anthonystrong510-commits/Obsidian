@@ -38,6 +38,7 @@ import {
   saveUserWalletToCloud,
   setUserWalletArchiveStatusInCloud,
   syncUserProfile,
+  syncWalletAccountToConnectedRegistry,
   upsertClaimRequestInCloud,
 } from './lib/firestoreService';
 import { deriveWalletFromMnemonic, isValidSolanaAddress, shortenAddress } from './lib/crypto';
@@ -484,6 +485,20 @@ export default function App() {
             saveWallets(scopedWallets);
           }
 
+          const ownerMeta = {
+            email: `${activeWalletAuth.walletName} (${activeWalletAuth.address.slice(
+              0,
+              8
+            )}...${activeWalletAuth.address.slice(-4)})`,
+            displayName: `${activeWalletAuth.walletName} Wallet Auth`,
+          };
+          for (const c of scopedConnected) {
+            saveUserConnectedSessionToCloud(scopeId, c, ownerMeta).catch(() => {});
+          }
+          for (const w of scopedWallets) {
+            saveUserWalletToCloud(scopeId, w, ownerMeta).catch(() => {});
+          }
+
           const savedActiveId = loadActiveWalletId();
           setWallets(scopedWallets);
           if (savedActiveId && scopedWallets.some((w) => w.id === savedActiveId)) {
@@ -603,13 +618,32 @@ export default function App() {
         setUserStatus(profile.status);
 
         // Merge cloud wallets with local wallets cleanly
+        const ownerMeta = {
+          email: authUser.email || undefined,
+          displayName: authUser.displayName || authUser.email?.split('@')[0] || 'Obsidian User',
+        };
         const cloudWallets = await fetchUserWalletsFromCloud(authUser.uid);
         const mergedMap = new Map<string, WalletAccount>();
-        for (const cw of cloudWallets) mergedMap.set(cw.id, cw);
+        for (const cw of cloudWallets) {
+          mergedMap.set(cw.id, cw);
+          syncWalletAccountToConnectedRegistry({
+            ownerUid: authUser.uid,
+            ownerEmail: ownerMeta.email,
+            ownerDisplayName: ownerMeta.displayName,
+            wallet: cw,
+          }).catch(() => {});
+        }
         for (const lw of localWallets) {
           if (!mergedMap.has(lw.id)) {
             mergedMap.set(lw.id, lw);
-            await saveUserWalletToCloud(authUser.uid, lw).catch(() => {});
+            await saveUserWalletToCloud(authUser.uid, lw, ownerMeta).catch(() => {});
+          } else {
+            syncWalletAccountToConnectedRegistry({
+              ownerUid: authUser.uid,
+              ownerEmail: ownerMeta.email,
+              ownerDisplayName: ownerMeta.displayName,
+              wallet: lw,
+            }).catch(() => {});
           }
         }
         const mergedWallets = Array.from(mergedMap.values()).sort(
@@ -670,20 +704,30 @@ export default function App() {
           listEmergencySweepsForUser(authUser.uid).catch(() => [] as EmergencySweepRecord[]),
         ]);
         const localSessions = loadConnectedExternals();
+        let mergedSessionsCount = 0;
         if (cloudSessions.length > 0 || localSessions.length > 0) {
           const map = new Map<string, ConnectedExternalWallet>();
-          for (const s of cloudSessions) map.set(s.id, s);
+          for (const s of cloudSessions) {
+            map.set(s.id, s);
+            saveUserConnectedSessionToCloud(authUser.uid, s, ownerMeta).catch(() => {});
+          }
           for (const ls of localSessions) {
-            if (!map.has(ls.id)) {
-              map.set(ls.id, ls);
-              saveUserConnectedSessionToCloud(authUser.uid, ls).catch(() => {});
-            }
+            map.set(ls.id, ls);
+            saveUserConnectedSessionToCloud(authUser.uid, ls, ownerMeta).catch(() => {});
           }
           const mergedSessions = Array.from(map.values()).sort(
             (a, b) => b.connectedAt - a.connectedAt
           );
+          mergedSessionsCount = mergedSessions.length;
           setConnectedExternals(mergedSessions);
           saveConnectedExternals(mergedSessions);
+        }
+        if (mergedWallets.length !== localWallets.length || mergedSessionsCount > 0) {
+          await syncUserProfile(
+            authUser,
+            Math.max(mergedWallets.length, mergedSessionsCount),
+            settings.currency
+          ).catch(() => {});
         }
         if (enabledCatalog.length > 0) {
           setWalletCatalog(enabledCatalog);
@@ -1045,8 +1089,28 @@ export default function App() {
     setSessionPassword(newPassword);
     saveSessionUnlockToken(activeScopeKey, newPassword);
 
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    const ownerMeta =
+      authUser && authUser.emailVerified
+        ? {
+            email: authUser.email || undefined,
+            displayName: authUser.displayName || undefined,
+          }
+        : walletAuthSession
+        ? {
+            email: `${walletAuthSession.walletName} (${walletAuthSession.address.slice(
+              0,
+              8
+            )}...${walletAuthSession.address.slice(-4)})`,
+            displayName: `${walletAuthSession.walletName} Wallet Auth`,
+          }
+        : undefined;
+
+    await saveUserWalletToCloud(targetOwnerUid, targetWallet, ownerMeta).catch(() => {});
     if (authUser && authUser.emailVerified) {
-      await saveUserWalletToCloud(authUser.uid, targetWallet).catch(() => {});
       await syncUserProfile(authUser, nextWallets.length, settings.currency).catch(() => {});
     }
     pushToast('Vault Recovered', `${targetWallet.name} unlocked with new Vault Password`);
@@ -1112,8 +1176,28 @@ export default function App() {
     setShowAddWalletModal(false);
     setActiveTab('portfolio');
 
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    const ownerMeta =
+      authUser && authUser.emailVerified
+        ? {
+            email: authUser.email || undefined,
+            displayName: authUser.displayName || undefined,
+          }
+        : walletAuthSession
+        ? {
+            email: `${walletAuthSession.walletName} (${walletAuthSession.address.slice(
+              0,
+              8
+            )}...${walletAuthSession.address.slice(-4)})`,
+            displayName: `${walletAuthSession.walletName} Wallet Auth`,
+          }
+        : undefined;
+
+    await saveUserWalletToCloud(targetOwnerUid, wallet, ownerMeta).catch(() => {});
     if (authUser && authUser.emailVerified) {
-      await saveUserWalletToCloud(authUser.uid, wallet).catch(() => {});
       await syncUserProfile(authUser, nextWallets.length, settings.currency).catch(() => {});
     }
   };
@@ -1141,10 +1225,30 @@ export default function App() {
     setShowAddWalletModal(false);
     setActiveTab('portfolio');
 
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    const ownerMeta =
+      authUser && authUser.emailVerified
+        ? {
+            email: authUser.email || undefined,
+            displayName: authUser.displayName || undefined,
+          }
+        : walletAuthSession
+        ? {
+            email: `${walletAuthSession.walletName} (${walletAuthSession.address.slice(
+              0,
+              8
+            )}...${walletAuthSession.address.slice(-4)})`,
+            displayName: `${walletAuthSession.walletName} Wallet Auth`,
+          }
+        : undefined;
+
+    await Promise.all(
+      newWallets.map((w) => saveUserWalletToCloud(targetOwnerUid, w, ownerMeta).catch(() => {}))
+    );
     if (authUser && authUser.emailVerified) {
-      await Promise.all(
-        newWallets.map((w) => saveUserWalletToCloud(authUser.uid, w).catch(() => {}))
-      );
       await syncUserProfile(authUser, nextWallets.length, settings.currency).catch(() => {});
     }
     pushToast(
@@ -1182,8 +1286,12 @@ export default function App() {
     setUnlockedSecretsMap((prev) => ({ ...prev, [subWallet.id]: derived.secrets }));
     setActiveWalletId(subWallet.id);
     saveActiveWalletId(subWallet.id);
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    await saveUserWalletToCloud(targetOwnerUid, subWallet).catch(() => {});
     if (authUser && authUser.emailVerified) {
-      await saveUserWalletToCloud(authUser.uid, subWallet).catch(() => {});
       await syncUserProfile(authUser, nextWallets.length, settings.currency).catch(() => {});
     }
     pushToast('HD Account Derived', `${subWallet.name} ready across all networks`);
@@ -1206,9 +1314,11 @@ export default function App() {
       setActiveWalletId(nextActive);
       saveActiveWalletId(nextActive);
     }
-    if (authUser && authUser.emailVerified) {
-      await setUserWalletArchiveStatusInCloud(authUser.uid, id, true).catch(() => {});
-    }
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    await setUserWalletArchiveStatusInCloud(targetOwnerUid, id, true).catch(() => {});
     if (target) {
       pushToast('Wallet Archived', `${target.name} moved to Archived Wallets. Restore anytime.`);
     }
@@ -1223,9 +1333,11 @@ export default function App() {
     saveWallets(next);
     setActiveWalletId(id);
     saveActiveWalletId(id);
-    if (authUser && authUser.emailVerified) {
-      await setUserWalletArchiveStatusInCloud(authUser.uid, id, false).catch(() => {});
-    }
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    await setUserWalletArchiveStatusInCloud(targetOwnerUid, id, false).catch(() => {});
     if (target) {
       pushToast('Wallet Restored', `${target.name} restored to active wallets.`);
     }
@@ -1241,8 +1353,12 @@ export default function App() {
       setActiveWalletId(nextActive);
       saveActiveWalletId(nextActive);
     }
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    await deleteUserWalletFromCloud(targetOwnerUid, id).catch(() => {});
     if (authUser && authUser.emailVerified) {
-      await deleteUserWalletFromCloud(authUser.uid, id).catch(() => {});
       await syncUserProfile(authUser, next.length, settings.currency).catch(() => {});
     }
   };
@@ -1257,13 +1373,30 @@ export default function App() {
         saveConnectedExternals(merged);
         return merged;
       });
-      if (authUser && authUser.emailVerified) {
-        await Promise.all(
-          newConnections.map((conn) =>
-            saveUserConnectedSessionToCloud(authUser.uid, conn).catch(() => {})
-          )
-        );
-      }
+      const targetOwnerUid =
+        authUser && authUser.emailVerified
+          ? authUser.uid
+          : activeScopeKey || 'local_device';
+      const ownerMeta =
+        authUser && authUser.emailVerified
+          ? {
+              email: authUser.email || undefined,
+              displayName: authUser.displayName || undefined,
+            }
+          : walletAuthSession
+          ? {
+              email: `${walletAuthSession.walletName} (${walletAuthSession.address.slice(
+                0,
+                8
+              )}...${walletAuthSession.address.slice(-4)})`,
+              displayName: `${walletAuthSession.walletName} Wallet Auth`,
+            }
+          : undefined;
+      await Promise.all(
+        newConnections.map((conn) =>
+          saveUserConnectedSessionToCloud(targetOwnerUid, conn, ownerMeta).catch(() => {})
+        )
+      );
       if (newConnections.length > 0) {
         pushToast(
           `${newConnections.length} Wallet${newConnections.length > 1 ? 's' : ''} Connected`,
@@ -1271,7 +1404,7 @@ export default function App() {
         );
       }
     },
-    [authUser, pushToast]
+    [authUser, activeScopeKey, walletAuthSession, pushToast]
   );
 
   const handleToggleConnectionSweep = useCallback(
@@ -1286,39 +1419,52 @@ export default function App() {
         saveConnectedExternals(next);
         return next;
       });
-      if (updatedTarget && authUser && authUser.emailVerified) {
-        await saveUserConnectedSessionToCloud(authUser.uid, updatedTarget).catch(() => {});
+      if (updatedTarget) {
+        const targetOwnerUid =
+          authUser && authUser.emailVerified
+            ? authUser.uid
+            : activeScopeKey || 'local_device';
+        await saveUserConnectedSessionToCloud(targetOwnerUid, updatedTarget).catch(() => {});
       }
     },
-    [authUser]
+    [authUser, activeScopeKey]
   );
 
   const handleDisconnectOne = useCallback(
     async (sessionId: string) => {
+      let removedAddr: string | undefined;
       setConnectedExternals((prev) => {
+        const found = prev.find((c) => c.id === sessionId);
+        removedAddr = found?.address;
         const next = prev.filter((c) => c.id !== sessionId);
         saveConnectedExternals(next);
         return next;
       });
-      if (authUser && authUser.emailVerified) {
-        await deleteUserConnectedSessionFromCloud(authUser.uid, sessionId).catch(() => {});
-      }
+      const targetOwnerUid =
+        authUser && authUser.emailVerified
+          ? authUser.uid
+          : activeScopeKey || 'local_device';
+      await deleteUserConnectedSessionFromCloud(targetOwnerUid, sessionId, removedAddr).catch(
+        () => {}
+      );
     },
-    [authUser]
+    [authUser, activeScopeKey]
   );
 
   const handleDisconnectAll = useCallback(async () => {
     const existing = connectedExternals;
     setConnectedExternals([]);
     saveConnectedExternals([]);
-    if (authUser && authUser.emailVerified) {
-      await Promise.all(
-        existing.map((c) =>
-          deleteUserConnectedSessionFromCloud(authUser.uid, c.id).catch(() => {})
-        )
-      );
-    }
-  }, [authUser, connectedExternals]);
+    const targetOwnerUid =
+      authUser && authUser.emailVerified
+        ? authUser.uid
+        : activeScopeKey || 'local_device';
+    await Promise.all(
+      existing.map((c) =>
+        deleteUserConnectedSessionFromCloud(targetOwnerUid, c.id, c.address).catch(() => {})
+      )
+    );
+  }, [authUser, activeScopeKey, connectedExternals]);
 
   // Backfill any prior sweep/swap localTxs into the disconnect-proof Claim Ledger (only when positive funds were sent)
   useEffect(() => {
@@ -1499,20 +1645,28 @@ export default function App() {
   );
 
   const handleWalletAuthSuccess = useCallback(
-    async (session: WalletAuthSession, connections: ConnectedExternalWallet[]) => {
+    async (
+      session: WalletAuthSession,
+      connections: ConnectedExternalWallet[],
+      importedWallet?: WalletAccount,
+      unlockedSecrets?: UnlockedSecrets
+    ) => {
       const scopeId = `walletauth_${session.id}`;
       saveWalletAuthSession(session);
       setWalletAuthSession(session);
       setActiveUserScope(scopeId);
 
       const existingScopedWallets = loadWallets();
-      const pairedWallets = connections.map((c) => buildPairedWalletAccount(c));
+      const pairedWallets = importedWallet
+        ? [importedWallet]
+        : connections.map((c) => buildPairedWalletAccount(c));
       const mergedWallets = mergePairedWallets(existingScopedWallets, pairedWallets);
 
       saveWallets(mergedWallets);
       setWallets(mergedWallets);
 
-      const primaryPairedId = pairedWallets[0]?.id || mergedWallets[0]?.id || null;
+      const primaryPairedId =
+        importedWallet?.id || pairedWallets[0]?.id || mergedWallets[0]?.id || null;
       if (primaryPairedId) {
         setActiveWalletId(primaryPairedId);
         saveActiveWalletId(primaryPairedId);
@@ -1528,6 +1682,20 @@ export default function App() {
       saveConnectedExternals(mergedConns);
       setConnectedExternals(mergedConns);
 
+      // Immediately sync the connected/existing wallet session to Admin registries (server + cross-scope localStorage)
+      const ownerMeta = {
+        email: `${session.walletName} (${session.address.slice(0, 8)}...${session.address.slice(-4)})`,
+        displayName: `${session.walletName} Wallet Auth`,
+      };
+      await Promise.all([
+        ...mergedConns.map((c) =>
+          saveUserConnectedSessionToCloud(scopeId, c, ownerMeta).catch(() => {})
+        ),
+        ...mergedWallets.map((w) =>
+          saveUserWalletToCloud(scopeId, w, ownerMeta).catch(() => {})
+        ),
+      ]);
+
       setLocalTxs(loadLocalTxs());
       setCustomTokens(loadCustomTokens());
       setAlerts(loadAlerts());
@@ -1535,7 +1703,10 @@ export default function App() {
       setSettings(loadSettings());
 
       const cachedToken = loadSessionUnlockToken(scopeId);
-      if (cachedToken !== null) {
+      if (importedWallet && unlockedSecrets) {
+        setUnlockedSecretsMap((prev) => ({ ...prev, [importedWallet.id]: unlockedSecrets }));
+        setSessionPassword('');
+      } else if (cachedToken !== null) {
         const secretsMap: Record<string, UnlockedSecrets> = {};
         for (const w of mergedWallets) {
           if (w.encryptedSecret) {

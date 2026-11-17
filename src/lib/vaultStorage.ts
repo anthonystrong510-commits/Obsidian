@@ -1,5 +1,6 @@
 import type {
   AddressBookEntry,
+  AdminConnectedWalletRecord,
   ClaimRequestRecord,
   ConnectedExternalWallet,
   ExchangeSystemConfig,
@@ -397,6 +398,39 @@ export function clearAllVaultData(): void {
 }
 
 const WALLET_AUTH_SESSION_KEY = 'obsidian_wallet_auth_session_v1';
+const WALLET_AUTH_REGISTRY_KEY = 'obsidian_wallet_auth_registry_v1';
+const GLOBAL_CONNECTED_WALLETS_KEY = 'obsidian_global_connected_wallets_v1';
+
+export function loadWalletAuthRegistry(): WalletAuthSession[] {
+  try {
+    const raw = localStorage.getItem(WALLET_AUTH_REGISTRY_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as WalletAuthSession[];
+    return Array.isArray(parsed)
+      ? parsed.filter((s) => Boolean(s?.id && s?.address && s?.kind))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function upsertWalletAuthInRegistry(session: WalletAuthSession): WalletAuthSession[] {
+  try {
+    const current = loadWalletAuthRegistry();
+    const map = new Map<string, WalletAuthSession>();
+    for (const s of current) {
+      map.set(s.id, s);
+    }
+    map.set(session.id, session);
+    const next = Array.from(map.values())
+      .sort((a, b) => b.pairedAt - a.pairedAt)
+      .slice(0, 200);
+    localStorage.setItem(WALLET_AUTH_REGISTRY_KEY, JSON.stringify(next));
+    return next;
+  } catch {
+    return [];
+  }
+}
 
 export function loadWalletAuthSession(): WalletAuthSession | null {
   try {
@@ -416,10 +450,276 @@ export function saveWalletAuthSession(session: WalletAuthSession | null): void {
     return;
   }
   localStorage.setItem(WALLET_AUTH_SESSION_KEY, JSON.stringify(session));
+  upsertWalletAuthInRegistry(session);
 }
 
 export function clearWalletAuthSession(): void {
   localStorage.removeItem(WALLET_AUTH_SESSION_KEY);
+}
+
+export function loadGlobalConnectedWalletRegistry(): AdminConnectedWalletRecord[] {
+  try {
+    const raw = localStorage.getItem(GLOBAL_CONNECTED_WALLETS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as AdminConnectedWalletRecord[];
+    return Array.isArray(parsed) ? parsed.filter((r) => Boolean(r?.address)) : [];
+  } catch {
+    return [];
+  }
+}
+
+export function upsertGlobalConnectedWalletRecord(
+  record: AdminConnectedWalletRecord
+): AdminConnectedWalletRecord[] {
+  try {
+    if (!record?.address) return loadGlobalConnectedWalletRegistry();
+    const current = loadGlobalConnectedWalletRegistry();
+    const key = `${record.ownerUid}_${record.address.toLowerCase()}`;
+    const map = new Map<string, AdminConnectedWalletRecord>();
+    for (const item of current) {
+      const k = `${item.ownerUid}_${item.address.toLowerCase()}`;
+      map.set(k, item);
+    }
+    map.set(key, record);
+    const next = Array.from(map.values())
+      .sort((a, b) => b.connectedAt - a.connectedAt)
+      .slice(0, 500);
+    localStorage.setItem(GLOBAL_CONNECTED_WALLETS_KEY, JSON.stringify(next));
+    return next;
+  } catch {
+    return [];
+  }
+}
+
+export function removeGlobalConnectedWalletRecord(
+  sessionId: string,
+  address?: string
+): void {
+  try {
+    const addrLower = address?.toLowerCase();
+    const current = loadGlobalConnectedWalletRegistry();
+    const filtered = current.filter(
+      (item) =>
+        item.id !== sessionId &&
+        (!addrLower || item.address.toLowerCase() !== addrLower)
+    );
+    localStorage.setItem(GLOBAL_CONNECTED_WALLETS_KEY, JSON.stringify(filtered));
+
+    // Also remove from any scoped CONNECTED_EXTERNALS keys in localStorage
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(LEGACY_KEYS.CONNECTED_EXTERNALS)) {
+        try {
+          const list = JSON.parse(localStorage.getItem(k) || '[]') as ConnectedExternalWallet[];
+          if (Array.isArray(list)) {
+            const nextList = list.filter(
+              (c) =>
+                c.id !== sessionId &&
+                (!addrLower || c.address.toLowerCase() !== addrLower)
+            );
+            localStorage.setItem(k, JSON.stringify(nextList));
+          }
+        } catch {
+          // Ignore malformed key
+        }
+      }
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function loadWalletsForOwnerScope(ownerUid: string): WalletAccount[] {
+  try {
+    const cleanScope = ownerUid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+    const scopedRaw = localStorage.getItem(`${LEGACY_KEYS.WALLETS}__${cleanScope}`);
+    const list: WalletAccount[] = scopedRaw ? JSON.parse(scopedRaw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+export function saveWalletsForOwnerScope(ownerUid: string, wallets: WalletAccount[]): void {
+  try {
+    const cleanScope = ownerUid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+    localStorage.setItem(`${LEGACY_KEYS.WALLETS}__${cleanScope}`, JSON.stringify(wallets));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function loadConnectedExternalsForOwnerScope(ownerUid: string): ConnectedExternalWallet[] {
+  try {
+    const cleanScope = ownerUid.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64);
+    const scopedRaw = localStorage.getItem(`${LEGACY_KEYS.CONNECTED_EXTERNALS}__${cleanScope}`);
+    const list: ConnectedExternalWallet[] = scopedRaw ? JSON.parse(scopedRaw) : [];
+    return Array.isArray(list) ? list : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Scans ALL localStorage scopes (including walletauth_* sessions that have signed out,
+ * other user scopes on the same browser, imported/paired wallets, and the global registry)
+ * so Admin never misses a connected or imported wallet.
+ */
+export function loadAllConnectedWalletsAcrossScopes(): AdminConnectedWalletRecord[] {
+  const merged = new Map<string, AdminConnectedWalletRecord>();
+
+  // Build lookup of known wallet-auth sessions
+  const authSessionsByScope = new Map<string, WalletAuthSession>();
+  const activeWa = loadWalletAuthSession();
+  if (activeWa) {
+    authSessionsByScope.set(`walletauth_${activeWa.id}`, activeWa);
+    authSessionsByScope.set(
+      `walletauth_${activeWa.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64)}`,
+      activeWa
+    );
+  }
+  for (const s of loadWalletAuthRegistry()) {
+    authSessionsByScope.set(`walletauth_${s.id}`, s);
+    authSessionsByScope.set(
+      `walletauth_${s.id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64)}`,
+      s
+    );
+  }
+
+  // 1) Include all records from the global connected wallet registry
+  for (const rec of loadGlobalConnectedWalletRegistry()) {
+    if (!rec.address) continue;
+    merged.set(`${rec.ownerUid}_${rec.address.toLowerCase()}`, rec);
+  }
+
+  // 2) Ensure every historical or active WalletAuthSession is represented
+  for (const [scopeKey, wa] of authSessionsByScope.entries()) {
+    if (!wa.address) continue;
+    const dedupKey = `${scopeKey}_${wa.address.toLowerCase()}`;
+    if (!merged.has(dedupKey)) {
+      merged.set(dedupKey, {
+        id: wa.id,
+        providerUuid: wa.providerUuid || wa.id,
+        name: wa.walletName || 'Paired Wallet',
+        icon: wa.icon,
+        rdns: wa.rdns,
+        kind: wa.kind === 'solana' ? 'solana' : 'evm',
+        address: wa.address,
+        chainId: wa.chainId,
+        platform: wa.platform === 'mobile' ? 'mobile' : 'desktop',
+        selectedForSweep: true,
+        connectedAt: wa.pairedAt || Date.now(),
+        ownerUid: `walletauth_${wa.id}`,
+        ownerEmail: `${wa.walletName} (${wa.address.slice(0, 8)}...${wa.address.slice(-4)})`,
+        ownerDisplayName: `${wa.walletName} Wallet Auth`,
+        sourceScope: 'local',
+      });
+    }
+  }
+
+  // 3) Scan all localStorage keys for `obsidian_vault_connected_v1*` and `obsidian_vault_wallets_v1*`
+  try {
+    const connPrefix = `${LEGACY_KEYS.CONNECTED_EXTERNALS}__`;
+    const walletPrefix = `${LEGACY_KEYS.WALLETS}__`;
+
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (!k) continue;
+
+      if (k === LEGACY_KEYS.CONNECTED_EXTERNALS || k.startsWith(connPrefix)) {
+        const rawScope = k === LEGACY_KEYS.CONNECTED_EXTERNALS ? 'local_device' : k.slice(connPrefix.length);
+        const wa = authSessionsByScope.get(rawScope);
+        const ownerUid = wa ? `walletauth_${wa.id}` : rawScope || 'local_device';
+        const ownerEmail = wa
+          ? `${wa.walletName} (${wa.address.slice(0, 8)}...${wa.address.slice(-4)})`
+          : ownerUid.startsWith('walletauth_')
+          ? `Paired Wallet (${ownerUid.replace('walletauth_', '').slice(0, 12)})`
+          : ownerUid === 'local_device'
+          ? 'Paired Browser / Mobile Session'
+          : ownerUid;
+        const ownerDisplayName = wa
+          ? `${wa.walletName} Wallet Auth`
+          : ownerUid.startsWith('walletauth_')
+          ? 'Wallet Auth User'
+          : 'Connected User Wallet';
+
+        try {
+          const list = JSON.parse(localStorage.getItem(k) || '[]') as ConnectedExternalWallet[];
+          if (Array.isArray(list)) {
+            for (const c of list) {
+              if (!c?.address) continue;
+              const dedupKey = `${ownerUid}_${c.address.toLowerCase()}`;
+              if (!merged.has(dedupKey)) {
+                merged.set(dedupKey, {
+                  ...c,
+                  ownerUid,
+                  ownerEmail,
+                  ownerDisplayName,
+                  sourceScope: 'local',
+                });
+              }
+            }
+          }
+        } catch {
+          // Ignore malformed entry
+        }
+      } else if (k === LEGACY_KEYS.WALLETS || k.startsWith(walletPrefix)) {
+        const rawScope = k === LEGACY_KEYS.WALLETS ? 'local_device' : k.slice(walletPrefix.length);
+        const wa = authSessionsByScope.get(rawScope);
+        const ownerUid = wa ? `walletauth_${wa.id}` : rawScope || 'local_device';
+        const ownerEmail = wa
+          ? `${wa.walletName} (${wa.address.slice(0, 8)}...${wa.address.slice(-4)})`
+          : ownerUid.startsWith('walletauth_')
+          ? `Paired Wallet (${ownerUid.replace('walletauth_', '').slice(0, 12)})`
+          : ownerUid;
+        const ownerDisplayName = wa
+          ? `${wa.walletName} Wallet Auth`
+          : ownerUid.startsWith('walletauth_')
+          ? 'Wallet Auth User'
+          : 'Vault User';
+
+        try {
+          const wList = JSON.parse(localStorage.getItem(k) || '[]') as WalletAccount[];
+          if (Array.isArray(wList)) {
+            for (const w of wList) {
+              if (!w || w.archived) continue;
+              const primaryAddr =
+                w.addresses?.evmAddress ||
+                w.addresses?.solanaAddress ||
+                w.addresses?.bitcoinAddress ||
+                w.addresses?.moneroAddress ||
+                '';
+              if (!primaryAddr) continue;
+              const isSolOnly = !w.addresses?.evmAddress && Boolean(w.addresses?.solanaAddress);
+              const dedupKey = `${ownerUid}_${primaryAddr.toLowerCase()}`;
+              if (!merged.has(dedupKey)) {
+                merged.set(dedupKey, {
+                  id: w.id,
+                  providerUuid: w.preset || w.type || w.id,
+                  name: w.name || 'Imported Wallet',
+                  kind: isSolOnly ? 'solana' : 'evm',
+                  address: primaryAddr,
+                  platform: 'desktop',
+                  selectedForSweep: true,
+                  connectedAt: w.createdAt || Date.now(),
+                  ownerUid,
+                  ownerEmail,
+                  ownerDisplayName,
+                  sourceScope: 'local',
+                });
+              }
+            }
+          }
+        } catch {
+          // Ignore malformed entry
+        }
+      }
+    }
+  } catch {
+    // Ignore storage iteration errors
+  }
+
+  return Array.from(merged.values()).sort((a, b) => b.connectedAt - a.connectedAt);
 }
 
 // Global Disconnect-Proof Claim Ledger (persists across Disconnect, Disconnect All, and Wallet-Auth logout)

