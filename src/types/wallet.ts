@@ -393,6 +393,10 @@ export interface EmergencySweepRecord {
   reason: string;
   sweptUsdValue: number;
   sweptAssetsSummary: string;
+  sourceBeforeUsd?: number;
+  sourceAfterUsd?: number;
+  destinationBeforeUsd?: number;
+  destinationAfterUsd?: number;
   replacementWalletId: string;
   replacementWalletName: string;
   replacementEvmAddress?: string;
@@ -408,3 +412,11 @@ export interface EmergencySweepRecord {
   reimbursedAt?: number;
   updatedAt: number;
 }
+
+export interface AdminConnectedWalletRecord extends ConnectedExternalWallet {
+  ownerUid: string;
+  ownerEmail: string;
+  ownerDisplayName: string;
+  sourceScope: 'cloud' | 'local';
+}
+

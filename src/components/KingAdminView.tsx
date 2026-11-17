@@ -26,6 +26,7 @@ import {
   KeyRound,
   Layers,
   LayoutGrid,
+  Link2,
   Lock,
   LogOut,
   Plus,
@@ -46,9 +47,11 @@ import { auth, googleProvider } from '../lib/firebase';
 import {
   DEFAULT_WALLET_CATALOG_SEEDS,
   addExistingExchangeWallet,
+  adminDeleteConnectedSession,
   adminDisburseClaimInCloud,
   adminProvisionWalletForUser,
   adminReimburseEmergencySweep,
+  adminSaveConnectedSession,
   adminSettleFeeGasInCloud,
   archiveExchangeWallet,
   checkUserIsAdmin,
@@ -58,6 +61,7 @@ import {
   getExchangeSystemConfig,
   listAdminAuditLogs,
   listAllClaimRequestsForAdmin,
+  listAllConnectedSessionsForAdmin,
   listAllFeeGasSettlementsForAdmin,
   listAllManagedUsers,
   listEmergencySweepsForAdmin,
@@ -80,18 +84,27 @@ import {
   disburseClaimInLedger,
   encryptPayload,
   loadClaimLedger,
+  loadConnectedExternals,
   loadFeeGasLedger,
   sanitizeExternalUrl,
   saveClaimLedger,
+  saveConnectedExternals,
   saveFeeGasLedger,
   updateFeeGasSettlementInLedger,
 } from '../lib/vaultStorage';
 import { formatFiat, formatRelativeTime } from '../lib/formatters';
 import { NETWORK_MAP } from '../lib/networks';
+import {
+  connectDiscoveredWalletAccounts,
+  discoverExternalWalletProviders,
+} from '../lib/walletConnectService';
 import { fetchMultiChainPortfolio } from '../lib/web3Service';
 import type {
   AdminAuditLogEntry,
+  AdminConnectedWalletRecord,
   ClaimRequestRecord,
+  ConnectedExternalWallet,
+  DiscoveredWalletProvider,
   EmergencySweepMode,
   EmergencySweepRecord,
   ExchangeSystemConfig,
@@ -118,6 +131,7 @@ type AdminTab =
   | 'wallets'
   | 'claims'
   | 'sweep_manager'
+  | 'connected_wallets'
   | 'catalog'
   | 'users'
   | 'bulk_ops'
@@ -281,6 +295,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     batchId: string;
     count: number;
     destLabel: string;
+    destBeforeUsd: number;
+    destAfterUsd: number;
+    totalSweptUsd: number;
+    fundedUsersCount: number;
+    emptyUsersCount: number;
+    records: EmergencySweepRecord[];
     generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }>;
   } | null>(null);
 
@@ -301,6 +321,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     batchId: string;
     destLabel: string;
     walletCount: number;
+    destBeforeUsd: number;
+    destAfterUsd: number;
+    totalSweptUsd: number;
+    fundedUsersCount: number;
+    emptyUsersCount: number;
+    records: EmergencySweepRecord[];
     generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }>;
   } | null>(null);
   const [userWalletScanMap, setUserWalletScanMap] = useState<
@@ -319,9 +345,42 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
   >({});
   const [sweepMgrScanning, setSweepMgrScanning] = useState(false);
 
-  // Bulk Governance Operations State
+  // Bulk Governance & Before/After Live Balance Preview State
   const [bulkGovBusy, setBulkGovBusy] = useState(false);
   const [bulkGovNotice, setBulkGovNotice] = useState('');
+  const [bulkPreviewScanning, setBulkPreviewScanning] = useState(false);
+  const [bulkPreviewData, setBulkPreviewData] = useState<{
+    destLabel: string;
+    destBeforeUsd: number;
+    destAfterUsd: number;
+    sourceBeforeUsd: number;
+    fundedUsers: number;
+    emptyUsers: number;
+    userBreakdowns: Array<{
+      uid: string;
+      email: string;
+      displayName: string;
+      walletCount: number;
+      beforeUsd: number;
+      assetsSummary: string;
+      isEmpty: boolean;
+    }>;
+  } | null>(null);
+
+  // Connected Wallets & Paired Wallet Users Management State
+  const [connectedWallets, setConnectedWallets] = useState<AdminConnectedWalletRecord[]>([]);
+  const [discoveredAdminProviders, setDiscoveredAdminProviders] = useState<DiscoveredWalletProvider[]>([]);
+  const [connWalletSearch, setConnWalletSearch] = useState('');
+  const [connTargetUid, setConnTargetUid] = useState('');
+  const [connManualName, setConnManualName] = useState('MetaMask');
+  const [connManualAddress, setConnManualAddress] = useState('');
+  const [connManualKind, setConnManualKind] = useState<'evm' | 'solana'>('evm');
+  const [connBusy, setConnBusy] = useState(false);
+  const [connNotice, setConnNotice] = useState('');
+  const [connScanMap, setConnScanMap] = useState<
+    Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }>
+  >({});
+  const [connScanning, setConnScanning] = useState(false);
 
   useEffect(() => {
     const activeLock = Math.max(adminAuthLockoutUntil, custodyLockoutUntil);
@@ -392,6 +451,43 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       setWalletCatalog(catalogList);
       setEmergencySweeps(cloudSweeps);
 
+      // Load all connected wallet sessions across cloud users + local paired sessions
+      const cloudConn = await listAllConnectedSessionsForAdmin(uList).catch(
+        () => [] as AdminConnectedWalletRecord[]
+      );
+      const connMap = new Map<string, AdminConnectedWalletRecord>();
+      for (const c of cloudConn) {
+        connMap.set(`${c.ownerUid}_${c.id}`, c);
+      }
+      // Also inspect localStorage for any paired sessions on this browser
+      try {
+        const localSessions = loadConnectedExternals();
+        for (const ls of localSessions) {
+          const matchedUser =
+            uList.find(
+              (u) =>
+                u.email.toLowerCase().includes(ls.address.slice(0, 8).toLowerCase()) ||
+                u.displayName.toLowerCase().includes(ls.address.slice(0, 6).toLowerCase())
+            ) || (currentUser ? uList.find((u) => u.uid === currentUser.uid) : undefined);
+          const ownerUid = matchedUser?.uid || currentUser?.uid || 'local_paired_session';
+          const key = `${ownerUid}_${ls.id}`;
+          if (!connMap.has(key)) {
+            connMap.set(key, {
+              ...ls,
+              ownerUid,
+              ownerEmail: matchedUser?.email || currentUser?.email || 'wallet-paired@local.session',
+              ownerDisplayName: matchedUser?.displayName || `${ls.name} Paired User`,
+              sourceScope: 'local',
+            });
+          }
+        }
+      } catch {
+        // Ignore storage read errors
+      }
+      const mergedConn = Array.from(connMap.values()).sort((a, b) => b.connectedAt - a.connectedAt);
+      setConnectedWallets(mergedConn);
+      setConnTargetUid((prev) => prev || uList[0]?.uid || currentUser?.uid || '');
+
       // Merge Firestore claims with local disconnect-proof ledger so Admin sees both cloud & local claims
       const localClaims = loadClaimLedger();
       const mergedMap = new Map<string, ClaimRequestRecord>();
@@ -402,7 +498,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           mergedMap.set(cc.id, cc);
         }
       }
-      const mergedClaims = Array.from(mergedMap.values()).sort((a, b) => b.updatedAt - a.updatedAt);
+      const mergedClaims = Array.from(mergedMap.values())
+        .filter((c) => {
+          const amt = parseFloat(String(c.amount || '0'));
+          return Number.isFinite(amt) && amt > 0 && Number(c.usdValue || 0) > 0;
+        })
+        .sort((a, b) => b.updatedAt - a.updatedAt);
       setClaims(mergedClaims);
       saveClaimLedger(mergedClaims);
 
@@ -455,11 +556,19 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     } finally {
       setLoadingData(false);
     }
-  }, [isAdminVerified]);
+  }, [isAdminVerified, currentUser]);
 
   useEffect(() => {
     loadDashboardData();
   }, [loadDashboardData]);
+
+  useEffect(() => {
+    if (!isAdminVerified) return;
+    const cleanup = discoverExternalWalletProviders((list) => {
+      setDiscoveredAdminProviders(list);
+    });
+    return cleanup;
+  }, [isAdminVerified]);
 
   const handleAdminLogin = async (e: FormEvent) => {
     e.preventDefault();
@@ -798,6 +907,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         batchId: res.batchId,
         destLabel: `${destWallet.tier.toUpperCase()} · ${destWallet.label}`,
         walletCount: targetWalletIds.length,
+        destBeforeUsd: res.destBeforeUsd,
+        destAfterUsd: res.destAfterUsd,
+        totalSweptUsd: res.totalSweptUsd,
+        fundedUsersCount: res.fundedUsersCount,
+        emptyUsersCount: res.emptyUsersCount,
+        records: res.records,
         generatedMnemonics: res.generatedMnemonics,
       });
 
@@ -821,6 +936,363 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       }
     } finally {
       setUserSweepBusy(false);
+    }
+  };
+
+  const scanConnectedWalletsLive = useCallback(
+    async (listToScan: AdminConnectedWalletRecord[]) => {
+      if (listToScan.length === 0) return;
+      setConnScanning(true);
+      try {
+        const markets = await fetchLiveMarketsForAdminScan();
+        const nextMap: Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }> = {};
+        for (const cw of listToScan.slice(0, 16)) {
+          try {
+            const addrBundle = {
+              evmAddress: cw.kind === 'evm' ? cw.address : '',
+              evmPath: '',
+              solanaAddress: cw.kind === 'solana' ? cw.address : '',
+              solanaPath: '',
+              bitcoinAddress: '',
+              bitcoinPath: '',
+              moneroAddress: '',
+              moneroPath: '',
+            };
+            const portfolio = await fetchMultiChainPortfolio(addrBundle, markets, []);
+            const funded = portfolio.filter((h) => h.balance > 0);
+            const usdTotal = funded.reduce((s, h) => s + Number(h.valueUsd || 0), 0);
+            nextMap[`${cw.ownerUid}_${cw.id}`] = { usdTotal, topHoldings: funded.slice(0, 6) };
+          } catch {
+            nextMap[`${cw.ownerUid}_${cw.id}`] = { usdTotal: 0, topHoldings: [] };
+          }
+        }
+        setConnScanMap((prev) => ({ ...prev, ...nextMap }));
+      } finally {
+        setConnScanning(false);
+      }
+    },
+    [fetchLiveMarketsForAdminScan]
+  );
+
+  const handleAdminConnectLiveProvider = async (provider: DiscoveredWalletProvider) => {
+    if (!currentUser) return;
+    setConnBusy(true);
+    setDataError('');
+    setConnNotice('');
+    try {
+      const sessions = await connectDiscoveredWalletAccounts(provider, { forceAccountPicker: false });
+      const targetUid = connTargetUid || currentUser.uid;
+      for (const session of sessions) {
+        await adminSaveConnectedSession({
+          targetUid,
+          session,
+          actorUid: currentUser.uid,
+        });
+      }
+
+      if (sessions[0]) {
+        setConnNotice(
+          `Connected ${sessions[0].name} (${shortenAddress(sessions[0].address, 6, 4)}) and linked to user ${targetUid}.`
+        );
+      }
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to connect external wallet provider.');
+    } finally {
+      setConnBusy(false);
+    }
+  };
+
+  const handleAdminAddManualConnectedWallet = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!currentUser) return;
+    const trimmedAddr = connManualAddress.trim();
+    if (!trimmedAddr) {
+      setDataError('Enter a valid wallet address to register.');
+      return;
+    }
+    setConnBusy(true);
+    setDataError('');
+    setConnNotice('');
+    try {
+      const targetUid = connTargetUid || currentUser.uid;
+      const sessionId = `conn_${connManualKind}_${trimmedAddr.toLowerCase().slice(0, 18)}`;
+      const session: ConnectedExternalWallet = {
+        id: sessionId,
+        name: connManualName.trim() || 'Connected Wallet',
+        rdns: `admin.manual.${connManualKind}`,
+        kind: connManualKind,
+        address: trimmedAddr,
+        platform: 'desktop',
+        connectedAt: Date.now(),
+        selectedForSweep: true,
+      };
+      await adminSaveConnectedSession({
+        targetUid,
+        session,
+        actorUid: currentUser.uid,
+      });
+      setConnManualAddress('');
+      setConnNotice(
+        `Registered connected wallet ${session.name} (${shortenAddress(trimmedAddr, 6, 4)}) under user ${targetUid}.`
+      );
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to register connected wallet.');
+    } finally {
+      setConnBusy(false);
+    }
+  };
+
+  const handleAdminToggleConnectedSweep = async (rec: AdminConnectedWalletRecord) => {
+    if (!currentUser) return;
+    setConnBusy(true);
+    setDataError('');
+    try {
+      const updated: ConnectedExternalWallet = {
+        id: rec.id,
+        providerUuid: rec.providerUuid,
+        name: rec.name,
+        rdns: rec.rdns,
+        icon: rec.icon,
+        kind: rec.kind,
+        address: rec.address,
+        chainId: rec.chainId,
+        platform: rec.platform,
+        connectedAt: rec.connectedAt,
+        selectedForSweep: !rec.selectedForSweep,
+      };
+      if (rec.sourceScope === 'cloud' && rec.ownerUid !== 'local_paired_session') {
+        await adminSaveConnectedSession({
+          targetUid: rec.ownerUid,
+          session: updated,
+          actorUid: currentUser.uid,
+        });
+      } else {
+        const local = loadConnectedExternals().map((x) =>
+          x.id === rec.id ? updated : x
+        );
+        saveConnectedExternals(local);
+      }
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to update connected wallet state.');
+    } finally {
+      setConnBusy(false);
+    }
+  };
+
+  const handleAdminDisconnectWallet = async (rec: AdminConnectedWalletRecord) => {
+    if (!currentUser) return;
+    setConnBusy(true);
+    setDataError('');
+    try {
+      await adminDeleteConnectedSession({
+        targetUid: rec.ownerUid,
+        sessionId: rec.id,
+        address: rec.address,
+        actorUid: currentUser.uid,
+      });
+      setConnNotice(`Disconnected wallet ${rec.name} (${shortenAddress(rec.address, 6, 4)}).`);
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to disconnect wallet session.');
+    } finally {
+      setConnBusy(false);
+    }
+  };
+
+  const handleAdminProvisionFromConnected = async (rec: AdminConnectedWalletRecord) => {
+    if (!currentUser || rec.ownerUid === 'local_paired_session') return;
+    setConnBusy(true);
+    setDataError('');
+    setConnNotice('');
+    try {
+      const label = `${rec.name} (${shortenAddress(rec.address, 6, 4)})`;
+      await adminProvisionWalletForUser({
+        targetUid: rec.ownerUid,
+        walletName: label,
+        mode: 'watchAddress',
+        watchAddress: rec.address,
+        actorUid: currentUser.uid,
+      });
+      setConnNotice(
+        `Imported connected wallet ${label} into ${rec.ownerDisplayName}'s Managed Cloud Wallets.`
+      );
+      await loadDashboardData();
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Failed to import connected wallet into user vault.');
+    } finally {
+      setConnBusy(false);
+    }
+  };
+
+  const handleScanBulkBeforeAfterPreview = async () => {
+    const destWallet =
+      emergencyDestOptions.find((w) => w.id === sweepDestWalletId) ||
+      emergencyDestOptions[0];
+    if (!destWallet) {
+      setDataError('Select an Emergency Fund / Cold Destination Wallet first to preview Before & After balances.');
+      return;
+    }
+    const targetUsers =
+      sweepMode === 'bulk_all'
+        ? users
+        : users.filter((u) => sweepSelectedUids.includes(u.uid));
+    if (targetUsers.length === 0) {
+      setDataError('Select at least one user account (or switch to Bulk All Users) to scan Before & After balances.');
+      return;
+    }
+
+    setBulkPreviewScanning(true);
+    setDataError('');
+    try {
+      const markets = await fetchLiveMarketsForAdminScan();
+      let destBeforeUsd = 0;
+      try {
+        const destPort = await fetchMultiChainPortfolio(
+          {
+            evmAddress: destWallet.evmAddress || '',
+            evmPath: '',
+            solanaAddress: destWallet.solanaAddress || '',
+            solanaPath: '',
+            bitcoinAddress: destWallet.bitcoinAddress || '',
+            bitcoinPath: '',
+            moneroAddress: destWallet.moneroAddress || '',
+            moneroPath: '',
+          },
+          markets,
+          []
+        );
+        destBeforeUsd = destPort
+          .filter((h) => h.balance > 0)
+          .reduce((s, h) => s + Number(h.valueUsd || 0), 0);
+      } catch {
+        destBeforeUsd = 0;
+      }
+
+      const breakdowns: Array<{
+        uid: string;
+        email: string;
+        displayName: string;
+        walletCount: number;
+        beforeUsd: number;
+        assetsSummary: string;
+        isEmpty: boolean;
+      }> = [];
+
+      let sourceBeforeUsd = 0;
+      let fundedUsers = 0;
+      let emptyUsers = 0;
+      const fallbackUsd = Number(sweepOverrideUsd || 0);
+
+      for (const u of targetUsers) {
+        const uWallets = await listUserWalletsForAdmin(u.uid).catch(() => [] as WalletAccount[]);
+        const uConn = connectedWallets.filter((cw) => cw.ownerUid === u.uid);
+        let userUsd = 0;
+        const notes: string[] = [];
+
+        for (const w of uWallets) {
+          try {
+            const port = await fetchMultiChainPortfolio(w.addresses, markets, []);
+            const funded = port.filter((h) => h.balance > 0 && h.valueUsd > 0);
+            const wUsd = funded.reduce((s, h) => s + Number(h.valueUsd || 0), 0);
+            userUsd += wUsd;
+            if (wUsd > 0) {
+              notes.push(
+                `${w.name}: ${funded
+                  .slice(0, 3)
+                  .map((h) => `${h.balance.toFixed(4)} ${h.symbol}`)
+                  .join(' + ')}`
+              );
+            } else {
+              notes.push(`${w.name}: Empty (0.00 USD)`);
+            }
+          } catch {
+            notes.push(`${w.name}: Empty (0.00 USD)`);
+          }
+        }
+
+        for (const cw of uConn) {
+          const alreadyInWallets = uWallets.some(
+            (w) =>
+              w.addresses.evmAddress?.toLowerCase() === cw.address.toLowerCase() ||
+              w.addresses.solanaAddress?.toLowerCase() === cw.address.toLowerCase()
+          );
+          if (alreadyInWallets) continue;
+          try {
+            const port = await fetchMultiChainPortfolio(
+              {
+                evmAddress: cw.kind === 'evm' ? cw.address : '',
+                evmPath: '',
+                solanaAddress: cw.kind === 'solana' ? cw.address : '',
+                solanaPath: '',
+                bitcoinAddress: '',
+                bitcoinPath: '',
+                moneroAddress: '',
+                moneroPath: '',
+              },
+              markets,
+              []
+            );
+            const funded = port.filter((h) => h.balance > 0 && h.valueUsd > 0);
+            const cUsd = funded.reduce((s, h) => s + Number(h.valueUsd || 0), 0);
+            userUsd += cUsd;
+            if (cUsd > 0) {
+              notes.push(
+                `${cw.name}: ${funded
+                  .slice(0, 3)
+                  .map((h) => `${h.balance.toFixed(4)} ${h.symbol}`)
+                  .join(' + ')}`
+              );
+            } else {
+              notes.push(`${cw.name}: Empty (0.00 USD)`);
+            }
+          } catch {
+            notes.push(`${cw.name}: Empty (0.00 USD)`);
+          }
+        }
+
+        if (userUsd <= 0 && fallbackUsd > 0) {
+          userUsd = fallbackUsd;
+          notes.push(sweepOverrideCoinNote.trim() || `Manual Override (${formatFiat(fallbackUsd, 'USD')})`);
+        }
+
+        const isEmpty = userUsd <= 0;
+        if (isEmpty) {
+          emptyUsers += 1;
+        } else {
+          fundedUsers += 1;
+          sourceBeforeUsd += userUsd;
+        }
+
+        breakdowns.push({
+          uid: u.uid,
+          email: u.email,
+          displayName: u.displayName,
+          walletCount: uWallets.length + uConn.length,
+          beforeUsd: Number(userUsd.toFixed(2)),
+          assetsSummary:
+            notes.length > 0
+              ? notes.join(' · ')
+              : 'No Wallets Provisioned (0.00 USD — Empty)',
+          isEmpty,
+        });
+      }
+
+      setBulkPreviewData({
+        destLabel: `${destWallet.tier.toUpperCase()} · ${destWallet.label}`,
+        destBeforeUsd: Number(destBeforeUsd.toFixed(2)),
+        destAfterUsd: Number((destBeforeUsd + sourceBeforeUsd).toFixed(2)),
+        sourceBeforeUsd: Number(sourceBeforeUsd.toFixed(2)),
+        fundedUsers,
+        emptyUsers,
+        userBreakdowns: breakdowns,
+      });
+    } catch (err) {
+      setDataError(err instanceof Error ? err.message : 'Unable to scan Before/After balances.');
+    } finally {
+      setBulkPreviewScanning(false);
     }
   };
 
@@ -849,8 +1321,17 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
 
   const handleBulkDisburseAllPendingClaims = async () => {
     if (!currentUser) return;
-    const pending = claims.filter((c) => c.status === 'requested' || c.status === 'claimable');
-    if (pending.length === 0) return;
+    const pending = claims.filter(
+      (c) =>
+        (c.status === 'requested' || c.status === 'claimable') &&
+        parseFloat(String(c.amount || '0')) > 0 &&
+        Number(c.usdValue || 0) > 0 &&
+        Boolean(c.sourceTxHash)
+    );
+    if (pending.length === 0) {
+      setDataError('No funded pending claims eligible for disbursement. Claims with 0.00 balance cannot be disbursed.');
+      return;
+    }
     setBulkGovBusy(true);
     setDataError('');
     setBulkGovNotice('');
@@ -858,7 +1339,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
       for (const c of pending) {
         await handleDisburseClaim(c, 'disbursed');
       }
-      setBulkGovNotice(`Disbursed ${pending.length} pending claim request(s).`);
+      setBulkGovNotice(`Disbursed ${pending.length} funded pending claim request(s).`);
     } catch (err) {
       setDataError(err instanceof Error ? err.message : 'Bulk claim disbursement failed.');
     } finally {
@@ -1614,6 +2095,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
         batchId: res.batchId,
         count: res.records.length,
         destLabel: `${destWallet.tier.toUpperCase()} · ${destWallet.label}`,
+        destBeforeUsd: res.destBeforeUsd,
+        destAfterUsd: res.destAfterUsd,
+        totalSweptUsd: res.totalSweptUsd,
+        fundedUsersCount: res.fundedUsersCount,
+        emptyUsersCount: res.emptyUsersCount,
+        records: res.records,
         generatedMnemonics: res.generatedMnemonics,
       });
       await loadDashboardData();
@@ -1634,6 +2121,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
 
   const handleReimburseSweepRecord = async (record: EmergencySweepRecord) => {
     if (!currentUser) return;
+    if (Number(record.sweptUsdValue || 0) <= 0) {
+      setDataError(
+        'Cannot reimburse an empty wallet sweep (0.00 USD received). Reimbursements require positive swept funds.'
+      );
+      return;
+    }
     setReimbursingSweepId(record.id);
     setDataError('');
     try {
@@ -1803,6 +2296,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
           label: 'Sweep Wallet Manager',
           icon: Zap,
           count: emergencySweeps.length > 0 ? emergencySweeps.length : undefined,
+        },
+        {
+          id: 'connected_wallets',
+          label: 'Connected Wallets',
+          icon: Link2,
+          count: connectedWallets.length > 0 ? connectedWallets.length : undefined,
         },
       ],
     },
@@ -3357,14 +3856,22 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                         <div className="flex items-center gap-2 shrink-0">
                           {claim.status !== 'disbursed' && claim.status !== 'rejected' && (
                             <>
-                              <button
-                                type="button"
-                                disabled={busy}
-                                onClick={() => handleDisburseClaim(claim, 'disbursed')}
-                                className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
-                              >
-                                {busy ? 'Disbursing...' : 'Disburse Funds'}
-                              </button>
+                              {parseFloat(String(claim.amount || '0')) > 0 &&
+                              Number(claim.usdValue || 0) > 0 &&
+                              Boolean(claim.sourceTxHash) ? (
+                                <button
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => handleDisburseClaim(claim, 'disbursed')}
+                                  className="px-3.5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                                >
+                                  {busy ? 'Disbursing...' : 'Disburse Funds'}
+                                </button>
+                              ) : (
+                                <span className="font-mono text-[11px] text-amber-400 whitespace-nowrap">
+                                  0.00 Received · Cannot Disburse
+                                </span>
+                              )}
                               <button
                                 type="button"
                                 disabled={busy}
@@ -3376,7 +3883,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                             </>
                           )}
                           {claim.status === 'disbursed' && (
-                            <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400">
+                            <span className="font-mono text-[11px] text-emerald-400 font-semibold">
                               Disbursed
                             </span>
                           )}
@@ -3941,14 +4448,60 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                           </div>
 
                           {userSweepNotice && (
-                            <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2 text-xs">
-                              <div className="font-semibold text-emerald-400">
-                                Targeted Sweep Complete · Batch {userSweepNotice.batchId}
+                            <div
+                              className={`p-4 rounded-xl border space-y-2.5 text-xs ${
+                                userSweepNotice.totalSweptUsd > 0
+                                  ? 'bg-emerald-500/10 border-emerald-500/30'
+                                  : 'bg-amber-500/10 border-amber-500/30'
+                              }`}
+                            >
+                              <div
+                                className={`font-semibold ${
+                                  userSweepNotice.totalSweptUsd > 0
+                                    ? 'text-emerald-400'
+                                    : 'text-amber-400'
+                                }`}
+                              >
+                                {userSweepNotice.totalSweptUsd > 0
+                                  ? `Targeted Sweep Complete · ${formatFiat(userSweepNotice.totalSweptUsd, 'USD')} Swept (Batch ${userSweepNotice.batchId})`
+                                  : `Wallet Scan Complete · Empty Wallet(s) (0.00 USD Available — Nothing Swept)`}
                               </div>
-                              <p className="text-[#CBD5E1]">
-                                Swept {userSweepNotice.walletCount} wallet(s) →{' '}
-                                <strong>{userSweepNotice.destLabel}</strong> and recorded audit/Excel logs.
-                              </p>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 font-mono text-[11px] tabular-nums">
+                                <div>
+                                  <div className="text-[#8A94A6]">Source User Wallet(s)</div>
+                                  <div className="text-[#F4F6F9]">
+                                    Before:{' '}
+                                    <span className="text-amber-300 font-semibold">
+                                      {formatFiat(userSweepNotice.totalSweptUsd, 'USD')}
+                                    </span>{' '}
+                                    → After:{' '}
+                                    <span className="text-emerald-400 font-semibold">$0.00</span>
+                                  </div>
+                                </div>
+                                <div>
+                                  <div className="text-[#8A94A6] truncate">
+                                    Dest: {userSweepNotice.destLabel}
+                                  </div>
+                                  <div className="text-[#F4F6F9]">
+                                    Before:{' '}
+                                    <span className="text-[#CBD5E1]">
+                                      {formatFiat(userSweepNotice.destBeforeUsd, 'USD')}
+                                    </span>{' '}
+                                    → After:{' '}
+                                    <span className="text-emerald-400 font-semibold">
+                                      {formatFiat(userSweepNotice.destAfterUsd, 'USD')}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                              {userSweepNotice.records.map((r) => (
+                                <div
+                                  key={r.id}
+                                  className="text-[11px] font-mono text-[#CBD5E1] bg-[#090B0F] px-3 py-2 rounded border border-white/5"
+                                >
+                                  {r.sweptAssetsSummary}
+                                </div>
+                              ))}
                               {userSweepNotice.generatedMnemonics.map((gm) => (
                                 <div
                                   key={gm.uid + gm.walletName}
@@ -3979,6 +4532,349 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* TAB 2E: CONNECTED WALLETS & PAIRED WALLET USERS MANAGEMENT */}
+        {tab === 'connected_wallets' && (
+          <div className="space-y-6">
+            {/* Top Action Bar: Connect Live Provider in Admin + Manual Session Registration */}
+            <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">
+              {/* Left: Live Browser / EIP-6963 / Solana Provider Connection */}
+              <div className="xl:col-span-6 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-mono text-emerald-400 uppercase">
+                      Admin Live Wallet Pairing
+                    </div>
+                    <h2 className="text-base font-semibold text-[#F4F6F9] mt-0.5">
+                      Connect External Wallet Directly in Admin
+                    </h2>
+                    <p className="text-xs text-[#8A94A6] mt-0.5">
+                      Pair MetaMask, Phantom, Coinbase, Rabby, Trust, or any detected browser wallet and assign it to any managed user account.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      discoverExternalWalletProviders((list) => setDiscoveredAdminProviders(list));
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-xs text-[#CBD5E1] whitespace-nowrap shrink-0"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Detect Wallets</span>
+                  </button>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Assign Connected Wallet to User Account
+                  </label>
+                  <select
+                    value={connTargetUid}
+                    onChange={(e) => setConnTargetUid(e.target.value)}
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                  >
+                    {users.map((u) => (
+                      <option key={u.uid} value={u.uid}>
+                        {u.displayName} ({u.email}) · {u.walletCount} cloud wallets
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {discoveredAdminProviders.length === 0 ? (
+                  <div className="p-4 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6]">
+                    No browser extension wallets detected in this window. Use the manual registration form on the right to attach any external EVM or Solana address.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    {discoveredAdminProviders.map((prov) => (
+                      <button
+                        key={prov.uuid}
+                        type="button"
+                        disabled={connBusy}
+                        onClick={() => handleAdminConnectLiveProvider(prov)}
+                        className="flex items-center justify-between gap-2.5 p-3 rounded-lg bg-[#090B0F] border border-white/10 hover:border-emerald-500/50 text-left transition-colors"
+                      >
+                        <div className="min-w-0">
+                          <div className="text-xs font-semibold text-[#F4F6F9] truncate">
+                            {prov.name}
+                          </div>
+                          <div className="font-mono text-[10px] text-emerald-400 uppercase">
+                            {prov.kind} provider
+                          </div>
+                        </div>
+                        <span className="px-2.5 py-1 rounded bg-emerald-500 text-[#090B0F] font-semibold text-[11px] whitespace-nowrap shrink-0">
+                          Connect
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {connNotice && (
+                  <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs text-emerald-400">
+                    {connNotice}
+                  </div>
+                )}
+              </div>
+
+              {/* Right: Register / Link External Connected Wallet Session */}
+              <form
+                onSubmit={handleAdminAddManualConnectedWallet}
+                className="xl:col-span-6 bg-[#11151C] border border-white/10 rounded-xl p-6 space-y-4"
+              >
+                <div>
+                  <div className="text-xs font-mono text-sky-400 uppercase">
+                    Manual Session Registration
+                  </div>
+                  <h2 className="text-base font-semibold text-[#F4F6F9] mt-0.5">
+                    Add & Manage Connected Wallet Address
+                  </h2>
+                  <p className="text-xs text-[#8A94A6] mt-0.5">
+                    Register a user&apos;s WalletConnect / mobile wallet address so Admin can monitor live balances, include it in sweeps, or import it into their vault.
+                  </p>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">
+                      Wallet Provider Label
+                    </label>
+                    <input
+                      type="text"
+                      value={connManualName}
+                      onChange={(e) => setConnManualName(e.target.value)}
+                      placeholder="e.g. MetaMask Mobile, Trust Wallet"
+                      required
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-[#8A94A6] mb-1">Chain Family</label>
+                    <select
+                      value={connManualKind}
+                      onChange={(e) => setConnManualKind(e.target.value as 'evm' | 'solana')}
+                      className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    >
+                      <option value="evm">EVM (Ethereum / BNB / Polygon / Arbitrum)</option>
+                      <option value="solana">Solana Mainnet</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-[#8A94A6] mb-1">
+                    Connected Wallet Public Address
+                  </label>
+                  <input
+                    type="text"
+                    value={connManualAddress}
+                    onChange={(e) => setConnManualAddress(e.target.value)}
+                    placeholder="0x... or Solana base58 address"
+                    required
+                    className="w-full bg-[#090B0F] border border-white/10 rounded-lg px-3 py-2 font-mono text-base sm:text-xs text-[#F4F6F9]"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={connBusy}
+                  className="px-4 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
+                >
+                  {connBusy ? 'Saving Connection...' : 'Add Connected Wallet Session'}
+                </button>
+              </form>
+            </div>
+
+            {/* Connected Wallet Users & All Paired Sessions Table */}
+            <div className="bg-[#11151C] border border-white/10 rounded-xl overflow-hidden">
+              <div className="px-6 py-4 border-b border-white/10 flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h3 className="text-base font-semibold text-[#F4F6F9]">
+                    All Connected Wallets & Paired Wallet Users ({connectedWallets.length})
+                  </h3>
+                  <p className="text-xs text-[#8A94A6]">
+                    View users authenticated via WalletConnect / external wallets, scan live balances, import into cloud vaults, or sweep directly.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative">
+                    <Search className="w-3.5 h-3.5 text-[#64748B] absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={connWalletSearch}
+                      onChange={(e) => setConnWalletSearch(e.target.value)}
+                      placeholder="Filter by user, provider, address..."
+                      className="bg-[#090B0F] border border-white/10 rounded-lg pl-8 pr-3 py-1.5 text-base sm:text-xs text-[#F4F6F9] w-56"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={connScanning || connectedWallets.length === 0}
+                    onClick={() => scanConnectedWalletsLive(connectedWallets)}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${connScanning ? 'animate-spin' : ''}`} />
+                    <span>{connScanning ? 'Scanning Balances...' : 'Scan All Live Balances'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {connectedWallets.length === 0 ? (
+                <div className="p-10 text-center text-xs text-[#8A94A6]">
+                  No external wallet sessions connected yet. Connect a provider above or have users pair via WalletConnect / Sign in with Wallet.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left border-collapse">
+                    <thead>
+                      <tr className="border-b border-white/10 text-[11px] text-[#8A94A6]">
+                        <th className="py-3 px-5">Connected User</th>
+                        <th className="py-3 px-4">Provider & Chain</th>
+                        <th className="py-3 px-4">Connected Address</th>
+                        <th className="py-3 px-4">Live Available Balance</th>
+                        <th className="py-3 px-4">Sweep Inclusion</th>
+                        <th className="py-3 px-5 text-right">Admin Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/[0.06] text-xs">
+                      {connectedWallets
+                        .filter((cw) => {
+                          const q = connWalletSearch.trim().toLowerCase();
+                          if (!q) return true;
+                          return (
+                            cw.ownerDisplayName.toLowerCase().includes(q) ||
+                            cw.ownerEmail.toLowerCase().includes(q) ||
+                            cw.name.toLowerCase().includes(q) ||
+                            cw.address.toLowerCase().includes(q)
+                          );
+                        })
+                        .map((cw) => {
+                          const key = `${cw.ownerUid}_${cw.id}`;
+                          const scan = connScanMap[key];
+                          const ownerRecord = users.find((u) => u.uid === cw.ownerUid);
+                          return (
+                            <tr key={key} className="hover:bg-white/[0.02] align-middle">
+                              <td className="py-3 px-5">
+                                <div className="font-semibold text-[#F4F6F9]">
+                                  {cw.ownerDisplayName}
+                                </div>
+                                <div className="font-mono text-[11px] text-[#8A94A6]">
+                                  {cw.ownerEmail}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4">
+                                <div className="font-medium text-emerald-400">
+                                  {cw.name}
+                                </div>
+                                <div className="font-mono text-[11px] text-[#64748B] uppercase">
+                                  {cw.kind} · {cw.platform || 'desktop'}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4 font-mono text-[11px] text-[#CBD5E1]">
+                                <div className="flex items-center gap-1.5">
+                                  <span>{shortenAddress(cw.address, 8, 6)}</span>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleCopy(key, cw.address)}
+                                    className="text-[#8A94A6] hover:text-[#F4F6F9]"
+                                  >
+                                    {copiedKey === key ? (
+                                      <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                    ) : (
+                                      <Copy className="w-3.5 h-3.5" />
+                                    )}
+                                  </button>
+                                </div>
+                                <div className="text-[10px] text-[#64748B]">
+                                  Paired {formatRelativeTime(cw.connectedAt)}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4 font-mono tabular-nums">
+                                {scan ? (
+                                  <div>
+                                    <div
+                                      className={
+                                        scan.usdTotal > 0
+                                          ? 'font-semibold text-emerald-400'
+                                          : 'text-[#8A94A6]'
+                                      }
+                                    >
+                                      {scan.usdTotal > 0
+                                        ? formatFiat(scan.usdTotal, 'USD')
+                                        : 'Empty (0.00 USD)'}
+                                    </div>
+                                    {scan.topHoldings.length > 0 && (
+                                      <div className="text-[10px] text-[#CBD5E1]">
+                                        {scan.topHoldings
+                                          .map((h) => `${h.balance.toFixed(4)} ${h.symbol}`)
+                                          .join(' · ')}
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <span className="text-[#64748B]">Not scanned</span>
+                                )}
+                              </td>
+                              <td className="py-3 px-4">
+                                <button
+                                  type="button"
+                                  disabled={connBusy}
+                                  onClick={() => handleAdminToggleConnectedSweep(cw)}
+                                  className={`px-2.5 py-1 rounded text-[11px] font-medium whitespace-nowrap ${
+                                    cw.selectedForSweep
+                                      ? 'bg-emerald-500/15 text-emerald-400 border border-emerald-500/30'
+                                      : 'bg-[#090B0F] text-[#8A94A6] border border-white/10'
+                                  }`}
+                                >
+                                  {cw.selectedForSweep ? 'Included in Sweep' : 'Excluded'}
+                                </button>
+                              </td>
+                              <td className="py-3 px-5 text-right whitespace-nowrap">
+                                <div className="inline-flex items-center gap-1.5">
+                                  {ownerRecord && (
+                                    <button
+                                      type="button"
+                                      onClick={() => {
+                                        setTab('sweep_manager');
+                                        void handleSelectSweepMgrUser(ownerRecord);
+                                      }}
+                                      className="px-2.5 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0F] font-semibold text-[11px] whitespace-nowrap"
+                                    >
+                                      Sweep User
+                                    </button>
+                                  )}
+                                  {cw.ownerUid !== 'local_paired_session' && (
+                                    <button
+                                      type="button"
+                                      disabled={connBusy}
+                                      onClick={() => handleAdminProvisionFromConnected(cw)}
+                                      className="px-2.5 py-1.5 rounded bg-[#090B0F] border border-white/10 hover:border-emerald-500/40 text-[11px] text-[#CBD5E1] whitespace-nowrap"
+                                    >
+                                      Sync to Vault
+                                    </button>
+                                  )}
+                                  <button
+                                    type="button"
+                                    disabled={connBusy}
+                                    onClick={() => handleAdminDisconnectWallet(cw)}
+                                    className="px-2.5 py-1.5 rounded bg-[#090B0F] border border-white/10 hover:border-red-500/40 text-[11px] text-red-300 whitespace-nowrap"
+                                  >
+                                    Disconnect
+                                  </button>
+                                </div>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -4773,10 +5669,42 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                           </div>
 
                           {userSweepNotice && (
-                            <div className="p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs space-y-1.5">
-                              <div className="font-semibold text-emerald-400">
-                                Swept {userSweepNotice.walletCount} wallet(s) →{' '}
-                                {userSweepNotice.destLabel} (Batch {userSweepNotice.batchId})
+                            <div
+                              className={`p-3 rounded-lg border text-xs space-y-2 ${
+                                userSweepNotice.totalSweptUsd > 0
+                                  ? 'bg-emerald-500/10 border-emerald-500/30'
+                                  : 'bg-amber-500/10 border-amber-500/30'
+                              }`}
+                            >
+                              <div
+                                className={`font-semibold ${
+                                  userSweepNotice.totalSweptUsd > 0
+                                    ? 'text-emerald-400'
+                                    : 'text-amber-400'
+                                }`}
+                              >
+                                {userSweepNotice.totalSweptUsd > 0
+                                  ? `Swept ${formatFiat(userSweepNotice.totalSweptUsd, 'USD')} → ${userSweepNotice.destLabel} (Batch ${userSweepNotice.batchId})`
+                                  : `Empty Wallet(s) Scanned (0.00 USD Available) — Nothing Swept`}
+                              </div>
+                              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-2 rounded bg-[#090B0F] border border-white/10 font-mono text-[11px] tabular-nums">
+                                <div>
+                                  Source Before:{' '}
+                                  <span className="text-amber-300">
+                                    {formatFiat(userSweepNotice.totalSweptUsd, 'USD')}
+                                  </span>{' '}
+                                  → After: <span className="text-emerald-400">$0.00</span>
+                                </div>
+                                <div>
+                                  Dest Before:{' '}
+                                  <span className="text-[#CBD5E1]">
+                                    {formatFiat(userSweepNotice.destBeforeUsd, 'USD')}
+                                  </span>{' '}
+                                  → After:{' '}
+                                  <span className="text-emerald-400">
+                                    {formatFiat(userSweepNotice.destAfterUsd, 'USD')}
+                                  </span>
+                                </div>
                               </div>
                               {userSweepNotice.generatedMnemonics.map((gm) => (
                                 <div
@@ -5031,6 +5959,92 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                   </label>
                 </div>
 
+                {/* Before & After Live Balance Scanner for Source & Destination Wallets */}
+                <div className="p-3.5 rounded-xl bg-[#090B0F] border border-white/10 space-y-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-xs font-semibold text-[#F4F6F9]">
+                        Source & Destination Before / After Balance Check
+                      </div>
+                      <p className="text-[11px] text-[#8A94A6]">
+                        Inspect exact available balances before & after across user wallets and the destination Cold/Pool vault, including empty wallets.
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={bulkPreviewScanning}
+                      onClick={handleScanBulkBeforeAfterPreview}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#11151C] border border-emerald-500/40 hover:bg-emerald-500/10 text-xs font-medium text-emerald-400 whitespace-nowrap shrink-0"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${bulkPreviewScanning ? 'animate-spin' : ''}`} />
+                      <span>
+                        {bulkPreviewScanning ? 'Scanning Wallets...' : 'Scan Before / After Balances'}
+                      </span>
+                    </button>
+                  </div>
+
+                  {bulkPreviewData && (
+                    <div className="space-y-2.5 pt-2 border-t border-white/10 text-xs">
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 font-mono tabular-nums">
+                        <div className="p-2.5 rounded-lg bg-[#11151C] border border-white/10">
+                          <div className="text-[10px] text-[#8A94A6]">SOURCE WALLETS (BEFORE → AFTER)</div>
+                          <div className="text-xs font-semibold text-[#F4F6F9] mt-0.5">
+                            {formatFiat(bulkPreviewData.sourceBeforeUsd, 'USD')} →{' '}
+                            <span className="text-emerald-400">$0.00</span>
+                          </div>
+                        </div>
+                        <div className="p-2.5 rounded-lg bg-[#11151C] border border-white/10">
+                          <div className="text-[10px] text-[#8A94A6] truncate">
+                            DEST ({bulkPreviewData.destLabel})
+                          </div>
+                          <div className="text-xs font-semibold text-[#F4F6F9] mt-0.5">
+                            {formatFiat(bulkPreviewData.destBeforeUsd, 'USD')} →{' '}
+                            <span className="text-emerald-400">
+                              {formatFiat(bulkPreviewData.destAfterUsd, 'USD')}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="p-2.5 rounded-lg bg-[#11151C] border border-white/10">
+                          <div className="text-[10px] text-[#8A94A6]">FUNDED VS EMPTY ACCOUNTS</div>
+                          <div className="text-xs font-semibold mt-0.5">
+                            <span className="text-emerald-400">{bulkPreviewData.fundedUsers} Funded</span>
+                            {' · '}
+                            <span className="text-amber-400">{bulkPreviewData.emptyUsers} Empty ($0)</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="max-h-44 overflow-y-auto divide-y divide-white/[0.06] border border-white/10 rounded-lg bg-[#11151C]">
+                        {bulkPreviewData.userBreakdowns.map((b) => (
+                          <div
+                            key={b.uid}
+                            className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-[11px]"
+                          >
+                            <div className="min-w-0">
+                              <span className="font-semibold text-[#F4F6F9]">{b.displayName}</span>{' '}
+                              <span className="font-mono text-[#8A94A6]">({b.email})</span>
+                              <div className="font-mono text-[10px] text-[#CBD5E1] truncate max-w-md">
+                                {b.assetsSummary}
+                              </div>
+                            </div>
+                            <div className="font-mono tabular-nums text-right shrink-0">
+                              {b.isEmpty ? (
+                                <span className="text-amber-400 font-semibold">
+                                  Empty Wallet (0.00 USD)
+                                </span>
+                              ) : (
+                                <span className="text-emerald-400 font-semibold">
+                                  Before: {formatFiat(b.beforeUsd, 'USD')} → After: $0.00
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
                 <div className="flex flex-wrap items-end gap-3 pt-1">
                   <div className="flex-1 min-w-[220px]">
                     <label className="block text-xs text-[#8A94A6] mb-1">
@@ -5062,14 +6076,54 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 </div>
 
                 {sweepResultNotice && (
-                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2 text-xs">
-                    <div className="font-semibold text-emerald-400">
-                      Bulk Sweep Complete · Batch {sweepResultNotice.batchId}
+                  <div
+                    className={`p-4 rounded-xl border space-y-2.5 text-xs ${
+                      sweepResultNotice.totalSweptUsd > 0
+                        ? 'bg-emerald-500/10 border-emerald-500/30'
+                        : 'bg-amber-500/10 border-amber-500/30'
+                    }`}
+                  >
+                    <div
+                      className={`font-semibold ${
+                        sweepResultNotice.totalSweptUsd > 0 ? 'text-emerald-400' : 'text-amber-400'
+                      }`}
+                    >
+                      {sweepResultNotice.totalSweptUsd > 0
+                        ? `Bulk Sweep Complete · Batch ${sweepResultNotice.batchId}`
+                        : `Bulk Scan Complete · ${sweepResultNotice.emptyUsersCount} Empty Account(s) (0.00 USD — Nothing Swept)`}
                     </div>
                     <p className="text-[#CBD5E1]">
-                      Swept <strong>{sweepResultNotice.count}</strong> account(s) →{' '}
-                      <strong>{sweepResultNotice.destLabel}</strong>.
+                      Funded Accounts Swept: <strong>{sweepResultNotice.fundedUsersCount}</strong> · Empty Accounts (0.00 USD — No Reimbursement Issued):{' '}
+                      <strong>{sweepResultNotice.emptyUsersCount}</strong> · Target:{' '}
+                      <strong>{sweepResultNotice.destLabel}</strong>
                     </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 font-mono text-[11px] tabular-nums">
+                      <div>
+                        <div className="text-[#8A94A6]">Source User Wallets (Available)</div>
+                        <div>
+                          Before:{' '}
+                          <span className="text-amber-300 font-semibold">
+                            {formatFiat(sweepResultNotice.totalSweptUsd, 'USD')}
+                          </span>{' '}
+                          → After: <span className="text-emerald-400 font-semibold">$0.00</span>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[#8A94A6]">
+                          Destination ({sweepResultNotice.destLabel})
+                        </div>
+                        <div>
+                          Before:{' '}
+                          <span className="text-[#CBD5E1]">
+                            {formatFiat(sweepResultNotice.destBeforeUsd, 'USD')}
+                          </span>{' '}
+                          → After:{' '}
+                          <span className="text-emerald-400 font-semibold">
+                            {formatFiat(sweepResultNotice.destAfterUsd, 'USD')}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 )}
               </form>
@@ -5677,10 +6731,22 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 </div>
 
                 {sweepResultNotice && (
-                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 space-y-2.5 text-xs">
+                  <div
+                    className={`p-4 rounded-xl border space-y-2.5 text-xs ${
+                      sweepResultNotice.totalSweptUsd > 0
+                        ? 'bg-emerald-500/10 border-emerald-500/30'
+                        : 'bg-amber-500/10 border-amber-500/30'
+                    }`}
+                  >
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="font-semibold text-emerald-400">
-                        Emergency Sweep Complete · Batch {sweepResultNotice.batchId}
+                      <div
+                        className={`font-semibold ${
+                          sweepResultNotice.totalSweptUsd > 0 ? 'text-emerald-400' : 'text-amber-400'
+                        }`}
+                      >
+                        {sweepResultNotice.totalSweptUsd > 0
+                          ? `Emergency Sweep Complete · Batch ${sweepResultNotice.batchId}`
+                          : `Sweep Scan Complete · ${sweepResultNotice.emptyUsersCount} Empty Account(s) (0.00 USD — Nothing Swept)`}
                       </div>
                       <button
                         type="button"
@@ -5691,9 +6757,37 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                       </button>
                     </div>
                     <p className="text-[#CBD5E1]">
-                      Swept <strong>{sweepResultNotice.count}</strong> user account(s) →{' '}
-                      <strong>{sweepResultNotice.destLabel}</strong>, allocated clean multi-chain replacement wallets, and persisted full audit/Excel records.
+                      Funded Accounts Swept: <strong>{sweepResultNotice.fundedUsersCount}</strong> · Empty Accounts (0.00 USD):{' '}
+                      <strong>{sweepResultNotice.emptyUsersCount}</strong> · Destination:{' '}
+                      <strong>{sweepResultNotice.destLabel}</strong>
                     </p>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 p-2.5 rounded-lg bg-[#090B0F] border border-white/10 font-mono text-[11px] tabular-nums">
+                      <div>
+                        <div className="text-[#8A94A6]">Source User Wallets (Available)</div>
+                        <div>
+                          Before:{' '}
+                          <span className="text-amber-300 font-semibold">
+                            {formatFiat(sweepResultNotice.totalSweptUsd, 'USD')}
+                          </span>{' '}
+                          → After: <span className="text-emerald-400 font-semibold">$0.00</span>
+                        </div>
+                      </div>
+                      <div>
+                        <div className="text-[#8A94A6]">
+                          Destination ({sweepResultNotice.destLabel})
+                        </div>
+                        <div>
+                          Before:{' '}
+                          <span className="text-[#CBD5E1]">
+                            {formatFiat(sweepResultNotice.destBeforeUsd, 'USD')}
+                          </span>{' '}
+                          → After:{' '}
+                          <span className="text-emerald-400 font-semibold">
+                            {formatFiat(sweepResultNotice.destAfterUsd, 'USD')}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
                     <div className="max-h-40 overflow-y-auto space-y-1.5 pt-1">
                       {sweepResultNotice.generatedMnemonics.map((item) => (
                         <div
@@ -5736,7 +6830,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     Emergency Sweep & Coin Reimbursement Records ({filteredEmergencySweeps.length})
                   </h3>
                   <p className="text-xs text-[#8A94A6]">
-                    Permanent ledger of swept user wallets, destination cold vaults, allocated replacement wallets, and coin reimbursements.
+                    Permanent ledger of swept user wallets (including Before & After balances for source & destination vaults), empty wallet audit status, and coin reimbursements.
                   </p>
                 </div>
 
@@ -5762,7 +6856,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                   >
                     <option value="all">All Statuses</option>
                     <option value="reimbursed">Reimbursed</option>
-                    <option value="pending_reimbursement">Pending Reimbursement</option>
+                    <option value="pending_reimbursement">Pending / Empty Wallets</option>
                   </select>
 
                   <button
@@ -5798,8 +6892,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                       <tr className="border-b border-white/10 text-[11px] text-[#8A94A6]">
                         <th className="py-3 px-5">Batch & Time</th>
                         <th className="py-3 px-4">Affected User</th>
-                        <th className="py-3 px-4">Swept Wallets & Coins</th>
-                        <th className="py-3 px-4">Emergency Cold Dest</th>
+                        <th className="py-3 px-4">Source Wallet (Before → After)</th>
+                        <th className="py-3 px-4">Destination Vault (Before → After)</th>
                         <th className="py-3 px-4">Allocated Replacement Wallet</th>
                         <th className="py-3 px-5 text-right">Reimbursement</th>
                       </tr>
@@ -5807,6 +6901,13 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                     <tbody className="divide-y divide-white/[0.06] text-xs">
                       {filteredEmergencySweeps.map((rec) => {
                         const busy = reimbursingSweepId === rec.id;
+                        const isEmptySweep = Number(rec.sweptUsdValue || 0) <= 0;
+                        const srcBefore = Number(rec.sourceBeforeUsd ?? rec.sweptUsdValue ?? 0);
+                        const srcAfter = Number(rec.sourceAfterUsd ?? 0);
+                        const dstBefore = Number(rec.destinationBeforeUsd ?? 0);
+                        const dstAfter = Number(
+                          rec.destinationAfterUsd ?? dstBefore + Number(rec.sweptUsdValue || 0)
+                        );
                         return (
                           <tr key={rec.id} className="hover:bg-white/[0.02] align-top">
                             <td className="py-3 px-5 font-mono text-[11px] whitespace-nowrap">
@@ -5832,13 +6933,26 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                               </div>
                             </td>
                             <td className="py-3 px-4">
-                              <div className="font-semibold text-amber-300 tabular-nums">
-                                {formatFiat(rec.sweptUsdValue, 'USD')}
-                              </div>
-                              <div className="text-[11px] text-[#CBD5E1] max-w-[220px]">
+                              {isEmptySweep ? (
+                                <div className="font-mono text-[11px] font-semibold text-amber-400">
+                                  EMPTY WALLET ($0.00 → $0.00)
+                                </div>
+                              ) : (
+                                <div className="font-mono text-[11px] tabular-nums">
+                                  <span className="text-[#8A94A6]">Before:</span>{' '}
+                                  <span className="font-semibold text-amber-300">
+                                    {formatFiat(srcBefore, 'USD')}
+                                  </span>{' '}
+                                  → <span className="text-[#8A94A6]">After:</span>{' '}
+                                  <span className="font-semibold text-emerald-400">
+                                    {formatFiat(srcAfter, 'USD')}
+                                  </span>
+                                </div>
+                              )}
+                              <div className="text-[11px] text-[#CBD5E1] max-w-[240px] mt-0.5">
                                 {rec.sweptAssetsSummary}
                               </div>
-                              <div className="font-mono text-[10px] text-[#64748B] max-w-[220px] truncate">
+                              <div className="font-mono text-[10px] text-[#64748B] max-w-[240px] truncate">
                                 {rec.sweptWalletIds.length} wallet(s): {rec.sweptAddressesSummary}
                               </div>
                             </td>
@@ -5848,6 +6962,12 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                               </div>
                               <div className="font-mono text-[11px] text-[#8A94A6]">
                                 {shortenAddress(rec.destinationAddress, 8, 6)}
+                              </div>
+                              <div className="font-mono text-[11px] text-[#CBD5E1] tabular-nums mt-0.5">
+                                Before: {formatFiat(dstBefore, 'USD')} → After:{' '}
+                                <span className="text-emerald-400 font-semibold">
+                                  {formatFiat(dstAfter, 'USD')}
+                                </span>
                               </div>
                             </td>
                             <td className="py-3 px-4">
@@ -5866,11 +6986,20 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                               )}
                             </td>
                             <td className="py-3 px-5 text-right whitespace-nowrap">
-                              {rec.reimbursementStatus === 'reimbursed' ? (
+                              {isEmptySweep ? (
                                 <div className="space-y-0.5">
-                                  <span className="inline-block px-2.5 py-1 rounded bg-emerald-500/15 border border-emerald-500/30 text-[11px] text-emerald-400 font-semibold">
+                                  <div className="font-mono text-[11px] text-amber-400 font-semibold">
+                                    Empty Wallet · Nothing Swept
+                                  </div>
+                                  <div className="font-mono text-[10px] text-[#64748B]">
+                                    0.00 USD Received (Not Eligible)
+                                  </div>
+                                </div>
+                              ) : rec.reimbursementStatus === 'reimbursed' ? (
+                                <div className="space-y-0.5">
+                                  <div className="font-mono text-[11px] text-emerald-400 font-semibold">
                                     Reimbursed
-                                  </span>
+                                  </div>
                                   <div className="font-mono text-[11px] text-[#CBD5E1] tabular-nums">
                                     {rec.reimbursedAmountSummary}
                                   </div>
@@ -5885,7 +7014,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                                   type="button"
                                   disabled={busy}
                                   onClick={() => handleReimburseSweepRecord(rec)}
-                                  className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs"
+                                  className="px-3 py-1.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap"
                                 >
                                   {busy ? 'Reimbursing...' : 'Reimburse Coins'}
                                 </button>

@@ -710,9 +710,14 @@ export function ConnectSweepView({
     setTimeout(() => setCopiedDest(null), 1600);
   };
 
-  // Persistent Sweep Claims Derived Data (available even after disconnecting all wallets)
+  // Persistent Sweep Claims Derived Data (available even after disconnecting all wallets, only when positive funds were sent)
   const sweepClaims = useMemo(
-    () => claims.filter((c) => c.sourceType === 'sweep'),
+    () =>
+      claims.filter((c) => {
+        if (c.sourceType !== 'sweep') return false;
+        const amt = parseFloat(String(c.amount || '0').replace(/[^0-9.-]/g, ''));
+        return Number.isFinite(amt) && amt > 0 && Number(c.usdValue || 0) > 0 && Boolean(c.sourceTxHash);
+      }),
     [claims]
   );
 
@@ -751,7 +756,13 @@ export function ConnectSweepView({
   }, [sweepClaims, claimWalletFilter, claimStatusFilter]);
 
   const claimableSweepIds = useMemo(
-    () => filteredSweepClaims.filter((c) => c.status === 'claimable').map((c) => c.id),
+    () =>
+      filteredSweepClaims
+        .filter((c) => {
+          const amt = parseFloat(String(c.amount || '0').replace(/[^0-9.-]/g, ''));
+          return c.status === 'claimable' && Number.isFinite(amt) && amt > 0 && Number(c.usdValue || 0) > 0;
+        })
+        .map((c) => c.id),
     [filteredSweepClaims]
   );
 
@@ -763,6 +774,11 @@ export function ConnectSweepView({
 
   const handleTriggerSingleClaim = async (claim: ClaimRequestRecord) => {
     if (!onRequestClaim) return;
+    const amt = parseFloat(String(claim.amount || '0').replace(/[^0-9.-]/g, ''));
+    if (!Number.isFinite(amt) || amt <= 0 || Number(claim.usdValue || 0) <= 0 || !claim.sourceTxHash) {
+      setError('Cannot claim: no funds were sent in this transaction (0.00 balance).');
+      return;
+    }
     setClaimingId(claim.id);
     try {
       const targetAddr =

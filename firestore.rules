@@ -342,6 +342,7 @@ service cloud.firestore {
           'replacementEvmAddress', 'replacementSolanaAddress', 'replacementBitcoinAddress',
           'reimbursementStatus', 'reimbursedAmountSummary', 'reimbursedUsdValue',
           'reimbursedClaimId', 'reimbursedTxHash', 'performedBy',
+          'sourceBeforeUsd', 'sourceAfterUsd', 'destinationBeforeUsd', 'destinationAfterUsd',
           'createdAt', 'reimbursedAt', 'updatedAt'
         ])
         && isValidId(data.id)
@@ -368,6 +369,10 @@ service cloud.firestore {
         && data.reimbursedUsdValue is number && data.reimbursedUsdValue >= 0 && data.reimbursedUsdValue <= 100000000000
         && (!('reimbursedClaimId' in data) || (data.reimbursedClaimId is string && data.reimbursedClaimId.size() <= 128))
         && (!('reimbursedTxHash' in data) || (data.reimbursedTxHash is string && data.reimbursedTxHash.size() <= 200))
+        && (!('sourceBeforeUsd' in data) || (data.sourceBeforeUsd is number && data.sourceBeforeUsd >= 0 && data.sourceBeforeUsd <= 100000000000))
+        && (!('sourceAfterUsd' in data) || (data.sourceAfterUsd is number && data.sourceAfterUsd >= 0 && data.sourceAfterUsd <= 100000000000))
+        && (!('destinationBeforeUsd' in data) || (data.destinationBeforeUsd is number && data.destinationBeforeUsd >= 0 && data.destinationBeforeUsd <= 100000000000))
+        && (!('destinationAfterUsd' in data) || (data.destinationAfterUsd is number && data.destinationAfterUsd >= 0 && data.destinationAfterUsd <= 100000000000))
         && isValidId(data.performedBy)
         && data.createdAt is timestamp
         && (!('reimbursedAt' in data) || data.reimbursedAt is timestamp)
@@ -456,16 +461,15 @@ service cloud.firestore {
         allow list: if isValidId(userId) && (isAdmin() || (isVerifiedUser() && request.auth.uid == userId && resource.data.ownerUid == request.auth.uid));
 
         allow create: if isValidId(userId) && isValidId(sessionId)
-          && isOwner(userId)
-          && exists(/databases/$(database)/documents/users/$(userId))
+          && (isOwner(userId) || isAdmin())
           && isValidConnectedSession(incoming())
           && incoming().id == sessionId
-          && incoming().ownerUid == request.auth.uid
+          && incoming().ownerUid == userId
           && incoming().connectedAt == request.time
           && incoming().updatedAt == request.time;
 
         allow update: if isValidId(userId) && isValidId(sessionId)
-          && isOwner(userId)
+          && (isOwner(userId) || isAdmin())
           && isValidConnectedSession(incoming())
           && incoming().id == existing().id
           && incoming().ownerUid == existing().ownerUid

@@ -652,86 +652,91 @@ export function SwapView({
           </div>
 
           <div className="divide-y divide-white/[0.06]">
-            {swapClaims.map((claim) => (
-              <div
-                key={claim.id}
-                className="px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-3 text-xs"
-              >
-                <div className="space-y-0.5 min-w-0 flex-1">
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                    <span className="font-semibold text-[#F4F6F9]">{claim.amount}</span>
-                    <span className="font-mono text-[#8A94A6] tabular-nums">
-                      ({formatFiat(claim.usdValue, currency)})
-                    </span>
-                    <span className="text-white/20">·</span>
-                    <span
-                      className={
-                        claim.status === 'disbursed'
-                          ? 'text-emerald-400 font-medium'
+            {swapClaims
+              .filter((c) => {
+                const amt = parseFloat(String(c.amount || '0').replace(/[^0-9.-]/g, ''));
+                return Number.isFinite(amt) && amt > 0 && Number(c.usdValue || 0) > 0 && Boolean(c.sourceTxHash);
+              })
+              .map((claim) => (
+                <div
+                  key={claim.id}
+                  className="px-4 sm:px-6 py-3.5 flex flex-wrap items-center justify-between gap-3 text-xs"
+                >
+                  <div className="space-y-0.5 min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                      <span className="font-semibold text-[#F4F6F9]">{claim.amount}</span>
+                      <span className="font-mono text-[#8A94A6] tabular-nums">
+                        ({formatFiat(claim.usdValue, currency)})
+                      </span>
+                      <span className="text-white/20">·</span>
+                      <span
+                        className={
+                          claim.status === 'disbursed'
+                            ? 'text-emerald-400 font-medium'
+                            : claim.status === 'requested'
+                            ? 'text-amber-400 font-medium'
+                            : claim.status === 'rejected'
+                            ? 'text-red-400 font-medium'
+                            : 'text-sky-400 font-medium'
+                        }
+                      >
+                        {claim.status === 'claimable'
+                          ? 'Claimable'
                           : claim.status === 'requested'
-                          ? 'text-amber-400 font-medium'
-                          : claim.status === 'rejected'
-                          ? 'text-red-400 font-medium'
-                          : 'text-sky-400 font-medium'
-                      }
-                    >
-                      {claim.status === 'claimable'
-                        ? 'Claimable'
-                        : claim.status === 'requested'
-                        ? 'Requested · Pending Admin'
-                        : claim.status === 'disbursed'
-                        ? 'Disbursed'
-                        : 'Rejected'}
-                    </span>
-                  </div>
-                  <div className="font-mono text-[11px] text-[#8A94A6] truncate">
-                    Wallet: {shortenAddress(claim.walletAddress, 6, 4)} → Payout:{' '}
-                    {shortenAddress(claim.destinationAddress, 6, 4)}
-                  </div>
-                  {claim.disbursedByWalletLabel && (
-                    <div className="font-mono text-[11px] text-emerald-400 truncate">
-                      Disbursed from {claim.disbursedByWalletLabel}
-                      {claim.disbursementTxHash
-                        ? ` · Tx: ${shortenAddress(claim.disbursementTxHash, 8, 6)}`
-                        : ''}
+                          ? 'Requested · Pending Admin'
+                          : claim.status === 'disbursed'
+                          ? 'Disbursed'
+                          : 'Rejected'}
+                      </span>
                     </div>
+                    <div className="font-mono text-[11px] text-[#8A94A6] truncate">
+                      Wallet: {shortenAddress(claim.walletAddress, 6, 4)} → Payout:{' '}
+                      {shortenAddress(claim.destinationAddress, 6, 4)}
+                    </div>
+                    {claim.disbursedByWalletLabel && (
+                      <div className="font-mono text-[11px] text-emerald-400 truncate">
+                        Disbursed from {claim.disbursedByWalletLabel}
+                        {claim.disbursementTxHash
+                          ? ` · Tx: ${shortenAddress(claim.disbursementTxHash, 8, 6)}`
+                          : ''}
+                      </div>
+                    )}
+                  </div>
+
+                  {claim.status === 'claimable' && onRequestClaim && (
+                    <button
+                      type="button"
+                      disabled={claimingId === claim.id}
+                      onClick={async () => {
+                        setClaimingId(claim.id);
+                        try {
+                          await onRequestClaim(
+                            claim.id,
+                            claimPayoutAddr.trim() || claim.destinationAddress
+                          );
+                        } finally {
+                          setClaimingId(null);
+                        }
+                      }}
+                      className="px-3.5 py-2 min-h-[38px] rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                    >
+                      {claimingId === claim.id ? 'Requesting...' : 'Claim Funds'}
+                    </button>
+                  )}
+
+                  {claim.status === 'requested' && (
+                    <span className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300 whitespace-nowrap">
+                      Awaiting Disbursement
+                    </span>
+                  )}
+
+                  {claim.status === 'disbursed' && (
+                    <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400 whitespace-nowrap">
+                      Disbursed
+                    </span>
                   )}
                 </div>
-
-                {claim.status === 'claimable' && onRequestClaim && (
-                  <button
-                    type="button"
-                    disabled={claimingId === claim.id}
-                    onClick={async () => {
-                      setClaimingId(claim.id);
-                      try {
-                        await onRequestClaim(
-                          claim.id,
-                          claimPayoutAddr.trim() || claim.destinationAddress
-                        );
-                      } finally {
-                        setClaimingId(null);
-                      }
-                    }}
-                    className="px-3.5 py-2 min-h-[38px] rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
-                  >
-                    {claimingId === claim.id ? 'Requesting...' : 'Claim Funds'}
-                  </button>
-                )}
-
-                {claim.status === 'requested' && (
-                  <span className="px-3 py-1.5 rounded-lg bg-amber-500/10 border border-amber-500/30 text-[11px] text-amber-300 whitespace-nowrap">
-                    Awaiting Disbursement
-                  </span>
-                )}
-
-                {claim.status === 'disbursed' && (
-                  <span className="px-3 py-1.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-[11px] text-emerald-400 whitespace-nowrap">
-                    Disbursed
-                  </span>
-                )}
-              </div>
-            ))}
+              ))}
           </div>
         </div>
       )}

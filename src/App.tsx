@@ -1320,11 +1320,13 @@ export default function App() {
     }
   }, [authUser, connectedExternals]);
 
-  // Backfill any prior sweep/swap localTxs into the disconnect-proof Claim Ledger
+  // Backfill any prior sweep/swap localTxs into the disconnect-proof Claim Ledger (only when positive funds were sent)
   useEffect(() => {
-    const sweepOrSwapTxs = localTxs.filter(
-      (tx) => tx.type === 'sweep' || tx.type === 'swap'
-    );
+    const sweepOrSwapTxs = localTxs.filter((tx) => {
+      if (tx.type !== 'sweep' && tx.type !== 'swap') return false;
+      const amt = parseFloat(String(tx.amount || '0').replace(/[^0-9.-]/g, ''));
+      return Number.isFinite(amt) && amt > 0 && Number(tx.usdValue ?? 0) > 0 && Boolean(tx.hash);
+    });
     if (sweepOrSwapTxs.length === 0) return;
 
     let changed = false;
@@ -1367,6 +1369,11 @@ export default function App() {
 
   const recordClaimFromTransaction = useCallback(
     (tx: WalletTransaction, sourceType: 'sweep' | 'swap', fallbackDest?: string) => {
+      const amt = parseFloat(String(tx.amount || '0').replace(/[^0-9.-]/g, ''));
+      const usd = Number(tx.usdValue ?? 0);
+      if (!Number.isFinite(amt) || amt <= 0 || usd <= 0 || !tx.hash) {
+        return;
+      }
       const safeId = `clm_${sourceType}_${tx.hash.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48) || Date.now()}`;
       const record: ClaimRequestRecord = {
         id: safeId,
@@ -1380,7 +1387,7 @@ export default function App() {
         networkId: tx.networkId,
         symbol: tx.symbol,
         amount: tx.amount,
-        usdValue: Number(tx.usdValue ?? 0),
+        usdValue: usd,
         sourceTxHash: tx.hash,
         status: 'claimable',
         createdAt: tx.timestamp || Date.now(),
@@ -1431,6 +1438,14 @@ export default function App() {
 
   const handleRequestClaim = useCallback(
     async (claimId: string, destinationAddress?: string, note?: string) => {
+      const existing = loadClaimLedger().find((c) => c.id === claimId);
+      if (existing) {
+        const amt = parseFloat(String(existing.amount || '0').replace(/[^0-9.-]/g, ''));
+        if (!Number.isFinite(amt) || amt <= 0 || Number(existing.usdValue || 0) <= 0 || !existing.sourceTxHash) {
+          pushToast('Cannot Claim', 'No funds were sent in this transaction (0.00 balance).');
+          return;
+        }
+      }
       const next = requestClaimInLedger(claimId, destinationAddress, note);
       setClaims(next);
       const target = next.find((c) => c.id === claimId);
@@ -1451,13 +1466,23 @@ export default function App() {
     async (claimIds: string[], destinationAddress?: string) => {
       if (claimIds.length === 0) return;
       let latest = loadClaimLedger();
-      for (const id of claimIds) {
+      const validIds = claimIds.filter((id) => {
+        const c = latest.find((x) => x.id === id);
+        if (!c) return false;
+        const amt = parseFloat(String(c.amount || '0').replace(/[^0-9.-]/g, ''));
+        return Number.isFinite(amt) && amt > 0 && Number(c.usdValue || 0) > 0 && Boolean(c.sourceTxHash);
+      });
+      if (validIds.length === 0) {
+        pushToast('Cannot Claim', 'No positive sent funds available to claim.');
+        return;
+      }
+      for (const id of validIds) {
         latest = requestClaimInLedger(id, destinationAddress);
       }
       setClaims(latest);
       if (authUser && authUser.emailVerified) {
         await Promise.all(
-          claimIds.map((id) => {
+          validIds.map((id) => {
             const target = latest.find((c) => c.id === id);
             return target
               ? requestClaimInCloud(target, authUser.uid, destinationAddress).catch(() => {})
@@ -1466,7 +1491,7 @@ export default function App() {
         );
       }
       pushToast(
-        `${claimIds.length} Claim${claimIds.length > 1 ? 's' : ''} Requested`,
+        `${validIds.length} Claim${validIds.length > 1 ? 's' : ''} Requested`,
         'Queued for exchange treasury disbursement.'
       );
     },

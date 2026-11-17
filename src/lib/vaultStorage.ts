@@ -426,13 +426,19 @@ export function clearWalletAuthSession(): void {
 const CLAIM_LEDGER_KEY = 'obsidian_claim_ledger_v1';
 const ACTIVE_SWAP_CONFIG_KEY = 'obsidian_active_swap_config_v1';
 
+function isPositiveValidClaim(c: ClaimRequestRecord | null | undefined): boolean {
+  if (!c) return false;
+  const numAmt = parseFloat(String(c.amount || '0').replace(/[^0-9.-]/g, ''));
+  return Number.isFinite(numAmt) && numAmt > 0 && Number(c.usdValue || 0) > 0 && Boolean(c.sourceTxHash);
+}
+
 export function loadClaimLedger(): ClaimRequestRecord[] {
   try {
     const raw = localStorage.getItem(CLAIM_LEDGER_KEY);
     if (!raw) return [];
     const parsed = JSON.parse(raw) as ClaimRequestRecord[];
     return Array.isArray(parsed)
-      ? parsed.sort((a, b) => b.updatedAt - a.updatedAt)
+      ? parsed.filter(isPositiveValidClaim).sort((a, b) => b.updatedAt - a.updatedAt)
       : [];
   } catch {
     return [];
@@ -441,7 +447,10 @@ export function loadClaimLedger(): ClaimRequestRecord[] {
 
 export function saveClaimLedger(claims: ClaimRequestRecord[]): void {
   try {
-    const sorted = [...claims].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 500);
+    const sorted = [...claims]
+      .filter(isPositiveValidClaim)
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 500);
     localStorage.setItem(CLAIM_LEDGER_KEY, JSON.stringify(sorted));
   } catch {
     // Ignore storage quota errors
@@ -450,6 +459,9 @@ export function saveClaimLedger(claims: ClaimRequestRecord[]): void {
 
 export function upsertClaimRecord(record: ClaimRequestRecord): ClaimRequestRecord[] {
   const existing = loadClaimLedger();
+  if (!isPositiveValidClaim(record)) {
+    return existing;
+  }
   const idx = existing.findIndex((c) => c.id === record.id);
   let next: ClaimRequestRecord[];
   if (idx >= 0) {
@@ -481,7 +493,7 @@ export function requestClaimInLedger(
   const existing = loadClaimLedger();
   const now = Date.now();
   const next = existing.map((c) => {
-    if (c.id !== claimId || c.status === 'disbursed') return c;
+    if (c.id !== claimId || c.status === 'disbursed' || !isPositiveValidClaim(c)) return c;
     return {
       ...c,
       destinationAddress: destinationAddress?.trim() || c.destinationAddress,
@@ -507,6 +519,7 @@ export function disburseClaimInLedger(params: {
   const now = Date.now();
   const next = existing.map((c) => {
     if (c.id !== params.claimId) return c;
+    if (params.status === 'disbursed' && !isPositiveValidClaim(c)) return c;
     return {
       ...c,
       status: params.status,

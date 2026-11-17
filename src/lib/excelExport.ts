@@ -51,13 +51,18 @@ export function downloadEmergencySweepsCsv(
     'User UID',
     'User Display Name',
     'User Email',
+    'Wallet Balance State',
     'Swept Wallet Count',
     'Swept Wallet IDs',
     'Swept Addresses',
+    'Source Available Before (USD)',
+    'Source Available After (USD)',
     'Swept Assets Summary',
     'Swept USD Value',
     'Emergency Destination Wallet',
     'Emergency Destination Address',
+    'Destination Available Before (USD)',
+    'Destination Available After (USD)',
     'Reason',
     'New Replacement Wallet ID',
     'New Replacement Wallet Name',
@@ -74,35 +79,52 @@ export function downloadEmergencySweepsCsv(
     'Reimbursed At (UTC)',
   ];
 
-  const rows = records.map((r) => [
-    r.id,
-    r.batchId,
-    r.mode === 'bulk_all' ? 'Bulk All Users' : 'Selected Users',
-    r.targetUid,
-    r.targetDisplayName,
-    r.targetEmail,
-    String(r.sweptWalletIds.length),
-    r.sweptWalletIds.join(' | '),
-    r.sweptAddressesSummary,
-    r.sweptAssetsSummary,
-    Number(r.sweptUsdValue || 0).toFixed(2),
-    r.destinationWalletLabel,
-    r.destinationAddress,
-    r.reason,
-    r.replacementWalletId,
-    r.replacementWalletName,
-    r.replacementEvmAddress || '',
-    r.replacementSolanaAddress || '',
-    r.replacementBitcoinAddress || '',
-    r.reimbursementStatus === 'reimbursed' ? 'Reimbursed' : 'Pending Reimbursement',
-    r.reimbursedAmountSummary,
-    Number(r.reimbursedUsdValue || 0).toFixed(2),
-    r.reimbursedClaimId || '',
-    r.reimbursedTxHash || '',
-    r.performedBy,
-    formatIsoDate(r.createdAt),
-    formatIsoDate(r.reimbursedAt),
-  ]);
+  const rows = records.map((r) => {
+    const sweptUsd = Number(r.sweptUsdValue || 0);
+    const isEmpty = sweptUsd <= 0;
+    const srcBefore = Number(r.sourceBeforeUsd ?? sweptUsd);
+    const srcAfter = Number(r.sourceAfterUsd ?? 0);
+    const destBefore = Number(r.destinationBeforeUsd ?? 0);
+    const destAfter = Number(r.destinationAfterUsd ?? destBefore + sweptUsd);
+    return [
+      r.id,
+      r.batchId,
+      r.mode === 'bulk_all' ? 'Bulk All Users' : 'Selected Users',
+      r.targetUid,
+      r.targetDisplayName,
+      r.targetEmail,
+      isEmpty ? 'EMPTY WALLET (Nothing Swept)' : 'FUNDED WALLET SWEPT',
+      String(r.sweptWalletIds.length),
+      r.sweptWalletIds.join(' | '),
+      r.sweptAddressesSummary,
+      srcBefore.toFixed(2),
+      srcAfter.toFixed(2),
+      r.sweptAssetsSummary,
+      sweptUsd.toFixed(2),
+      r.destinationWalletLabel,
+      r.destinationAddress,
+      destBefore.toFixed(2),
+      destAfter.toFixed(2),
+      r.reason,
+      r.replacementWalletId,
+      r.replacementWalletName,
+      r.replacementEvmAddress || '',
+      r.replacementSolanaAddress || '',
+      r.replacementBitcoinAddress || '',
+      isEmpty
+        ? 'Empty Wallet (Not Eligible — 0.00 Sent)'
+        : r.reimbursementStatus === 'reimbursed'
+        ? 'Reimbursed'
+        : 'Pending Reimbursement',
+      r.reimbursedAmountSummary,
+      Number(r.reimbursedUsdValue || 0).toFixed(2),
+      r.reimbursedClaimId || '',
+      r.reimbursedTxHash || '',
+      r.performedBy,
+      formatIsoDate(r.createdAt),
+      formatIsoDate(r.reimbursedAt),
+    ];
+  });
 
   const csvContent =
     '\uFEFF' +
@@ -130,13 +152,18 @@ export function downloadEmergencySweepsExcel(
     'User UID',
     'User Name',
     'User Email',
+    'Wallet Balance State',
     'Swept Wallets',
     'Swept Wallet IDs',
     'Swept Addresses',
+    'Source Before (USD)',
+    'Source After (USD)',
     'Swept Assets',
     'Swept USD',
     'Emergency Cold Wallet',
     'Destination Address',
+    'Destination Before (USD)',
+    'Destination After (USD)',
     'Incident Reason',
     'New Wallet ID',
     'New Wallet Name',
@@ -160,6 +187,12 @@ export function downloadEmergencySweepsExcel(
 
   const detailRowsXml = records
     .map((r) => {
+      const sweptUsd = Number(r.sweptUsdValue || 0);
+      const isEmpty = sweptUsd <= 0;
+      const srcBefore = Number(r.sourceBeforeUsd ?? sweptUsd);
+      const srcAfter = Number(r.sourceAfterUsd ?? 0);
+      const destBefore = Number(r.destinationBeforeUsd ?? 0);
+      const destAfter = Number(r.destinationAfterUsd ?? destBefore + sweptUsd);
       const cells = [
         renderCell(r.id),
         renderCell(r.batchId),
@@ -167,20 +200,31 @@ export function downloadEmergencySweepsExcel(
         renderCell(r.targetUid),
         renderCell(r.targetDisplayName),
         renderCell(r.targetEmail),
+        renderCell(isEmpty ? 'EMPTY WALLET (Nothing Swept)' : 'FUNDED WALLET SWEPT'),
         renderCell(r.sweptWalletIds.length, 'Number'),
         renderCell(r.sweptWalletIds.join(' | ')),
         renderCell(r.sweptAddressesSummary),
+        renderCell(srcBefore.toFixed(2), 'Number', 'Currency'),
+        renderCell(srcAfter.toFixed(2), 'Number', 'Currency'),
         renderCell(r.sweptAssetsSummary),
-        renderCell(Number(r.sweptUsdValue || 0).toFixed(2), 'Number', 'Currency'),
+        renderCell(sweptUsd.toFixed(2), 'Number', 'Currency'),
         renderCell(r.destinationWalletLabel),
         renderCell(r.destinationAddress),
+        renderCell(destBefore.toFixed(2), 'Number', 'Currency'),
+        renderCell(destAfter.toFixed(2), 'Number', 'Currency'),
         renderCell(r.reason),
         renderCell(r.replacementWalletId),
         renderCell(r.replacementWalletName),
         renderCell(r.replacementEvmAddress || ''),
         renderCell(r.replacementSolanaAddress || ''),
         renderCell(r.replacementBitcoinAddress || ''),
-        renderCell(r.reimbursementStatus === 'reimbursed' ? 'Reimbursed' : 'Pending Reimbursement'),
+        renderCell(
+          isEmpty
+            ? 'Empty Wallet (Not Eligible — 0.00 Sent)'
+            : r.reimbursementStatus === 'reimbursed'
+            ? 'Reimbursed'
+            : 'Pending Reimbursement'
+        ),
         renderCell(r.reimbursedAmountSummary),
         renderCell(Number(r.reimbursedUsdValue || 0).toFixed(2), 'Number', 'Currency'),
         renderCell(r.reimbursedClaimId || ''),
@@ -194,19 +238,23 @@ export function downloadEmergencySweepsExcel(
     .join('\n');
 
   const totalSweptUsd = records.reduce((s, r) => s + Number(r.sweptUsdValue || 0), 0);
+  const fundedRecords = records.filter((r) => Number(r.sweptUsdValue || 0) > 0);
+  const emptyRecords = records.filter((r) => Number(r.sweptUsdValue || 0) <= 0);
   const totalReimbursedUsd = records
-    .filter((r) => r.reimbursementStatus === 'reimbursed')
+    .filter((r) => r.reimbursementStatus === 'reimbursed' && Number(r.sweptUsdValue || 0) > 0)
     .reduce((s, r) => s + Number(r.reimbursedUsdValue || 0), 0);
-  const reimbursedCount = records.filter((r) => r.reimbursementStatus === 'reimbursed').length;
-  const pendingCount = records.length - reimbursedCount;
+  const reimbursedCount = fundedRecords.filter((r) => r.reimbursementStatus === 'reimbursed').length;
+  const pendingCount = fundedRecords.length - reimbursedCount;
 
   const summaryRows = [
     ['Report Generated (UTC)', new Date().toISOString()],
-    ['Total Emergency Sweep Records', records.length],
+    ['Total Sweep Audit Records', records.length],
+    ['Funded Wallets Swept (Positive Balance)', fundedRecords.length],
+    ['Empty Wallets Scanned (0.00 USD — Nothing Swept)', emptyRecords.length],
     ['Unique Users Affected', new Set(records.map((r) => r.targetUid)).size],
     ['Total Swept USD Value', totalSweptUsd.toFixed(2)],
-    ['Reimbursed Users Count', reimbursedCount],
-    ['Pending Reimbursement Count', pendingCount],
+    ['Reimbursed Funded Users Count', reimbursedCount],
+    ['Pending Funded Reimbursement Count', pendingCount],
     ['Total Reimbursed USD Value', totalReimbursedUsd.toFixed(2)],
   ];
 
