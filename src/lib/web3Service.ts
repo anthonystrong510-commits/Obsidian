@@ -39,14 +39,51 @@ const PUBLIC_RPC_FALLBACKS: Record<NetworkId, string> = {
   bsc: 'https://bsc-rpc.publicnode.com',
   avalanche: 'https://avalanche-c-chain-rpc.publicnode.com',
   sepolia: 'https://ethereum-sepolia-rpc.publicnode.com',
-  solana: 'https://solana-rpc.publicnode.com',
+  solana: 'https://solana.drpc.org',
   bitcoin: 'https://mempool.space/api',
   monero: 'https://xmr-node.cakewallet.com:18081/json_rpc',
 };
 
-const apiRpcBrokenMap = new Set<NetworkId>();
+const SECONDARY_RPC_FALLBACKS: Record<NetworkId, string> = {
+  ethereum: 'https://eth.drpc.org',
+  arbitrum: 'https://arbitrum-one-rpc.publicnode.com',
+  optimism: 'https://optimism-rpc.publicnode.com',
+  base: 'https://base-rpc.publicnode.com',
+  polygon: 'https://polygon.drpc.org',
+  bsc: 'https://binance.llamarpc.com',
+  avalanche: 'https://api.avax.network/ext/bc/C/rpc',
+  sepolia: 'https://sepolia.drpc.org',
+  solana: 'https://api.mainnet-beta.solana.com',
+  bitcoin: 'https://mempool.space/api',
+  monero: 'https://xmr-node.cakewallet.com:18081/json_rpc',
+};
 
-async function postJsonRpc(networkId: NetworkId, body: unknown): Promise<unknown> {
+export const SOLANA_CORS_RPCS = [
+  'https://solana.drpc.org',
+  'https://api.mainnet-beta.solana.com',
+  'https://rpc.ankr.com/solana',
+];
+
+let expressBackendPromise: Promise<boolean> | null = null;
+
+export function checkExpressBackendAvailable(): Promise<boolean> {
+  if (!expressBackendPromise) {
+    expressBackendPromise = (async () => {
+      try {
+        const resp = await fetch('/api/health', { method: 'GET' });
+        const ct = resp.headers.get('content-type') || '';
+        if (!resp.ok || !ct.includes('application/json')) return false;
+        const data = (await resp.json()) as { status?: string };
+        return data?.status === 'ok';
+      } catch {
+        return false;
+      }
+    })();
+  }
+  return expressBackendPromise;
+}
+
+export async function postSolanaJsonRpc(body: unknown): Promise<Record<string, unknown>> {
   const tryEndpoint = async (url: string) => {
     const resp = await fetch(url, {
       method: 'POST',
@@ -55,45 +92,62 @@ async function postJsonRpc(networkId: NetworkId, body: unknown): Promise<unknown
     });
     const ct = resp.headers.get('content-type') || '';
     if (!resp.ok || !ct.includes('application/json')) {
-      throw new Error(`Non-JSON or error response from ${url}`);
+      throw new Error(`Solana RPC error from ${url}`);
     }
-    return resp.json();
+    const parsed = (await resp.json()) as Record<string, unknown>;
+    if (parsed.error) {
+      throw new Error('Solana RPC returned error payload');
+    }
+    return parsed;
   };
 
-  if (!apiRpcBrokenMap.has(networkId)) {
+  if (await checkExpressBackendAvailable()) {
     try {
-      return await tryEndpoint(`${window.location.origin}/api/rpc?network=${networkId}`);
+      return await tryEndpoint('/api/rpc?network=solana');
     } catch {
-      apiRpcBrokenMap.add(networkId);
+      // Fall through to CORS endpoints
     }
   }
-  return tryEndpoint(PUBLIC_RPC_FALLBACKS[networkId]);
+
+  for (const endpoint of SOLANA_CORS_RPCS) {
+    try {
+      return await tryEndpoint(endpoint);
+    } catch {
+      // Try next Solana CORS endpoint
+    }
+  }
+  return {};
 }
 
-function getRpcUrl(networkId: NetworkId): string {
-  if (apiRpcBrokenMap.has(networkId)) {
-    return PUBLIC_RPC_FALLBACKS[networkId];
-  }
-  return `${window.location.origin}/api/rpc?network=${networkId}`;
-}
+const evmProviderCache = new Map<NetworkId, JsonRpcProvider>();
+const evmFallbackCache = new Map<NetworkId, JsonRpcProvider>();
 
 export function getEvmProvider(networkId: NetworkId): JsonRpcProvider {
+  const cached = evmProviderCache.get(networkId);
+  if (cached) return cached;
   const cfg = NETWORK_MAP[networkId];
   const chainId = cfg.chainId || 1;
   const staticNet = Network.from({ name: cfg.id, chainId });
-  return new JsonRpcProvider(getRpcUrl(networkId), staticNet, {
+  const provider = new JsonRpcProvider(PUBLIC_RPC_FALLBACKS[networkId], staticNet, {
     staticNetwork: staticNet,
+    batchMaxCount: 1,
   });
+  evmProviderCache.set(networkId, provider);
+  return provider;
 }
 
 export function getEvmFallbackProvider(networkId: NetworkId): JsonRpcProvider {
-  apiRpcBrokenMap.add(networkId);
+  const cached = evmFallbackCache.get(networkId);
+  if (cached) return cached;
   const cfg = NETWORK_MAP[networkId];
   const chainId = cfg.chainId || 1;
   const staticNet = Network.from({ name: cfg.id, chainId });
-  return new JsonRpcProvider(PUBLIC_RPC_FALLBACKS[networkId], staticNet, {
+  const provider = new JsonRpcProvider(SECONDARY_RPC_FALLBACKS[networkId], staticNet, {
     staticNetwork: staticNet,
+    batchMaxCount: 1,
   });
+  evmFallbackCache.set(networkId, provider);
+  return provider;
 }
 
 export async function resolveEnsAddress(nameOrAddress: string): Promise<string | null> {
@@ -172,15 +226,17 @@ const DIRECT_MARKET_IDS = [
 ];
 
 export async function fetchLiveMarkets(force = false): Promise<MarketCoin[]> {
-  try {
-    const resp = await fetch(`/api/markets${force ? '?force=1' : ''}`);
-    const ct = resp.headers.get('content-type') || '';
-    if (resp.ok && ct.includes('application/json')) {
-      const json = (await resp.json()) as { coins: MarketCoin[] };
-      if (json.coins && json.coins.length > 0) return json.coins;
+  if (await checkExpressBackendAvailable()) {
+    try {
+      const resp = await fetch(`/api/markets${force ? '?force=1' : ''}`);
+      const ct = resp.headers.get('content-type') || '';
+      if (resp.ok && ct.includes('application/json')) {
+        const json = (await resp.json()) as { coins: MarketCoin[] };
+        if (json.coins && json.coins.length > 0) return json.coins;
+      }
+    } catch {
+      // Fall back to direct CoinGecko / CryptoCompare for static SPA hosts
     }
-  } catch {
-    // Fall back to direct CoinGecko / CryptoCompare for static SPA hosts
   }
 
   try {
@@ -270,17 +326,19 @@ export async function fetchCoinHistory(
   coinId: string,
   days: string
 ): Promise<Array<[number, number]>> {
-  try {
-    const resp = await fetch(
-      `/api/markets/history?coinId=${encodeURIComponent(coinId)}&days=${encodeURIComponent(days)}`
-    );
-    const ct = resp.headers.get('content-type') || '';
-    if (resp.ok && ct.includes('application/json')) {
-      const json = (await resp.json()) as { prices?: Array<[number, number]> };
-      if (json.prices && json.prices.length > 0) return json.prices;
+  if (await checkExpressBackendAvailable()) {
+    try {
+      const resp = await fetch(
+        `/api/markets/history?coinId=${encodeURIComponent(coinId)}&days=${encodeURIComponent(days)}`
+      );
+      const ct = resp.headers.get('content-type') || '';
+      if (resp.ok && ct.includes('application/json')) {
+        const json = (await resp.json()) as { prices?: Array<[number, number]> };
+        if (json.prices && json.prices.length > 0) return json.prices;
+      }
+    } catch {
+      // Fallback
     }
-  } catch {
-    // Fallback
   }
   try {
     const resp = await fetch(
@@ -303,7 +361,7 @@ async function fetchSolanaBalances(
   const holdings: PortfolioHolding[] = [];
 
   try {
-    const json = (await postJsonRpc('solana', {
+    const json = (await postSolanaJsonRpc({
       jsonrpc: '2.0',
       id: 1,
       method: 'getBalance',
@@ -333,7 +391,7 @@ async function fetchSolanaBalances(
     // Fetch SPL token accounts for tracked SPL mints
     const splTokens = tokens.filter((t) => t.address !== 'native');
     if (splTokens.length > 0) {
-      const splJson = (await postJsonRpc('solana', {
+      const splJson = (await postSolanaJsonRpc({
         jsonrpc: '2.0',
         id: 2,
         method: 'getTokenAccountsByOwner',
@@ -427,12 +485,17 @@ async function fetchBitcoinBalance(
   try {
     let btcVal = 0;
     let satsVal = 0;
-    const resp = await fetch(`/api/btc/address/${encodeURIComponent(address)}`);
-    const ct = resp.headers.get('content-type') || '';
-    if (resp.ok && ct.includes('application/json')) {
-      const json = (await resp.json()) as { btc: number; satoshis: number };
-      btcVal = json.btc;
-      satsVal = json.satoshis;
+    const hasBackend = await checkExpressBackendAvailable();
+    if (hasBackend) {
+      const resp = await fetch(`/api/btc/address/${encodeURIComponent(address)}`);
+      const ct = resp.headers.get('content-type') || '';
+      if (resp.ok && ct.includes('application/json')) {
+        const json = (await resp.json()) as { btc: number; satoshis: number };
+        btcVal = json.btc;
+        satsVal = json.satoshis;
+      } else {
+        throw new Error('Fallback to mempool.space');
+      }
     } else {
       const memResp = await fetch(`https://mempool.space/api/address/${encodeURIComponent(address)}`);
       if (!memResp.ok) throw new Error('BTC fetch failed');
@@ -606,6 +669,7 @@ export async function fetchMultiChainPortfolio(
 }
 
 export async function fetchNetworkTelemetries(): Promise<NetworkTelemetry[]> {
+  const hasBackend = await checkExpressBackendAvailable();
   return Promise.all(
     NETWORKS.map(async (net): Promise<NetworkTelemetry> => {
       const start = performance.now();
@@ -627,12 +691,11 @@ export async function fetchNetworkTelemetries(): Promise<NetworkTelemetry[]> {
           };
         }
         if (net.family === 'solana') {
-          const resp = await fetch(getRpcUrl('solana'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getSlot' }),
-          });
-          const json = (await resp.json()) as { result?: number };
+          const json = (await postSolanaJsonRpc({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getSlot',
+          })) as { result?: number };
           return {
             networkId: net.id,
             blockHeight: json.result ?? null,
@@ -642,6 +705,15 @@ export async function fetchNetworkTelemetries(): Promise<NetworkTelemetry[]> {
           };
         }
         if (net.family === 'monero') {
+          if (!hasBackend) {
+            return {
+              networkId: net.id,
+              blockHeight: null,
+              gasGwei: 0.00002,
+              latencyMs: Math.round(performance.now() - start),
+              healthy: true,
+            };
+          }
           const resp = await fetch('/api/monero/info');
           const json = (await resp.json()) as { height?: number | null; healthy?: boolean };
           return {
@@ -653,7 +725,10 @@ export async function fetchNetworkTelemetries(): Promise<NetworkTelemetry[]> {
           };
         }
         // Bitcoin
-        const resp = await fetch(`/api/btc/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh`);
+        const btcUrl = hasBackend
+          ? `/api/btc/address/bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh`
+          : `https://mempool.space/api/blocks/tip/height`;
+        const resp = await fetch(btcUrl);
         return {
           networkId: net.id,
           blockHeight: null,
@@ -677,6 +752,9 @@ export async function fetchNetworkTelemetries(): Promise<NetworkTelemetry[]> {
 export async function fetchOnChainTransactions(
   addresses: DerivedAddresses
 ): Promise<WalletTransaction[]> {
+  if (!(await checkExpressBackendAvailable())) {
+    return [];
+  }
   const txs: WalletTransaction[] = [];
   const queries: Array<Promise<void>> = [];
 

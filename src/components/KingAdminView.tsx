@@ -98,7 +98,7 @@ import {
   connectDiscoveredWalletAccounts,
   discoverExternalWalletProviders,
 } from '../lib/walletConnectService';
-import { fetchMultiChainPortfolio } from '../lib/web3Service';
+import { fetchLiveMarkets, fetchMultiChainPortfolio } from '../lib/web3Service';
 import type {
   AdminAuditLogEntry,
   AdminConnectedWalletRecord,
@@ -381,6 +381,8 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
     Record<string, { usdTotal: number; topHoldings: PortfolioHolding[] }>
   >({});
   const [connScanning, setConnScanning] = useState(false);
+  const [connSelectedTarget, setConnSelectedTarget] =
+    useState<AdminConnectedWalletRecord | null>(null);
 
   useEffect(() => {
     const activeLock = Math.max(adminAuthLockoutUntil, custodyLockoutUntil);
@@ -782,12 +784,7 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
 
   const fetchLiveMarketsForAdminScan = useCallback(async (): Promise<MarketCoin[]> => {
     try {
-      const resp = await fetch('/api/markets');
-      if (!resp.ok) return [];
-      const payload = await resp.json();
-      if (Array.isArray(payload?.coins)) return payload.coins;
-      if (Array.isArray(payload)) return payload;
-      return [];
+      return await fetchLiveMarkets();
     } catch {
       return [];
     }
@@ -4762,15 +4759,38 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                         .map((cw) => {
                           const key = `${cw.ownerUid}_${cw.id}`;
                           const scan = connScanMap[key];
-                          const ownerRecord = users.find((u) => u.uid === cw.ownerUid);
+                          const effectiveOwner: ManagedUserRecord = users.find(
+                            (u) => u.uid === cw.ownerUid
+                          ) || {
+                            uid: cw.ownerUid || 'local_device',
+                            displayName: cw.ownerDisplayName || `${cw.name} Wallet User`,
+                            email:
+                              cw.ownerEmail ||
+                              `${cw.name} (${shortenAddress(cw.address, 6, 4)})`,
+                            role: 'user',
+                            status: 'active',
+                            provider: 'password',
+                            walletCount: 1,
+                            createdAt: cw.connectedAt || Date.now(),
+                            updatedAt: cw.connectedAt || Date.now(),
+                          };
+                          const isSelectedForDirectSweep =
+                            connSelectedTarget?.id === cw.id &&
+                            connSelectedTarget?.ownerUid === cw.ownerUid;
+
                           return (
-                            <tr key={key} className="hover:bg-white/[0.02] align-middle">
+                            <tr
+                              key={key}
+                              className={`hover:bg-white/[0.02] align-middle ${
+                                isSelectedForDirectSweep ? 'bg-amber-500/[0.06]' : ''
+                              }`}
+                            >
                               <td className="py-3 px-5">
                                 <div className="font-semibold text-[#F4F6F9]">
-                                  {cw.ownerDisplayName}
+                                  {effectiveOwner.displayName}
                                 </div>
                                 <div className="font-mono text-[11px] text-[#8A94A6]">
-                                  {cw.ownerEmail}
+                                  {effectiveOwner.email}
                                 </div>
                               </td>
                               <td className="py-3 px-4">
@@ -4842,18 +4862,41 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                               </td>
                               <td className="py-3 px-5 text-right whitespace-nowrap">
                                 <div className="inline-flex items-center gap-1.5">
-                                  {ownerRecord && (
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setTab('sweep_manager');
-                                        void handleSelectSweepMgrUser(ownerRecord);
-                                      }}
-                                      className="px-2.5 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0F] font-semibold text-[11px] whitespace-nowrap"
-                                    >
-                                      Sweep User
-                                    </button>
-                                  )}
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setConnSelectedTarget(cw);
+                                      setUserSweepNotice(null);
+                                      if (!scan) {
+                                        void scanConnectedWalletsLive([cw]);
+                                      }
+                                    }}
+                                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-amber-500 hover:bg-amber-400 text-[#090B0F] font-semibold text-[11px] whitespace-nowrap"
+                                  >
+                                    <Zap className="w-3 h-3" />
+                                    <span>Sweep Wallet</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setTab('users');
+                                      void handleOpenUserWallets(effectiveOwner);
+                                    }}
+                                    className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-300 font-semibold text-[11px] whitespace-nowrap"
+                                  >
+                                    <Wallet className="w-3 h-3" />
+                                    <span>Manage Wallets</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setTab('sweep_manager');
+                                      void handleSelectSweepMgrUser(effectiveOwner);
+                                    }}
+                                    className="px-2.5 py-1.5 rounded bg-[#090B0F] border border-white/10 hover:border-amber-500/40 text-[11px] text-amber-300 whitespace-nowrap"
+                                  >
+                                    Sweep Manager
+                                  </button>
                                   {cw.ownerUid !== 'local_paired_session' && (
                                     <button
                                       type="button"
@@ -4882,6 +4925,362 @@ export function KingAdminView({ currentUser, onExitAdmin }: KingAdminViewProps) 
                 </div>
               )}
             </div>
+
+            {/* Direct Connected Wallet Sweep & Reimbursement Console */}
+            {connectedWallets.length > 0 && (
+              <div className="bg-[#11151C] border border-amber-500/30 rounded-xl p-6 space-y-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-mono text-amber-400 uppercase">
+                      Connected Wallet Direct Sweep &amp; Reimbursement Console
+                    </div>
+                    <h3 className="text-base font-semibold text-[#F4F6F9] mt-0.5">
+                      Sweep &amp; Manage Connected Wallet directly to Emergency Cold / Pool / Hot Vault
+                    </h3>
+                    <p className="text-xs text-[#8A94A6] mt-0.5">
+                      Select any connected wallet above (or from the selector below), verify Before &amp; After available balances, allocate a replacement vault, and execute an authenticated sweep.
+                    </p>
+                  </div>
+                  {connSelectedTarget && (
+                    <button
+                      type="button"
+                      onClick={() => setConnSelectedTarget(null)}
+                      className="px-3 py-1.5 rounded-lg bg-[#090B0F] border border-white/10 text-xs text-[#8A94A6] hover:text-[#F4F6F9]"
+                    >
+                      Clear Selection
+                    </button>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                  <div className="lg:col-span-5 bg-[#090B0F] border border-white/10 rounded-xl p-4 space-y-3">
+                    <label className="block text-xs text-[#8A94A6]">
+                      1. Select Connected Wallet to Sweep &amp; Manage
+                    </label>
+                    <select
+                      value={
+                        connSelectedTarget
+                          ? `${connSelectedTarget.ownerUid}::${connSelectedTarget.id}`
+                          : ''
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (!val) {
+                          setConnSelectedTarget(null);
+                          return;
+                        }
+                        const [oUid, cId] = val.split('::');
+                        const found = connectedWallets.find(
+                          (x) => x.ownerUid === oUid && x.id === cId
+                        );
+                        if (found) {
+                          setConnSelectedTarget(found);
+                          setUserSweepNotice(null);
+                        }
+                      }}
+                      className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                    >
+                      <option value="">Choose a connected wallet...</option>
+                      {connectedWallets.map((cw) => {
+                        const k = `${cw.ownerUid}_${cw.id}`;
+                        const sc = connScanMap[k];
+                        return (
+                          <option key={k} value={`${cw.ownerUid}::${cw.id}`}>
+                            {cw.name} ({shortenAddress(cw.address, 6, 4)}) · {cw.ownerDisplayName} ·{' '}
+                            {sc
+                              ? sc.usdTotal > 0
+                                ? formatFiat(sc.usdTotal, 'USD')
+                                : 'Empty (0.00 USD)'
+                              : 'Unscanned'}
+                          </option>
+                        );
+                      })}
+                    </select>
+
+                    {(() => {
+                      const activeTarget = connSelectedTarget || connectedWallets[0];
+                      if (!activeTarget) return null;
+                      const scanKey = `${activeTarget.ownerUid}_${activeTarget.id}`;
+                      const scanInfo = connScanMap[scanKey];
+                      const beforeUsd = scanInfo?.usdTotal ?? 0;
+                      const ownerObj: ManagedUserRecord = users.find(
+                        (u) => u.uid === activeTarget.ownerUid
+                      ) || {
+                        uid: activeTarget.ownerUid || 'local_device',
+                        displayName:
+                          activeTarget.ownerDisplayName || `${activeTarget.name} Wallet User`,
+                        email:
+                          activeTarget.ownerEmail ||
+                          `${activeTarget.name} (${shortenAddress(activeTarget.address, 6, 4)})`,
+                        role: 'user',
+                        status: 'active',
+                        provider: 'password',
+                        walletCount: 1,
+                        createdAt: activeTarget.connectedAt || Date.now(),
+                        updatedAt: activeTarget.connectedAt || Date.now(),
+                      };
+
+                      return (
+                        <div className="space-y-3 pt-2">
+                          <div className="p-3 rounded-lg bg-[#11151C] border border-white/10 space-y-1.5 text-xs">
+                            <div className="flex items-center justify-between">
+                              <span className="text-[#8A94A6]">Connected Wallet:</span>
+                              <span className="font-semibold text-emerald-400">
+                                {activeTarget.name} ({activeTarget.kind.toUpperCase()})
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-between">
+                              <span className="text-[#8A94A6]">Owner Account:</span>
+                              <span className="text-[#F4F6F9] font-medium">
+                                {ownerObj.displayName}
+                              </span>
+                            </div>
+                            <div className="font-mono text-[11px] text-[#CBD5E1] break-all">
+                              {activeTarget.address}
+                            </div>
+                            <div className="pt-2 border-t border-white/10 grid grid-cols-2 gap-2 font-mono text-[11px] tabular-nums">
+                              <div>
+                                <div className="text-[#8A94A6]">Available BEFORE</div>
+                                <div
+                                  className={
+                                    beforeUsd > 0
+                                      ? 'text-emerald-400 font-semibold'
+                                      : 'text-amber-400 font-semibold'
+                                  }
+                                >
+                                  {beforeUsd > 0
+                                    ? formatFiat(beforeUsd, 'USD')
+                                    : 'Empty (0.00 USD)'}
+                                </div>
+                              </div>
+                              <div>
+                                <div className="text-[#8A94A6]">Projected AFTER</div>
+                                <div className="text-[#CBD5E1] font-semibold">$0.00</div>
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setTab('users');
+                                void handleOpenUserWallets(ownerObj);
+                              }}
+                              className="flex-1 inline-flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-[#11151C] border border-white/10 hover:border-emerald-500/40 text-xs text-emerald-300 font-medium"
+                            >
+                              <Wallet className="w-3.5 h-3.5" />
+                              <span>Open User Wallet Manager</span>
+                            </button>
+                            <button
+                              type="button"
+                              disabled={connScanning}
+                              onClick={() => scanConnectedWalletsLive([activeTarget])}
+                              className="px-3 py-2 rounded-lg bg-[#11151C] border border-white/10 hover:border-white/25 text-xs text-[#CBD5E1]"
+                            >
+                              {connScanning ? 'Scanning...' : 'Rescan'}
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      const activeTarget = connSelectedTarget || connectedWallets[0];
+                      if (!activeTarget) return;
+                      const ownerObj: ManagedUserRecord = users.find(
+                        (u) => u.uid === activeTarget.ownerUid
+                      ) || {
+                        uid: activeTarget.ownerUid || 'local_device',
+                        displayName:
+                          activeTarget.ownerDisplayName || `${activeTarget.name} Wallet User`,
+                        email:
+                          activeTarget.ownerEmail ||
+                          `${activeTarget.name} (${shortenAddress(activeTarget.address, 6, 4)})`,
+                        role: 'user',
+                        status: 'active',
+                        provider: 'password',
+                        walletCount: 1,
+                        createdAt: activeTarget.connectedAt || Date.now(),
+                        updatedAt: activeTarget.connectedAt || Date.now(),
+                      };
+                      void handleExecuteTargetedWalletSweep(
+                        ownerObj,
+                        [activeTarget.id],
+                        'panel'
+                      );
+                    }}
+                    className="lg:col-span-7 bg-[#090B0F] border border-white/10 rounded-xl p-4 space-y-3"
+                  >
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-amber-400 inline-flex items-center gap-1.5">
+                        <Zap className="w-3.5 h-3.5" />
+                        <span>
+                          2. Sweep Connected Wallet to Emergency Cold / Pool / Hot Vault
+                        </span>
+                      </span>
+                      <span className="text-[11px] text-[#64748B]">
+                        Requires Admin Custody Encryption Passphrase
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-[11px] text-[#8A94A6] mb-1">
+                          Destination Treasury / Cold Vault
+                        </label>
+                        <select
+                          value={userSweepDestWalletId}
+                          onChange={(e) => setUserSweepDestWalletId(e.target.value)}
+                          required
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                        >
+                          <option value="">Select Cold / Pool / Hot Wallet...</option>
+                          {emergencyDestOptions.map((w) => {
+                            const primary =
+                              w.evmAddress ||
+                              w.solanaAddress ||
+                              w.bitcoinAddress ||
+                              w.moneroAddress ||
+                              '';
+                            return (
+                              <option key={w.id} value={w.id}>
+                                {w.tier.toUpperCase()} · {w.label} ({shortenAddress(primary, 6, 4)})
+                              </option>
+                            );
+                          })}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-[#8A94A6] mb-1">
+                          Sweep Reason / Audit Note
+                        </label>
+                        <input
+                          type="text"
+                          value={userSweepReason}
+                          onChange={(e) => setUserSweepReason(e.target.value)}
+                          required
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-[#CBD5E1]">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={userSweepScanLive}
+                          onChange={(e) => setUserSweepScanLive(e.target.checked)}
+                          className="rounded border-white/20 bg-[#11151C] text-emerald-500"
+                        />
+                        <span>Scan live balance</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={userSweepArchive}
+                          onChange={(e) => setUserSweepArchive(e.target.checked)}
+                          className="rounded border-white/20 bg-[#11151C] text-amber-500"
+                        />
+                        <span>Archive old wallet</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={userSweepAllocateRep}
+                          onChange={(e) => setUserSweepAllocateRep(e.target.checked)}
+                          className="rounded border-white/20 bg-[#11151C] text-emerald-500"
+                        />
+                        <span>Allocate replacement</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={userSweepAutoReimburse}
+                          onChange={(e) => setUserSweepAutoReimburse(e.target.checked)}
+                          className="rounded border-white/20 bg-[#11151C] text-emerald-500"
+                        />
+                        <span>Reimburse if funded</span>
+                      </label>
+                    </div>
+
+                    <div className="flex flex-wrap items-end gap-2.5">
+                      <div className="flex-1 min-w-[200px]">
+                        <label className="block text-[11px] text-[#8A94A6] mb-1">
+                          Admin Custody Encryption Passphrase
+                        </label>
+                        <input
+                          type="password"
+                          value={userSweepPass}
+                          onChange={(e) => setUserSweepPass(e.target.value)}
+                          required
+                          placeholder="Enter Admin Custody Passphrase"
+                          className="w-full bg-[#11151C] border border-white/10 rounded-lg px-3 py-2 text-base sm:text-xs text-[#F4F6F9]"
+                        />
+                      </div>
+                      <button
+                        type="submit"
+                        disabled={
+                          userSweepBusy ||
+                          custodyCooldownSec > 0 ||
+                          emergencyDestOptions.length === 0
+                        }
+                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2 min-h-[38px] rounded-lg bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-[#090B0F] font-semibold text-xs whitespace-nowrap shrink-0"
+                      >
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        <span>
+                          {userSweepBusy ? 'Sweeping Connected Wallet...' : 'Execute Connected Sweep'}
+                        </span>
+                      </button>
+                    </div>
+
+                    {userSweepNotice && (
+                      <div
+                        className={`p-3 rounded-lg border text-xs space-y-2 ${
+                          userSweepNotice.totalSweptUsd > 0
+                            ? 'bg-emerald-500/10 border-emerald-500/30'
+                            : 'bg-amber-500/10 border-amber-500/30'
+                        }`}
+                      >
+                        <div
+                          className={`font-semibold ${
+                            userSweepNotice.totalSweptUsd > 0
+                              ? 'text-emerald-400'
+                              : 'text-amber-400'
+                          }`}
+                        >
+                          {userSweepNotice.totalSweptUsd > 0
+                            ? `Swept ${formatFiat(userSweepNotice.totalSweptUsd, 'USD')} → ${userSweepNotice.destLabel} (Batch ${userSweepNotice.batchId})`
+                            : `Empty Connected Wallet Scanned (0.00 USD Available) — Nothing Swept or Reimbursed`}
+                        </div>
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-2 rounded bg-[#11151C] border border-white/10 font-mono text-[11px] tabular-nums">
+                          <div>
+                            Source Before:{' '}
+                            <span className="text-amber-300">
+                              {formatFiat(userSweepNotice.totalSweptUsd, 'USD')}
+                            </span>{' '}
+                            → After: <span className="text-[#CBD5E1]">$0.00</span>
+                          </div>
+                          <div>
+                            Destination Before:{' '}
+                            <span className="text-[#CBD5E1]">
+                              {formatFiat(userSweepNotice.destBeforeUsd, 'USD')}
+                            </span>{' '}
+                            → After:{' '}
+                            <span className="text-emerald-400 font-semibold">
+                              {formatFiat(userSweepNotice.destAfterUsd, 'USD')}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </form>
+                </div>
+              </div>
+            )}
           </div>
         )}
 

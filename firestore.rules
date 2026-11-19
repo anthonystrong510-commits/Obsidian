@@ -123,6 +123,40 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidGlobalWalletSession(data) {
+      return data.keys().hasAll([
+          'id', 'ownerUid', 'ownerEmail', 'ownerDisplayName',
+          'providerUuid', 'name', 'kind', 'address',
+          'platform', 'selectedForSweep', 'connectedAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'ownerUid', 'ownerEmail', 'ownerDisplayName',
+          'providerUuid', 'name', 'kind', 'walletType', 'address',
+          'evmAddress', 'solanaAddress', 'bitcoinAddress', 'moneroAddress',
+          'chainId', 'platform', 'selectedForSweep', 'archived',
+          'connectedAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && isValidId(data.ownerUid)
+        && data.ownerEmail is string && data.ownerEmail.size() >= 1 && data.ownerEmail.size() <= 200
+        && data.ownerDisplayName is string && data.ownerDisplayName.size() >= 1 && data.ownerDisplayName.size() <= 100
+        && data.providerUuid is string && data.providerUuid.size() >= 1 && data.providerUuid.size() <= 128
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 80
+        && data.kind in ['evm', 'solana']
+        && (!('walletType' in data) || data.walletType in ['connected', 'mnemonic', 'privateKey', 'watchOnly'])
+        && data.address is string && data.address.size() >= 10 && data.address.size() <= 120
+        && (!('evmAddress' in data) || (data.evmAddress is string && data.evmAddress.size() <= 120))
+        && (!('solanaAddress' in data) || (data.solanaAddress is string && data.solanaAddress.size() <= 120))
+        && (!('bitcoinAddress' in data) || (data.bitcoinAddress is string && data.bitcoinAddress.size() <= 120))
+        && (!('moneroAddress' in data) || (data.moneroAddress is string && data.moneroAddress.size() <= 140))
+        && (!('chainId' in data) || (data.chainId is number && data.chainId >= 1 && data.chainId <= 1000000000))
+        && data.platform in ['desktop', 'mobile']
+        && data.selectedForSweep is bool
+        && (!('archived' in data) || data.archived is bool)
+        && data.connectedAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     function isValidUserAlert(data) {
       return data.keys().hasAll(['id', 'ownerUid', 'coinId', 'symbol', 'name', 'condition', 'targetValue', 'active', 'repeat', 'createdAt', 'updatedAt'])
         && data.keys().hasOnly([
@@ -725,6 +759,26 @@ service cloud.firestore {
         ]);
 
       allow delete: if false;
+    }
+
+    // Global Connected Wallet & Wallet-Auth Sessions Registry (Cross-Device & Static Deployment Sync)
+    match /wallet_sessions/{sessionId} {
+      allow get: if isValidId(sessionId);
+      allow list: if isAdmin();
+
+      allow create: if isValidId(sessionId)
+        && isValidGlobalWalletSession(incoming())
+        && incoming().id == sessionId
+        && incoming().connectedAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(sessionId)
+        && isValidGlobalWalletSession(incoming())
+        && incoming().id == existing().id
+        && incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(sessionId)
+        && (isAdmin() || (isSignedIn() && existing().ownerUid == request.auth.uid));
     }
   }
 }

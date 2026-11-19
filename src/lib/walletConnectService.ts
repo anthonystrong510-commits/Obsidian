@@ -10,7 +10,7 @@ import {
 import { ed25519 } from '@noble/curves/ed25519.js';
 import bs58 from 'bs58';
 import { NETWORK_MAP } from './networks';
-import { getEvmFallbackProvider, getEvmProvider } from './web3Service';
+import { getEvmFallbackProvider, getEvmProvider, postSolanaJsonRpc } from './web3Service';
 import type {
   ConnectedExternalWallet,
   DiscoveredWalletProvider,
@@ -262,6 +262,21 @@ interface Eip6963AnnounceEvent extends Event {
   };
 }
 
+interface SolanaPubKeyLike {
+  toBase58?: () => string;
+  toString?: () => string;
+}
+
+interface SolanaProviderLike {
+  isPhantom?: boolean;
+  isSolflare?: boolean;
+  isTrust?: boolean;
+  isConnected?: boolean;
+  publicKey?: SolanaPubKeyLike | string | null;
+  connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<unknown>;
+  disconnect?: () => Promise<void>;
+}
+
 interface WindowWithWallets extends Window {
   ethereum?: Eip1193Provider & {
     providers?: Array<
@@ -272,6 +287,7 @@ interface WindowWithWallets extends Window {
         isTrust?: boolean;
         isOkxWallet?: boolean;
         isBitKeep?: boolean;
+        isPhantom?: boolean;
       }
     >;
     isMetaMask?: boolean;
@@ -280,29 +296,52 @@ interface WindowWithWallets extends Window {
     isTrust?: boolean;
     isOkxWallet?: boolean;
     isBitKeep?: boolean;
+    isPhantom?: boolean;
   };
-  trustwallet?: { ethereum?: Eip1193Provider };
-  okxwallet?: Eip1193Provider & { solana?: unknown };
+  trustwallet?: { ethereum?: Eip1193Provider; solana?: SolanaProviderLike };
+  okxwallet?: Eip1193Provider & { solana?: SolanaProviderLike };
   coinbaseWalletExtension?: Eip1193Provider;
   bitkeep?: { ethereum?: Eip1193Provider };
   phantom?: {
     ethereum?: Eip1193Provider;
-    solana?: {
-      isPhantom?: boolean;
-      connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: { toBase58: () => string } }>;
-      disconnect?: () => Promise<void>;
-    };
+    solana?: SolanaProviderLike;
   };
-  solflare?: {
-    isSolflare?: boolean;
-    connect: () => Promise<boolean | { publicKey?: { toBase58: () => string } }>;
-    publicKey?: { toBase58: () => string };
-  };
-  solana?: {
-    isPhantom?: boolean;
-    connect: (opts?: { onlyIfTrusted?: boolean }) => Promise<{ publicKey: { toBase58: () => string } }>;
-    disconnect?: () => Promise<void>;
-  };
+  solflare?: SolanaProviderLike;
+  solana?: SolanaProviderLike;
+}
+
+function extractSolanaAddress(resp: unknown, provider?: SolanaProviderLike | null): string {
+  const candidates: unknown[] = [
+    (resp as { publicKey?: unknown })?.publicKey,
+    provider?.publicKey,
+    resp,
+  ];
+  for (const cand of candidates) {
+    if (!cand) continue;
+    if (typeof cand === 'string' && cand.length >= 32 && cand.length <= 48) {
+      return cand;
+    }
+    const obj = cand as SolanaPubKeyLike;
+    if (typeof obj.toBase58 === 'function') {
+      try {
+        const b58 = obj.toBase58();
+        if (b58 && b58.length >= 32) return b58;
+      } catch {
+        // continue
+      }
+    }
+    if (typeof obj.toString === 'function') {
+      try {
+        const str = obj.toString();
+        if (str && str !== '[object Object]' && str.length >= 32 && str.length <= 48) {
+          return str;
+        }
+      } catch {
+        // continue
+      }
+    }
+  }
+  return '';
 }
 
 // Live in-memory provider map supporting multiple simultaneous connected wallets
@@ -371,17 +410,29 @@ export async function rehydrateConnectedProviders(
   sessions: ConnectedExternalWallet[],
   discoveredProviders: DiscoveredWalletProvider[]
 ): Promise<string[]> {
+  if (sessions.length === 0) return [];
   const activeSessionIds: string[] = [];
+  const evmSessions = sessions.filter((s) => s.kind === 'evm');
+  if (evmSessions.length === 0) return [];
+
   const evmProviders = discoveredProviders.filter((p) => p.kind === 'evm' && p.provider);
 
   for (const prov of evmProviders) {
+    // Only query providers that match at least one saved session to avoid spamming all browser extensions
+    const matchesSavedSession = evmSessions.some(
+      (s) =>
+        (s.rdns && prov.rdns === s.rdns) ||
+        (s.providerUuid && prov.uuid === s.providerUuid) ||
+        prov.name.toLowerCase().includes(s.name.replace(/\s+#\d+$/, '').toLowerCase().split(' ')[0])
+    );
+    if (!matchesSavedSession && evmProviders.length > 1) continue;
+
     try {
-      // Silent read-only check (never pops up MetaMask unlock/credentials UI)
       const authorized = (await prov.provider!.request({ method: 'eth_accounts' })) as string[];
       if (!Array.isArray(authorized) || authorized.length === 0) continue;
       const lowerSet = new Set(authorized.map((a) => a.toLowerCase()));
-      for (const sess of sessions) {
-        if (sess.kind === 'evm' && lowerSet.has(sess.address.toLowerCase())) {
+      for (const sess of evmSessions) {
+        if (lowerSet.has(sess.address.toLowerCase())) {
           registerSessionProvider(sess.id, prov.provider!);
           activeSessionIds.push(sess.id);
         }
@@ -443,10 +494,14 @@ export function discoverExternalWalletProviders(
           ? 'OKX Wallet'
           : prov.isBitKeep
           ? 'Bitget Wallet'
+          : prov.isPhantom
+          ? 'Phantom'
           : prov.isMetaMask
           ? 'MetaMask'
           : 'Injected Web3 Wallet';
-        const rdns = prov.isMetaMask
+        const rdns = prov.isPhantom
+          ? 'app.phantom'
+          : prov.isMetaMask
           ? 'io.metamask'
           : prov.isCoinbaseWallet
           ? 'com.coinbase.wallet'
@@ -501,7 +556,7 @@ export function discoverExternalWalletProviders(
     if (win.phantom?.ethereum) {
       evmCandidates.push({
         uuid: 'injected-phantom-evm',
-        name: 'Phantom (EVM)',
+        name: 'Phantom',
         rdns: 'app.phantom',
         provider: win.phantom.ethereum,
       });
@@ -525,12 +580,14 @@ export function discoverExternalWalletProviders(
       }
     }
 
-    const solProvider = win.phantom?.solana || win.solana;
+    const solProvider = win.phantom?.solana || win.solana || win.solflare;
     if (solProvider) {
+      const isPhantomSol = Boolean(win.phantom?.solana || solProvider.isPhantom);
+      const isSolflare = Boolean(solProvider.isSolflare);
       discovered.set('injected-solana-provider', {
         uuid: 'injected-solana-provider',
-        name: solProvider.isPhantom ? 'Phantom (Solana)' : 'Solana Wallet',
-        rdns: solProvider.isPhantom ? 'app.phantom' : undefined,
+        name: isPhantomSol ? 'Phantom (Solana)' : isSolflare ? 'Solflare (Solana)' : 'Solana Wallet',
+        rdns: isPhantomSol ? 'app.phantom' : isSolflare ? 'com.solflare.wallet' : undefined,
         kind: 'solana',
       });
     }
@@ -541,77 +598,43 @@ export function discoverExternalWalletProviders(
   window.addEventListener('ethereum#initialized', scanLegacyAndMobileInjected);
   window.addEventListener('solana#initialized', scanLegacyAndMobileInjected);
 
-  const requestNow = () => {
-    window.dispatchEvent(new Event('eip6963:requestProvider'));
-    scanLegacyAndMobileInjected();
-  };
-
-  requestNow();
-  // Multiple scan passes catch delayed iOS/Android in-app wallet WebView injections
-  const timers = [180, 650, 1500].map((ms) => setTimeout(requestNow, ms));
+  // Dispatch eip6963:requestProvider once per discovery lifecycle to prevent extension EventEmitter warnings
+  window.dispatchEvent(new Event('eip6963:requestProvider'));
+  scanLegacyAndMobileInjected();
+  const delayedTimer = setTimeout(scanLegacyAndMobileInjected, 450);
 
   return () => {
-    timers.forEach((t) => clearTimeout(t));
+    clearTimeout(delayedTimer);
     window.removeEventListener('eip6963:announceProvider', handleAnnounce);
     window.removeEventListener('ethereum#initialized', scanLegacyAndMobileInjected);
     window.removeEventListener('solana#initialized', scanLegacyAndMobileInjected);
   };
 }
 
-export async function connectDiscoveredWalletAccounts(
+async function connectEvmProviderAccounts(
+  evmProvider: Eip1193Provider,
   item: DiscoveredWalletProvider,
-  options?: { forceAccountPicker?: boolean }
+  platform: 'desktop' | 'mobile',
+  forceAccountPicker?: boolean
 ): Promise<ConnectedExternalWallet[]> {
-  const platform: 'desktop' | 'mobile' = isMobileUserAgent() ? 'mobile' : 'desktop';
   const stableProviderKey = item.rdns || item.uuid;
-
-  if (item.kind === 'solana') {
-    const win = window as unknown as WindowWithWallets;
-    const sol = win.phantom?.solana || win.solana;
-    if (!sol) {
-      throw new Error('No Solana browser/mobile wallet detected.');
-    }
-    const resp = await sol.connect();
-    const addr = resp.publicKey.toBase58();
-    const sid = makeSessionId(stableProviderKey, addr);
-    return [
-      {
-        id: sid,
-        providerUuid: item.uuid,
-        name: item.name,
-        icon: item.icon,
-        rdns: item.rdns,
-        kind: 'solana',
-        address: addr,
-        platform,
-        selectedForSweep: true,
-        connectedAt: Date.now(),
-      },
-    ];
-  }
-
-  if (!item.provider) {
-    throw new Error('EVM provider unavailable.');
-  }
-
   let accounts: string[] = [];
 
-  if (options?.forceAccountPicker) {
+  if (forceAccountPicker) {
     try {
-      await item.provider.request({
+      await evmProvider.request({
         method: 'wallet_requestPermissions',
         params: [{ eth_accounts: {} }],
       });
     } catch {
       // Fallback smoothly to eth_requestAccounts
     }
-    accounts = (await item.provider.request({
+    accounts = (await evmProvider.request({
       method: 'eth_requestAccounts',
     })) as string[];
   } else {
-    // Check already-authorized accounts silently first so MetaMask does not force repeated credential/permission modals
     try {
-      const existing = (await item.provider.request({
+      const existing = (await evmProvider.request({
         method: 'eth_accounts',
       })) as string[];
       if (Array.isArray(existing) && existing.length > 0) {
@@ -622,19 +645,19 @@ export async function connectDiscoveredWalletAccounts(
     }
 
     if (accounts.length === 0) {
-      accounts = (await item.provider.request({
+      accounts = (await evmProvider.request({
         method: 'eth_requestAccounts',
       })) as string[];
     }
   }
 
-  if (!accounts || accounts.length === 0) {
-    throw new Error('Wallet connection rejected or returned no accounts.');
+  if (!Array.isArray(accounts) || accounts.length === 0) {
+    return [];
   }
 
   let chainId = 1;
   try {
-    const chainHex = (await item.provider.request({
+    const chainHex = (await evmProvider.request({
       method: 'eth_chainId',
     })) as string;
     chainId = chainHex ? parseInt(chainHex, 16) : 1;
@@ -644,7 +667,7 @@ export async function connectDiscoveredWalletAccounts(
 
   return accounts.map((addr, idx) => {
     const sid = makeSessionId(stableProviderKey, addr);
-    registerSessionProvider(sid, item.provider!);
+    registerSessionProvider(sid, evmProvider);
     return {
       id: sid,
       providerUuid: item.uuid,
@@ -659,6 +682,151 @@ export async function connectDiscoveredWalletAccounts(
       connectedAt: Date.now(),
     };
   });
+}
+
+async function connectSolanaProviderAccount(
+  sol: SolanaProviderLike,
+  item: DiscoveredWalletProvider,
+  platform: 'desktop' | 'mobile'
+): Promise<ConnectedExternalWallet | null> {
+  const stableProviderKey = item.rdns || item.uuid || 'solana';
+  let addr = extractSolanaAddress(null, sol);
+
+  if (!addr) {
+    try {
+      const trustedResp = await sol.connect({ onlyIfTrusted: true });
+      addr = extractSolanaAddress(trustedResp, sol);
+    } catch {
+      // Proceed to interactive connect()
+    }
+  }
+
+  if (!addr) {
+    const resp = await sol.connect();
+    addr = extractSolanaAddress(resp, sol);
+  }
+
+  if (!addr) return null;
+
+  const sid = makeSessionId(stableProviderKey, addr);
+  const cleanName = item.name.includes('Solana') ? item.name : `${item.name} (Solana)`;
+  return {
+    id: sid,
+    providerUuid: item.uuid,
+    name: cleanName,
+    icon: item.icon,
+    rdns: item.rdns || (sol.isPhantom ? 'app.phantom' : undefined),
+    kind: 'solana',
+    address: addr,
+    platform,
+    selectedForSweep: true,
+    connectedAt: Date.now(),
+  };
+}
+
+export async function connectDiscoveredWalletAccounts(
+  item: DiscoveredWalletProvider,
+  options?: { forceAccountPicker?: boolean }
+): Promise<ConnectedExternalWallet[]> {
+  const platform: 'desktop' | 'mobile' = isMobileUserAgent() ? 'mobile' : 'desktop';
+  const win = window as unknown as WindowWithWallets;
+  const isPhantom =
+    item.rdns === 'app.phantom' || item.name.toLowerCase().includes('phantom');
+  const phantomSol = win.phantom?.solana || (win.solana?.isPhantom ? win.solana : undefined);
+  const phantomEvm = win.phantom?.ethereum || (isPhantom ? item.provider : undefined);
+
+  // Unified Phantom & Solana handler: connects both Solana and EVM when Phantom is clicked,
+  // and gracefully succeeds if either Solana OR EVM is active in the user's Phantom wallet!
+  if (item.kind === 'solana' || isPhantom) {
+    const results: ConnectedExternalWallet[] = [];
+    let lastErr: unknown = null;
+
+    const solCandidate =
+      item.kind === 'solana'
+        ? win.phantom?.solana || win.solana || win.solflare
+        : phantomSol;
+
+    if (item.kind === 'solana') {
+      // 1) Try Solana first when user clicked a Solana entry
+      if (solCandidate) {
+        try {
+          const solConn = await connectSolanaProviderAccount(solCandidate, item, platform);
+          if (solConn) results.push(solConn);
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      // 2) Also pair Phantom EVM if available (or fall back to Phantom EVM if Solana failed)
+      if (phantomEvm) {
+        try {
+          const evmConns = await connectEvmProviderAccounts(
+            phantomEvm,
+            {
+              ...item,
+              name: item.name.replace(/\s*\(Solana\)/i, ''),
+              kind: 'evm',
+              provider: phantomEvm,
+            },
+            platform,
+            results.length === 0 ? options?.forceAccountPicker : false
+          );
+          results.push(...evmConns);
+        } catch (err) {
+          if (!lastErr) lastErr = err;
+        }
+      }
+    } else {
+      // User clicked "Phantom" (EIP-6963 / EVM entry): try EVM and Solana so neither mode ever fails
+      if (phantomEvm) {
+        try {
+          const evmConns = await connectEvmProviderAccounts(
+            phantomEvm,
+            item,
+            platform,
+            options?.forceAccountPicker
+          );
+          results.push(...evmConns);
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (solCandidate) {
+        try {
+          const solConn = await connectSolanaProviderAccount(solCandidate, item, platform);
+          if (solConn) results.push(solConn);
+        } catch (err) {
+          if (!lastErr) lastErr = err;
+        }
+      }
+    }
+
+    if (results.length > 0) {
+      return results;
+    }
+
+    throw new Error(
+      lastErr instanceof Error
+        ? lastErr.message
+        : 'Phantom / Solana wallet connection was rejected or locked. Please unlock Phantom and try again.'
+    );
+  }
+
+  if (!item.provider) {
+    throw new Error('EVM provider unavailable.');
+  }
+
+  const evmConns = await connectEvmProviderAccounts(
+    item.provider,
+    item,
+    platform,
+    options?.forceAccountPicker
+  );
+
+  if (evmConns.length === 0) {
+    throw new Error('Wallet connection rejected or returned no accounts.');
+  }
+
+  return evmConns;
 }
 
 export async function connectDiscoveredWallet(
@@ -869,24 +1037,7 @@ function buildSolanaTransferMessage(
 }
 
 async function postSolanaRpc(body: unknown): Promise<Record<string, unknown>> {
-  const tryUrl = async (url: string) => {
-    const resp = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    const ct = resp.headers.get('content-type') || '';
-    if (!resp.ok || !ct.includes('application/json')) {
-      throw new Error('Solana RPC error');
-    }
-    return (await resp.json()) as Record<string, unknown>;
-  };
-
-  try {
-    return await tryUrl('/api/rpc?network=solana');
-  } catch {
-    return await tryUrl('https://solana-rpc.publicnode.com');
-  }
+  return postSolanaJsonRpc(body);
 }
 
 export async function sweepHoldingViaPrivateKey(params: {

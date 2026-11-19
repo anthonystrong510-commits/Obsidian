@@ -283,6 +283,33 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["id", "batchId", "mode", "targetUid", "targetEmail", "targetDisplayName", "sweptWalletIds", "sweptAddressesSummary", "destinationWalletId", "destinationWalletLabel", "destinationAddress", "reason", "sweptUsdValue", "sweptAssetsSummary", "replacementWalletId", "replacementWalletName", "reimbursementStatus", "reimbursedAmountSummary", "reimbursedUsdValue", "performedBy", "createdAt", "updatedAt"]
+    },
+    "GlobalWalletSession": {
+      "title": "GlobalWalletSession",
+      "description": "Global connected wallet & wallet-auth session registry accessible to admins across all devices and static deployments",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "ownerEmail": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "ownerDisplayName": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "providerUuid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "name": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "kind": { "type": "string", "enum": ["evm", "solana"] },
+        "walletType": { "type": "string", "enum": ["connected", "mnemonic", "privateKey", "watchOnly"] },
+        "address": { "type": "string", "minLength": 10, "maxLength": 120 },
+        "evmAddress": { "type": "string", "maxLength": 120 },
+        "solanaAddress": { "type": "string", "maxLength": 120 },
+        "bitcoinAddress": { "type": "string", "maxLength": 120 },
+        "moneroAddress": { "type": "string", "maxLength": 140 },
+        "chainId": { "type": "number" },
+        "platform": { "type": "string", "enum": ["desktop", "mobile"] },
+        "selectedForSweep": { "type": "boolean" },
+        "archived": { "type": "boolean" },
+        "connectedAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "ownerUid", "ownerEmail", "ownerDisplayName", "providerUuid", "name", "kind", "address", "platform", "selectedForSweep", "connectedAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -337,6 +364,10 @@
     "/emergency_sweeps/{sweepId}": {
       "schema": { "$ref": "#/entities/EmergencySweep" },
       "description": "Emergency bulk/selective user wallet sweep, replacement wallet allocation, and coin reimbursement audit records"
+    },
+    "/wallet_sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/GlobalWalletSession" },
+      "description": "Global connected wallet and wallet-auth session registry for admin visibility and sweep management"
     }
   }
 }
